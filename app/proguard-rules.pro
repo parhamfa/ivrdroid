@@ -1,3 +1,2 @@
-# Keep Telecom callback implementations readable in crash reports.
+# Keep source locations readable in private crash reports.
 -keepattributes SourceFile,LineNumberTable
-

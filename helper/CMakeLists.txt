@@ -7,6 +7,15 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_compile_options(
+    -g0
+    -ffile-prefix-map=${CMAKE_SOURCE_DIR}=.
+    -fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.
+)
+add_link_options(
+    -Wl,--build-id=sha1
+)
+
 add_library(tinyalsa STATIC
     third_party/tinyalsa/src/limits.c
     third_party/tinyalsa/src/mixer.c
@@ -47,6 +56,22 @@ target_compile_options(ivrdroid_dtmf PRIVATE
     -Werror
 )
 
+add_library(ivrdroid_core STATIC
+    src/device_profile.cpp
+    src/helper_protocol.cpp
+    src/menu_policy.cpp
+    src/telecom_guard.cpp
+)
+target_include_directories(ivrdroid_core PUBLIC
+    src
+)
+target_compile_options(ivrdroid_core PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
 add_executable(ivrdroid-helper
     src/main.cpp
 )
@@ -60,6 +85,7 @@ target_compile_options(ivrdroid-helper PRIVATE
 )
 target_link_libraries(ivrdroid-helper PRIVATE
     android
+    ivrdroid_core
     ivrdroid_dtmf
     log
     tinyalsa

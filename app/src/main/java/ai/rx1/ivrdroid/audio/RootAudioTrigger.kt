@@ -9,14 +9,10 @@ import java.io.FileOutputStream
 object RootAudioTrigger {
     private const val TAG = "IVRdroidBridge"
     private const val DIRECTORY_NAME = "bridge"
-    private const val TRIGGER_NAME = "play_once.request"
-    private const val TEMP_TRIGGER_NAME = ".play_once.request.tmp"
     private const val COMMAND_NAME = "command.request"
     private const val TEMP_COMMAND_NAME = ".command.request.tmp"
     private const val STATUS_NAME = "status"
-    private const val REQUEST_BODY = "PLAY_ONCE\n"
-    private const val INITIAL_STATUS = "NOT_INSTALLED\n"
-    private const val MAXIMUM_STATUS_BYTES = 128L
+    private const val LAST_RESULT_NAME = "last_result"
 
     @Synchronized
     fun initialize(context: Context): Boolean {
@@ -28,15 +24,14 @@ object RootAudioTrigger {
             }
             Os.chmod(directory.absolutePath, 0b111000000)
 
-            val status = File(directory, STATUS_NAME)
-            if (!status.exists()) {
-                FileOutputStream(status).use { output ->
-                    output.write(INITIAL_STATUS.toByteArray(Charsets.US_ASCII))
-                    output.fd.sync()
-                }
-                Os.chmod(status.absolutePath, 0b110000000)
-            }
-            status.isFile
+            ensurePrivateFile(
+                File(directory, STATUS_NAME),
+                HelperProtocol.INITIAL_STATUS,
+            ) &&
+                ensurePrivateFile(
+                    File(directory, LAST_RESULT_NAME),
+                    HelperProtocol.INITIAL_LAST_RESULT,
+                )
         } catch (error: Exception) {
             Log.e(TAG, "Could not initialize the private helper bridge.", error)
             false
@@ -44,38 +39,25 @@ object RootAudioTrigger {
     }
 
     @Synchronized
-    fun requestOnePrompt(context: Context): Boolean {
-        if (!initialize(context)) return false
-
-        return queueFixedRequest(
-            context,
-            TRIGGER_NAME,
-            TEMP_TRIGGER_NAME,
-            REQUEST_BODY,
-        )
+    fun requestStartMenu(context: Context): Boolean {
+        if (!readState(context).isIdle) return false
+        return queueFixedRequest(context, HelperProtocol.START_MENU_REQUEST)
     }
 
     @Synchronized
-    fun requestCommand(context: Context, command: HelperCommand): Boolean {
-        if (!initialize(context)) return false
-
-        return queueFixedRequest(
-            context,
-            COMMAND_NAME,
-            TEMP_COMMAND_NAME,
-            command.wireBody,
-        )
+    fun cancelPendingStartMenu(context: Context) {
+        val directory = bridgeDirectory(context)
+        File(directory, TEMP_COMMAND_NAME).delete()
+        File(directory, COMMAND_NAME).delete()
     }
 
     private fun queueFixedRequest(
         context: Context,
-        requestName: String,
-        temporaryName: String,
         body: String,
     ): Boolean {
         val directory = bridgeDirectory(context)
-        val trigger = File(directory, requestName)
-        val temporary = File(directory, temporaryName)
+        val trigger = File(directory, COMMAND_NAME)
+        val temporary = File(directory, TEMP_COMMAND_NAME)
         if (temporary.exists() && !temporary.delete()) return false
 
         return try {
@@ -100,16 +82,38 @@ object RootAudioTrigger {
         }
     }
 
-    fun readStatus(context: Context): String {
-        if (!initialize(context)) return "UNAVAILABLE"
-        val status = File(bridgeDirectory(context), STATUS_NAME)
-        if (!status.isFile || status.length() !in 1..MAXIMUM_STATUS_BYTES) {
+    fun readState(context: Context): HelperBridgeState {
+        if (!initialize(context)) {
+            return HelperBridgeState("UNAVAILABLE", "UNAVAILABLE")
+        }
+        val directory = bridgeDirectory(context)
+        return HelperBridgeState(
+            current = readBoundedFile(File(directory, STATUS_NAME)),
+            lastResult = readBoundedFile(File(directory, LAST_RESULT_NAME)),
+        )
+    }
+
+    fun isIdle(context: Context): Boolean = readState(context).isIdle
+
+    private fun ensurePrivateFile(file: File, initialValue: String): Boolean {
+        if (!file.exists()) {
+            FileOutputStream(file).use { output ->
+                output.write("$initialValue\n".toByteArray(Charsets.US_ASCII))
+                output.fd.sync()
+            }
+            Os.chmod(file.absolutePath, 0b110000000)
+        }
+        return file.isFile
+    }
+
+    private fun readBoundedFile(file: File): String {
+        if (!file.isFile || file.length() !in 1..HelperProtocol.MAXIMUM_FILE_BYTES) {
             return "UNAVAILABLE"
         }
         return runCatching {
-            status.readText(Charsets.US_ASCII)
+            file.readText(Charsets.US_ASCII)
                 .trim()
-                .take(MAXIMUM_STATUS_BYTES.toInt())
+                .take(HelperProtocol.MAXIMUM_FILE_BYTES.toInt())
                 .ifEmpty { "UNAVAILABLE" }
         }.getOrDefault("UNAVAILABLE")
     }

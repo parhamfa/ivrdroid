@@ -7,8 +7,8 @@ These four WAV files are temporary English prompts for the SM-T585 live menu tes
 - `support-unavailable.wav`: terminal support response
 - `operator-unavailable.wav`: terminal operator response
 
-They are 48 kHz, stereo, signed 16-bit PCM and are intentionally short enough for the helper's
-15-second watchdog.
+They are 48 kHz, stereo, signed 16-bit PCM and are intentionally shorter than the guardian's
+15-second prompt-phase deadline.
 
 The recordings were synthesized with a local macOS system voice. They are test fixtures, not
 publication-cleared project assets. Replace them with recordings whose redistribution terms are

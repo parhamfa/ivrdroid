@@ -11,7 +11,6 @@ import android.telecom.TelecomManager
 import android.telecom.VideoProfile
 import android.util.Log
 import ai.rx1.ivrdroid.IvrPreferences
-import ai.rx1.ivrdroid.audio.HelperCommand
 import ai.rx1.ivrdroid.audio.RootAudioTrigger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -51,14 +50,54 @@ class GatedCallScreeningService : CallScreeningService() {
             Log.w(TAG, "Allowlisted call matched, but answer permission is missing.")
             return
         }
+        if (!RootAudioTrigger.isIdle(this)) {
+            Log.w(TAG, "Allowlisted call matched, but the helper is busy; leaving it ringing.")
+            return
+        }
 
-        Log.i(TAG, "Allowlisted incoming call matched; scheduling audio-only answer.")
+        if (!RootAudioTrigger.requestStartMenu(this)) {
+            Log.e(TAG, "Could not queue the fixed privileged menu handoff.")
+            return
+        }
+        Log.i(TAG, "Allowlisted incoming call matched; waiting for the helper to claim it.")
+        awaitHelperClaim(token, 0)
+    }
+
+    private fun awaitHelperClaim(token: Long, attempt: Int) {
+        if (latestIncomingCall.get() != token) return
+
+        val state = RootAudioTrigger.readState(this)
+        if (state.hasClaimedSession) {
+            answerCurrentRingingCall()
+            return
+        }
+        if (!state.isIdle) {
+            Log.e(TAG, "Helper entered ${state.current} before claiming the call; not answering.")
+            return
+        }
+        if (attempt < MAXIMUM_CLAIM_POLLS) {
+            mainHandler.postDelayed(
+                { awaitHelperClaim(token, attempt + 1) },
+                CLAIM_POLL_INTERVAL_MS,
+            )
+            return
+        }
+
+        RootAudioTrigger.cancelPendingStartMenu(this)
         mainHandler.postDelayed(
-            {
-                if (latestIncomingCall.get() == token) answerCurrentRingingCall()
-            },
-            ANSWER_DELAY_MS,
+            { finishClaimTimeout(token) },
+            CLAIM_CANCELLATION_SETTLE_MS,
         )
+    }
+
+    private fun finishClaimTimeout(token: Long) {
+        if (latestIncomingCall.get() != token) return
+        val state = RootAudioTrigger.readState(this)
+        if (state.hasClaimedSession) {
+            answerCurrentRingingCall()
+        } else {
+            Log.e(TAG, "Helper did not claim START_MENU; leaving the call to Android.")
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -68,16 +107,15 @@ class GatedCallScreeningService : CallScreeningService() {
         ) {
             return
         }
+        if (!RootAudioTrigger.readState(this).hasClaimedSession) {
+            Log.w(TAG, "Helper no longer owns a waiting session; leaving the call to Android.")
+            return
+        }
 
         val telecom = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
         try {
             telecom.acceptRingingCall(VideoProfile.STATE_AUDIO_ONLY)
             Log.i(TAG, "Answer request sent for allowlisted incoming call.")
-            if (RootAudioTrigger.requestCommand(this, HelperCommand.StartMenu)) {
-                Log.i(TAG, "Queued the fixed privileged menu handoff.")
-            } else {
-                Log.e(TAG, "Could not queue the fixed privileged menu handoff.")
-            }
         } catch (error: SecurityException) {
             Log.e(TAG, "Android rejected the gated answer request.", error)
         }
@@ -85,7 +123,9 @@ class GatedCallScreeningService : CallScreeningService() {
 
     private companion object {
         const val TAG = "IVRdroidScreen"
-        const val ANSWER_DELAY_MS = 250L
+        const val CLAIM_POLL_INTERVAL_MS = 50L
+        const val CLAIM_CANCELLATION_SETTLE_MS = 250L
+        const val MAXIMUM_CLAIM_POLLS = 40
         val latestIncomingCall = AtomicLong()
     }
 }

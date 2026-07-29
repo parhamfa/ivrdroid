@@ -1,44 +1,43 @@
 # IVRdroid privileged helper
 
-This helper is intentionally device-specific. It refuses to run unless the Android identity,
-audio controls, prompt files, app bridge ownership, and audited ROM match the Samsung SM-T585
-profile.
+This helper is intentionally device-specific. It refuses to serve unless the Android identity,
+audio controls, root-owned prompts, app bridge ownership, and audited ROM match the pinned
+Samsung SM-T585 profile.
 
-For the fixed `START_MENU` request it:
+For the sole `START_MENU` request it:
 
-1. waits for Android to report `MODE_IN_CALL`;
-2. snapshots all three affected mixer values to root-owned durable storage;
-3. starts an independent watchdog before changing the route;
-4. plays the root-owned main prompt and restores the exact snapshot;
-5. captures 48 kHz stereo PCM16 from TinyALSA without persisting it;
-6. detects caller DTMF on both channels;
-7. routes 1 to sales, 2 to support, and 0 to operator, with two retries;
-8. plays the terminal prompt with another transactional mixer restore;
+1. claims the request before the app answers;
+2. polls for the audited call route and snapshots four mixer values durably;
+3. disables both the tablet microphone and speaker;
+4. starts continuous privacy enforcement in an independent guardian;
+5. confirms `MODE_IN_CALL` and exactly one safe Telecom call;
+6. plays root-owned prompts through TinyALSA;
+7. captures 48 kHz stereo PCM16 without persisting it;
+8. detects caller DTMF and routes 1, 2, and 0 with two retries;
 9. ends the call through the Telecom binder transaction pinned to this ROM;
-10. verifies Android leaves `MODE_IN_CALL`.
+10. restores normal audio only after the call has ended.
 
-The app supplies no shell text, mixer names, values, paths, prompts, transaction numbers, or menu
-targets.
+If the worker dies, the guardian keeps the call private and attempts termination first. A failed
+hangup leaves the durable snapshot in place so the supervisor can retry recovery. The app
+supplies no shell text, mixer names, values, paths, prompts, transaction numbers, or menu targets.
 
 TinyALSA is vendored at commit `9fab97ca07184371ecad81154d1dadb09d0fa7cf` under its BSD license.
 See `third_party/tinyalsa/NOTICE`.
 
 ## Build and test
 
+From the repository root:
+
 ```sh
-cmake \
-  -S helper \
-  -B helper/build-android-arm64 \
-  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-23 \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build helper/build-android-arm64
-helper/tests/run.sh
+./helper/tests/run.sh
+./scripts/build-helper.sh
+./scripts/check-helper-reproducibility.sh
+./scripts/package-helper.sh
 ```
 
-Warnings are errors for the native project. The host test covers all twelve DTMF keys and several
-rejection cases.
+The arm64 build is pinned to Android NDK `25.2.9519653`. Warnings are errors. Host tests cover
+device identity, the command/status protocol, menu policy, Telecom dump parsing and hangup
+guards, all twelve DTMF keys, and multiple DTMF rejection cases.
 
 ## Module layout
 
@@ -48,7 +47,6 @@ rejection cases.
   module.prop
   service.sh
   bin/ivrdroid-helper
-  prompt.wav
   prompts/
     main-menu.wav
     sales-unavailable.wav
@@ -67,7 +65,7 @@ Before a live call, run the non-mutating self-test as root:
 
 It validates the exact device/build, bridge ownership, prompt files, and mixer topology, then
 reports the current values without changing them. Start `service.sh` manually and confirm helper
-status `READY`.
+state `READY`.
 
-Do not remove `disable` until interruption, reboot, second-call, SIM-loss, and emergency-call
-tests are complete.
+Do not remove `disable` until reboot, SIM/network-loss, and emergency-call recovery tests are
+complete.

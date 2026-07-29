@@ -9,9 +9,7 @@
 
     <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -21,14 +19,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.IVRdroid"
         android:usesCleartextTraffic="false">
-
-        <activity
-            android:name=".telecom.CallActivity"
-            android:excludeFromRecents="true"
-            android:exported="false"
-            android:launchMode="singleTask"
-            android:showWhenLocked="true"
-            android:turnScreenOn="true" />
 
         <activity
             android:name=".MainActivity"
@@ -48,31 +38,5 @@
                 <action android:name="android.telecom.CallScreeningService" />
             </intent-filter>
         </service>
-
-        <service
-            android:name=".telecom.IvrInCallService"
-            android:exported="true"
-            android:permission="android.permission.BIND_INCALL_SERVICE">
-            <meta-data
-                android:name="android.telecom.IN_CALL_SERVICE_UI"
-                android:value="true" />
-            <meta-data
-                android:name="android.telecom.IN_CALL_SERVICE_RINGING"
-                android:value="true" />
-            <intent-filter>
-                <action android:name="android.telecom.InCallService" />
-            </intent-filter>
-        </service>
-
-        <service
-            android:name=".telecom.MenuSessionService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse"
-            android:stopWithTask="false">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Dedicated, caller-gated cellular IVR session" />
-        </service>
-
     </application>
 </manifest>

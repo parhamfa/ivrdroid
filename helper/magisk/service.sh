@@ -12,11 +12,25 @@ ACTIVE_HELPER_PID=
 mkdir -p "$STATE_DIR"
 chmod 0700 "$STATE_DIR"
 
+is_ivrdroid_process() {
+    CANDIDATE_PID=$1
+    [ -n "$CANDIDATE_PID" ] || return 1
+    [ -r "/proc/$CANDIDATE_PID/cmdline" ] || return 1
+    CANDIDATE_COMMAND=$(tr '\000' ' ' <"/proc/$CANDIDATE_PID/cmdline")
+    case "$CANDIDATE_COMMAND" in
+        *ivrdroid_helper/service.sh*|*ivrdroid-helper*--serve*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 if [ -f "$SERVICE_PID_FILE" ]; then
     OLD_PID=$(head -n 1 "$SERVICE_PID_FILE")
-    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    if is_ivrdroid_process "$OLD_PID" && kill -0 "$OLD_PID" 2>/dev/null; then
         exit 0
     fi
+    rm -f "$SERVICE_PID_FILE"
 fi
 
 echo $$ >"$SERVICE_PID_FILE"
@@ -28,7 +42,7 @@ stop_service() {
         wait "$ACTIVE_HELPER_PID" 2>/dev/null
     elif [ -f "$HELPER_PID_FILE" ]; then
         HELPER_PID=$(head -n 1 "$HELPER_PID_FILE")
-        if [ -n "$HELPER_PID" ]; then
+        if is_ivrdroid_process "$HELPER_PID"; then
             kill -TERM "$HELPER_PID" 2>/dev/null
         fi
     fi

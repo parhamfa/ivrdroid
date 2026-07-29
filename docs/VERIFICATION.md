@@ -1,98 +1,126 @@
 # SM-T585 verification record
 
-Date: 2026-07-28  
-Package: `ai.rx1.ivrdroid` v0.2.1-dev  
-Helper: v0.2.3-dev  
-Device: Samsung SM-T585 (`gtaxllte`)  
+Date: 2026-07-29
+
+Package: `ai.rx1.ivrdroid` v0.3.0-dev
+
+Helper: v0.3.3-dev
+
+Device: Samsung SM-T585 (`gtaxllte`)
+
 Runtime: LineageOS 19.1, Android 12 / API 32, Magisk 30.7
 
 ## Build checks
 
-- Ten debug unit tests and the same ten release unit tests passed.
-- Android lint completed without findings.
-- The native helper built for `arm64-v8a` with warnings treated as errors.
-- Native DTMF tests covered all `123456789*0#` keys, asymmetric levels, short-tone rejection,
-  channel disagreement, and non-DTMF tones.
-- The helper archive passed ZIP integrity validation.
-- The publish-safe APK was checked and does not contain the private test caller.
-- The private installed APK was separately checked and does contain its local gate.
+- Debug and release Android unit tests passed.
+- Android lint completed without findings and the debug APK assembled.
+- Native device-profile, helper-protocol, menu-policy, Telecom-guard, and DTMF tests passed.
+- The arm64 helper built with warnings treated as errors using pinned Android NDK
+  `25.2.9519653`.
+- Independent builds from two source/build paths produced the same helper SHA-256.
+- The disabled helper archive passed deterministic ZIP integrity validation.
+- A publish-safe APK was built with an explicitly empty caller gate and checked against the
+  ignored private gate.
 
-## Fixed-prompt and watchdog bring-up
+## Normal live call
 
-The initial root bridge injected a complete 5.64-second prompt into a live cellular call and
-restored the exact mixer snapshot.
-
-A forced-worker-death test sent `SIGKILL` 1.25 seconds after playback began. The independent
-watchdog restored the route before the call ended, cleared the durable snapshot, and allowed the
-supervisor to launch a new helper.
-
-## Live DTMF calibration
-
-A read-only PCM 0:0 capture was streamed to an analyzer without saving call audio. Remote digits
-1, 5, and 9 were decoded identically on both stereo channels, proving that the caller's tones
-reach the audited digital capture path.
-
-The native detector then decoded key 2 in the complete menu test with the following logged
-metrics:
+One allowlisted call completed the key-2 path:
 
 ```text
-Detected caller DTMF digit 2
-left confidence=1.00
-right confidence=1.00
-dominance=268.06/268.33
+15:15:51.316  Answer request sent
+15:15:51.664  Early session privacy active
+15:15:51.877  Privacy re-applied after vendor route update
+15:15:52.077  Privacy re-applied after vendor route update
+15:15:52.195  Session privacy stabilized
+15:15:52.265  Main prompt injection started
+15:15:58.746  Main prompt completed
+15:15:58.831  DTMF capture started
+15:16:00.233  Digit 2 detected, dominance 779.75/779.75
+15:16:00.298  Support prompt injection started
+15:16:03.242  Support prompt completed
+15:16:03.347  Pinned Telecom end-call transaction sent
+15:16:05.223  Normal route restored and snapshot cleared
 ```
 
-## Complete live IVR result
+The caller reported no microphone leakage, no tablet-speaker output, both prompts audible, and
+automatic disconnect.
 
-The allowlisted incoming call completed this sequence:
+Observed routes:
 
 ```text
-Allowlisted incoming call matched
-Answer request sent
-Queued the fixed privileged menu handoff
-Starting the fixed root-owned IVR menu session
-Mixer transaction applied; playing main prompt
-Prompt completed and mixer snapshot was restored
-Listening for caller DTMF on audited PCM 0:0
-Detected caller DTMF digit 2
-Mixer transaction applied; playing support prompt
-Prompt completed and mixer snapshot was restored
-Sending the pinned Telecom end-call transaction
-Result: Parcel(... 00000001)
+main/support prompt  DMIX_OUT / Off / speaker Off / microphone Off
+DTMF listening       AIF4IN  / On  / speaker Off / microphone Off
+post-call normal     AIF4IN  / Off / speaker On  / microphone Off
 ```
 
-The caller heard the complete main menu, pressed 2, heard the support terminal prompt, and the
-tablet disconnected the call automatically.
+Final state:
 
-Immediately afterward:
-
-- helper status: `SESSION_COMPLETE`;
-- Android audio mode: `MODE_NORMAL`;
-- telephony call state: idle;
+- helper state: `READY`;
+- last result: `SESSION_COMPLETE`;
+- Android requested/actual audio mode: `MODE_NORMAL`;
+- Telecom call list: empty;
 - persistent `mixer.snapshot`: absent;
 - helper process: alive;
 - helper boot marker: `disable` present;
-- call-screening holder: `ai.rx1.ivrdroid`;
-- default dialer holder: `com.android.dialer`.
+- default dialer: unchanged.
 
-## Rejected designs observed live
+## Forced worker-death recovery
 
-- Android rejected an app-started background foreground service with
-  `ForegroundServiceStartNotAllowedException`.
-- The long-running root helper's `cmd activity` and `cmd input` shell-command transactions
-  returned `FAILED_TRANSACTION`.
+A failure injector validated `/data/adb/ivrdroid/helper.pid`, waited for `PLAYING_MAIN`, allowed
+roughly one second of prompt playback, and sent `SIGKILL` only to the menu worker.
 
-The final path does not depend on either mechanism. The fixed menu runs in the helper and call
-termination uses the ROM-pinned native Telecom binder transaction.
+The caller heard the prompt stop, heard no tablet microphone or speaker leakage, and was
+disconnected automatically.
+
+Device evidence:
+
+```text
+15:18:04.905  Early session privacy active
+15:18:05.132  Privacy re-applied after vendor route update
+15:18:05.335  Privacy re-applied after vendor route update
+15:18:05.536  Main prompt injection started
+15:18:06.xxx  Worker killed
+15:18:06.759  Guardian sent pinned Telecom end-call transaction
+15:18:11.008  First hangup verification timed out; privacy and snapshot retained
+15:18:11.093  Supervisor found the unfinished mixer transaction
+15:18:11.172  Stale-transaction recovery retried the Telecom hangup
+15:18:12.965  Helper returned READY
+```
+
+During `PLAYING_MAIN`, `RECOVERING`, and the retry interval, both `SPK Switch` and
+`Main Mic Switch` remained `Off`. The first binder transaction did not complete, so the
+supervisor retry—not the first guardian attempt—finished termination. This is an expected
+fail-closed recovery path, not evidence that the binder call is perfectly reliable.
+
+Final state:
+
+- helper state: `READY`;
+- last result: `RECOVERED_AND_ENDED`;
+- Android requested/actual audio mode: `MODE_NORMAL`;
+- Telecom call list: empty;
+- persistent `mixer.snapshot`: absent;
+- normal mixer route restored;
+- replacement helper process: alive.
+
+## Regression found and contained
+
+Helper v0.3.2 attempted a one-time mute as soon as the first in-call mixer baseline appeared.
+Samsung rewrote that route later, causing the helper to reject prompt playback. Its old recovery
+ordering restored the microphone before attempting hangup, which exposed background audio on
+failed sessions.
+
+The device was rolled back to v0.3.1 immediately. v0.3.3 replaced the one-time mute with
+session-wide guardian enforcement and changed recovery to terminate first and restore second.
+Both the normal and forced-death tests above validate those changes.
 
 ## Packaged artifacts
 
 ```text
-b25c1c597a083278de70dc4965f7b323c95c6794f961e97caecca1a7fea49db6  IVRdroid-0.2.1-dev-debug.apk
-00d879a162ca07a60a6c28ed7c4b4068139dcd332f8dc136ef758409715e6da4  IVRdroid-helper-0.2.3-dev-disabled.zip
-91d0c6f761c49e97cf5e42ea778f2b351ac940b7039b953e2df88c17ad0444cc  ivrdroid-helper
+e26ae84ffe55f58f48c1e8e593f197cde61f0cab935308d5974bab908f9f5d77  app-debug.apk
+90c2e18d6fa9cccb5d966eb091ab906104cdf969bd2ff80816e0a2df213cb3a6  ivrdroid-helper
+0c638847dc8cc0cd252db3f85bc66be7bf21b4249779d54a366ee972f7eecf2c  IVRdroid-helper-0.3.3-dev-disabled.zip
 ```
 
-The packaged APK has an empty caller allowlist and cannot auto-answer. The installed private test
-APK is intentionally separate. The bundled synthesized prompts are test fixtures and are not
-publication-cleared assets.
+The recorded APK is the publish-safe empty-gate build, not the private APK installed for tablet
+testing. Generated artifacts remain ignored by Git. The synthesized prompts are test fixtures
+and are not publication-cleared assets.

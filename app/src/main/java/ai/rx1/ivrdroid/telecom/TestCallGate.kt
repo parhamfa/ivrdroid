@@ -14,6 +14,22 @@ object TestCallGate {
     internal fun canonicalize(rawCaller: String?): String? {
         val raw = rawCaller?.trim().orEmpty()
         if (raw.isEmpty()) return null
+        if (raw.any { character ->
+                character !in '0'..'9' &&
+                    character != '+' &&
+                    character != ' ' &&
+                    character != '-' &&
+                    character != '(' &&
+                    character != ')'
+            }
+        ) {
+            return null
+        }
+        if (raw.count { it == '+' } > 1 ||
+            ('+' in raw && !raw.startsWith("+"))
+        ) {
+            return null
+        }
 
         val asciiDigits = raw.filter { it in '0'..'9' }
         return when {
@@ -28,4 +44,3 @@ object TestCallGate {
         }
     }
 }
-

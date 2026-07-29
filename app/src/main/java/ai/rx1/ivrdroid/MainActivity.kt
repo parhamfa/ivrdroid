@@ -187,10 +187,14 @@ class MainActivity : Activity() {
     }
 
     private fun refreshAudioBridgeStatus() {
-        val status = RootAudioTrigger.readStatus(this)
-        audioBridgeStatus.text = getString(R.string.audio_bridge_status, status)
+        val state = RootAudioTrigger.readState(this)
+        audioBridgeStatus.text = getString(
+            R.string.audio_bridge_status,
+            state.current,
+            state.lastResult,
+        )
         audioBridgeStatus.setTextColor(
-            if (status in HEALTHY_BRIDGE_STATES) {
+            if (state.isIdle) {
                 Color.rgb(35, 105, 63)
             } else {
                 Color.rgb(166, 49, 49)
@@ -242,7 +246,6 @@ class MainActivity : Activity() {
         const val REQUEST_SCREENING_ROLE = 1001
         const val REQUEST_TEST_PERMISSIONS = 1002
         const val STATUS_POLL_INTERVAL_MS = 1_000L
-        val HEALTHY_BRIDGE_STATES = setOf("READY", "RESTORED", "STOPPED_RESTORED")
         val REQUIRED_PERMISSIONS = arrayOf(
             Manifest.permission.ANSWER_PHONE_CALLS,
             Manifest.permission.READ_CONTACTS,

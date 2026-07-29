@@ -21,6 +21,9 @@ class TestCallGateTest {
     fun rejectsSuffixMatchesAndUnavailableCallerIds() {
         assertNull(TestCallGate.canonicalize(null))
         assertNull(TestCallGate.canonicalize("anonymous"))
+        assertNull(TestCallGate.canonicalize("+989999999999;12"))
+        assertNull(TestCallGate.canonicalize("+98+9999999999"))
+        assertNull(TestCallGate.canonicalize("tel:+989999999999"))
         assertFalse(TestCallGate.matches("+449999999999"))
         assertFalse(TestCallGate.matches("9999999"))
     }

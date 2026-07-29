@@ -7,25 +7,13 @@
     <string name="request_phone_role">Enable gated call testing</string>
     <string name="auto_answer">Automatically answer the allowlisted caller</string>
     <string name="auto_answer_summary">Every other incoming call remains with Android’s normal dialer.</string>
-    <string name="audio_bridge_status">Audio bridge: %1$s</string>
+    <string name="audio_bridge_status">Audio bridge: %1$s\nLast session: %2$s</string>
     <string name="app_summary">A gated cellular IVR host for dedicated Android devices.</string>
     <string name="allowlisted_caller">Allowlisted caller</string>
     <string name="allowlist_not_configured">No test caller is configured in this build.</string>
     <string name="permissions_ready">Answer and contact permissions are ready.</string>
     <string name="permissions_missing">Answer/contact permissions are required for reliable gated testing.</string>
     <string name="normal_dialer">Normal dialer remains: %1$s</string>
-    <string name="answer_call">Answer</string>
-    <string name="end_call">End call</string>
-    <string name="no_active_call">No active call</string>
-    <string name="active_call">Active call</string>
-    <string name="incoming_call">Incoming call</string>
-    <string name="outgoing_call">Outgoing call</string>
-    <string name="held_call">Call on hold</string>
-    <string name="call_ended">Call ended</string>
     <string name="unknown_number">Unknown number</string>
     <string name="role_not_available">This Android build does not expose the call-screening role.</string>
-    <string name="ivr_notification_channel">Active IVR sessions</string>
-    <string name="ivr_session_starting">Starting the cellular menu…</string>
-    <string name="ivr_session_playing">Playing: %1$s</string>
-    <string name="ivr_session_listening">Waiting for a keypad digit…</string>
 </resources>

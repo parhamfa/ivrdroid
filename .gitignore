@@ -1,0 +1,15 @@
+.gradle/
+.kotlin/
+.idea/
+*.iml
+local.properties
+build/
+app/build/
+captures/
+.DS_Store
+*.apk
+*.zip
+*.log
+/SHA256SUMS
+/helper/dist/
+/helper/build-android-*/

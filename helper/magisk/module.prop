@@ -1,0 +1,6 @@
+id=ivrdroid_helper
+name=IVRdroid Privileged Audio Helper
+version=0.2.3-dev
+versionCode=5
+author=IVRdroid contributors
+description=Device-pinned transactional TinyALSA menu, prompt, and DTMF runtime for IVRdroid.

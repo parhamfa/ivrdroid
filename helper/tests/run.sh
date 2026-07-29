@@ -34,6 +34,10 @@ compile_test \
     "$HELPER_DIR/src/helper_protocol.cpp" \
     "$TEST_DIR/protocol_test.cpp"
 compile_test \
+    privacy_policy_test \
+    "$HELPER_DIR/src/privacy_policy.cpp" \
+    "$TEST_DIR/privacy_policy_test.cpp"
+compile_test \
     telecom_guard_test \
     "$HELPER_DIR/src/telecom_guard.cpp" \
     "$TEST_DIR/telecom_guard_test.cpp"
@@ -45,5 +49,6 @@ compile_test \
 "$BUILD_DIR/dtmf_detector_test"
 "$BUILD_DIR/menu_policy_test"
 "$BUILD_DIR/protocol_test"
+"$BUILD_DIR/privacy_policy_test"
 "$BUILD_DIR/telecom_guard_test"
 "$BUILD_DIR/device_profile_test"

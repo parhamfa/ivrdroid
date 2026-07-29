@@ -60,6 +60,7 @@ add_library(ivrdroid_core STATIC
     src/device_profile.cpp
     src/helper_protocol.cpp
     src/menu_policy.cpp
+    src/privacy_policy.cpp
     src/telecom_guard.cpp
 )
 target_include_directories(ivrdroid_core PUBLIC

@@ -5,7 +5,7 @@ set -eu
 REPO_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_DIR="$REPO_DIR/helper/build-android-arm64"
 DIST_DIR="$REPO_DIR/helper/dist"
-PACKAGE="$DIST_DIR/IVRdroid-helper-0.3.3-dev-disabled.zip"
+PACKAGE="$DIST_DIR/IVRdroid-helper-0.3.4-dev-disabled.zip"
 STRIPPED_BINARY="$DIST_DIR/ivrdroid-helper"
 NDK_VERSION=25.2.9519653
 

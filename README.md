@@ -18,17 +18,24 @@ The current build is a verified, single-call, three-option IVR foundation:
 - The helper plays a main prompt, captures caller audio directly through TinyALSA, detects DTMF
   with a stereo Goertzel detector, and handles keys 1, 2, and 0.
 - The tablet microphone and speaker remain muted for the entire IVR session. A 5 ms independent
-  guardian re-applies that mute when Samsung rewrites the call route.
+  guardian re-applies that mute when Samsung rewrites the call route, tolerates bounded mixer
+  contention, and withholds prompt playback until privacy has remained stable for 500 ms.
 - One durable snapshot covers all four audited mixer controls for the whole session. Normal
   completion restores it only after the call has ended.
 - Failure recovery keeps the call private, attempts the pinned Telecom hangup, and preserves the
   snapshot for a supervisor retry if the first hangup does not complete.
 - No captured call audio is written to storage.
 
-Helper v0.3.3 was verified live on both a complete key-2 call and a forced worker-death call. The
-normal call played both prompts and disconnected. The failure test interrupted playback, kept
-both local audio paths muted, retried a timed-out Telecom hangup, restored the normal route, and
-reported `RECOVERED_AND_ENDED`.
+Helper v0.3.4 was verified on five consecutive complete key-2 calls using one uninterrupted
+helper process, followed by a forced worker-death call. Every normal call played both prompts,
+detected the digit, disconnected, and restored the exact normal mixer route. The failure test
+interrupted playback, kept both local audio paths muted, disconnected the caller, restored the
+normal route, restarted the helper, and reported `RECOVERED_AND_ENDED`.
+
+The repeated-call test is a required regression check. Helper v0.3.3 could mistake one
+write/read race during Samsung's in-call route rewrite for permanent privacy loss and
+immediately terminate an otherwise healthy call. v0.3.4 requires a continuous stable-privacy
+window before playback and aborts only after privacy remains unverified for 250 ms.
 
 This is not yet a general menu editor, PBX, concurrent-call system, or multi-device release. The
 verified runtime is a Samsung SM-T585 running LineageOS 19.1, Android 12 / API 32.
@@ -81,9 +88,10 @@ APK built with a private caller number.
 7. Verify the tablet microphone and speaker are silent from answer onward.
 8. Wait for the full main prompt, then press 1, 2, or 0 once.
 9. Verify the terminal prompt plays and IVRdroid disconnects the call.
-10. Confirm `SESSION_COMPLETE`, `MODE_NORMAL`, an empty Telecom call list, and no
+10. Repeat the complete path at least five times without restarting the helper.
+11. Confirm `SESSION_COMPLETE`, `MODE_NORMAL`, an empty Telecom call list, and no
     `/data/adb/ivrdroid/mixer.snapshot`.
-11. Call from another number and verify the stock dialer rings without IVRdroid answering.
+12. Call from another number and verify the stock dialer rings without IVRdroid answering.
 
 The caller-ID allowlist limits accidental interference; it is not authentication and caller ID
 can be spoofed.

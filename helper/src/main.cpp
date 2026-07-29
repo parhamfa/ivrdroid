@@ -2,6 +2,7 @@
 #include "dtmf_detector.h"
 #include "helper_protocol.h"
 #include "menu_policy.h"
+#include "privacy_policy.h"
 #include "telecom_guard.h"
 
 #include <android/log.h>
@@ -10,6 +11,7 @@
 #include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/poll.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <sys/types.h>
@@ -72,6 +74,11 @@ constexpr useconds_t kCallWaitSleepUs = 100'000;
 constexpr int kMixerRouteWaitIterations = 5'000;
 constexpr useconds_t kMixerRouteWaitSleepUs = 2'000;
 constexpr int kPrivacyEnforcementPollMs = 5;
+constexpr int kPrivacyInitialAttempts = 125;
+constexpr int kPrivacyRecoveryAttempts = 125;
+constexpr int64_t kPrivacyRequiredStableMs = 500;
+constexpr int64_t kPrivacyMaximumUnverifiedMs = 250;
+constexpr int kGuardianPrivacyReadyWaitMs = 12'000;
 constexpr off_t kMaximumPromptBytes = 4 * 1024 * 1024;
 constexpr off_t kMaximumCommandBytes = 64;
 constexpr size_t kMaximumTelecomDumpBytes = 512 * 1024;
@@ -96,6 +103,7 @@ constexpr char kGuardianRemoteHangup = 'H';
 constexpr char kGuardianAudioFailure = 'A';
 constexpr char kGuardianCaptureFailure = 'C';
 constexpr char kGuardianEndCallFailure = 'T';
+constexpr char kGuardianPrivacyReady = 'R';
 
 constexpr uint32_t kSnapshotMagic = 0x49565231U;  // IVR1
 constexpr uint32_t kSnapshotVersion = 2;
@@ -485,27 +493,46 @@ bool ApplyPrivacyRoute(MixerRoute* route) {
     return SameRoute(ReadRoute(*route), PrivacyRoute(*route));
 }
 
-bool EnforcePrivateControls(MixerRoute* route) {
+ivrdroid::PrivacyObservation EnforcePrivateControls(
+    MixerRoute* route,
+    bool* startupRouteReady) {
     const RouteValues current = ReadRoute(*route);
-    if (current.dout < 0 ||
-        current.mixer < 0 ||
-        current.speaker < 0 ||
-        current.mic < 0) {
-        return false;
-    }
-
     const bool corrected = current.speaker != 0 || current.mic != 0;
-    if (current.speaker != 0 && !SetAndVerify(route->speaker, 0)) return false;
-    if (current.mic != 0 && !SetAndVerify(route->mic, 0)) return false;
+    if (current.speaker != 0) {
+        mixer_ctl_set_value(route->speaker, 0, 0);
+    }
+    if (current.mic != 0) {
+        mixer_ctl_set_value(route->mic, 0, 0);
+    }
 
     const RouteValues verified = ReadRoute(*route);
-    if (verified.speaker != 0 || verified.mic != 0) return false;
-    if (corrected) {
-        Log(
-            ANDROID_LOG_WARN,
-            "Re-applied session privacy after a vendor route update.");
+    *startupRouteReady =
+        verified.dout == route->expectedDout &&
+        verified.mixer == route->expectedMixer;
+    if (verified.speaker != 0 || verified.mic != 0) {
+        return ivrdroid::PrivacyObservation::Contended;
     }
-    return true;
+    return corrected
+        ? ivrdroid::PrivacyObservation::Corrected
+        : ivrdroid::PrivacyObservation::Private;
+}
+
+bool EstablishInitialPrivacy(MixerRoute* route) {
+    for (int attempt = 0;
+         attempt < kPrivacyInitialAttempts && !gStopRequested;
+         ++attempt) {
+        bool startupRouteReady = false;
+        const ivrdroid::PrivacyObservation observation =
+            EnforcePrivateControls(route, &startupRouteReady);
+        if (observation != ivrdroid::PrivacyObservation::Contended) {
+            return true;
+        }
+        usleep(kMixerRouteWaitSleepUs);
+    }
+    Log(
+        ANDROID_LOG_ERROR,
+        "Could not verify the initial microphone and speaker mute.");
+    return false;
 }
 
 bool ApplyInjectionRoute(MixerRoute* route) {
@@ -918,8 +945,46 @@ bool PlayPrompt(const char* path) {
     return success && remaining == 0 && !gStopRequested;
 }
 
+int64_t MonotonicMilliseconds();
+
 bool NotifyGuardian(int fd, char phase) {
-    return fd >= 0 && WriteAll(fd, &phase, 1);
+    if (fd < 0) return false;
+    while (true) {
+        const ssize_t sent = send(fd, &phase, 1, MSG_NOSIGNAL);
+        if (sent == 1) return true;
+        if (sent < 0 && errno == EINTR) continue;
+        return false;
+    }
+}
+
+bool WaitForGuardianPrivacyReady(int fd) {
+    const int64_t deadline =
+        MonotonicMilliseconds() + kGuardianPrivacyReadyWaitMs;
+    while (!gStopRequested) {
+        const int64_t remaining =
+            deadline - MonotonicMilliseconds();
+        if (remaining <= 0) return false;
+
+        pollfd descriptor {fd, POLLIN | POLLHUP, 0};
+        const int result = poll(
+            &descriptor,
+            1,
+            static_cast<int>(remaining));
+        if (result == 0) return false;
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if ((descriptor.revents & POLLIN) != 0) {
+            char message = 0;
+            const ssize_t count = recv(fd, &message, 1, 0);
+            return count == 1 && message == kGuardianPrivacyReady;
+        }
+        if ((descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            return false;
+        }
+    }
+    return false;
 }
 
 enum class PromptResult {
@@ -967,12 +1032,12 @@ PrivacyStartResult BeginPrivateSession(int guardianFd) {
         return PrivacyStartResult::Failed;
     }
 
-    const bool applied = ApplyPrivacyRoute(&route);
+    const bool applied = EstablishInitialPrivacy(&route);
     CloseMixerRoute(&route);
     if (!applied) {
         Log(
             ANDROID_LOG_ERROR,
-            "Session privacy mute failed; retaining the snapshot for recovery.");
+            "Initial session privacy failed; retaining the snapshot for recovery.");
         return PrivacyStartResult::Failed;
     }
 
@@ -991,14 +1056,10 @@ PrivacyStartResult BeginPrivateSession(int guardianFd) {
             : PrivacyStartResult::Failed;
     }
 
-    MixerRoute stableRoute {};
-    if (!OpenMixerRoute(&stableRoute)) return PrivacyStartResult::Failed;
-    const bool stable = ApplyPrivacyRoute(&stableRoute);
-    CloseMixerRoute(&stableRoute);
-    if (!stable) {
+    if (!WaitForGuardianPrivacyReady(guardianFd)) {
         Log(
             ANDROID_LOG_ERROR,
-            "Could not establish the final private in-call route.");
+            "Guardian did not confirm a stable private in-call route.");
         return PrivacyStartResult::Failed;
     }
     Log(
@@ -1313,7 +1374,16 @@ bool ForcePrivateRouteForRecovery() {
 
     MixerRoute route {};
     if (!OpenMixerRoute(&route)) return false;
-    const bool applied = ApplyPrivacyRoute(&route);
+    bool applied = false;
+    for (int attempt = 0;
+         attempt < kPrivacyRecoveryAttempts && !gStopRequested;
+         ++attempt) {
+        if (ApplyPrivacyRoute(&route)) {
+            applied = true;
+            break;
+        }
+        usleep(kMixerRouteWaitSleepUs);
+    }
     CloseMixerRoute(&route);
     if (!applied) {
         Log(
@@ -1382,6 +1452,71 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
         MonotonicMilliseconds() + kGuardianWaitForCallMs;
     MixerRoute privacyRoute {};
     bool privacyEnforcementActive = false;
+    bool privacyReadySent = false;
+    unsigned int correctionCount = 0;
+    unsigned int consecutiveContendedSamples = 0;
+    ivrdroid::PrivacyStabilityPolicy privacyPolicy(
+        kPrivacyRequiredStableMs,
+        kPrivacyMaximumUnverifiedMs);
+
+    const auto enforcePrivacy = [&]() {
+        bool startupRouteReady = false;
+        const ivrdroid::PrivacyObservation observation =
+            EnforcePrivateControls(
+                &privacyRoute,
+                &startupRouteReady);
+        const ivrdroid::PrivacyDecision decision = privacyPolicy.Observe(
+            observation,
+            startupRouteReady,
+            MonotonicMilliseconds());
+
+        if (observation == ivrdroid::PrivacyObservation::Contended) {
+            if (consecutiveContendedSamples == 0) {
+                Log(
+                    ANDROID_LOG_WARN,
+                    "Vendor route update contested the privacy mute; retrying.");
+            }
+            ++consecutiveContendedSamples;
+        } else {
+            if (consecutiveContendedSamples > 0) {
+                Log(
+                    ANDROID_LOG_INFO,
+                    "Privacy mute recovered after %u contested samples.",
+                    consecutiveContendedSamples);
+                consecutiveContendedSamples = 0;
+            }
+            if (observation == ivrdroid::PrivacyObservation::Corrected) {
+                ++correctionCount;
+                Log(
+                    ANDROID_LOG_WARN,
+                    "Re-applied session privacy after a vendor route update.");
+            }
+        }
+
+        if (decision == ivrdroid::PrivacyDecision::Abort) {
+            Log(
+                ANDROID_LOG_ERROR,
+                "Session privacy could not be verified for %lld ms.",
+                static_cast<long long>(kPrivacyMaximumUnverifiedMs));
+            return false;
+        }
+        if (decision == ivrdroid::PrivacyDecision::Ready &&
+            !privacyReadySent) {
+            if (!NotifyGuardian(controlFd, kGuardianPrivacyReady)) {
+                Log(
+                    ANDROID_LOG_ERROR,
+                    "Could not acknowledge stable session privacy.");
+                return false;
+            }
+            privacyReadySent = true;
+            Log(
+                ANDROID_LOG_INFO,
+                "Session privacy held stable for %lld ms after %u corrections.",
+                static_cast<long long>(kPrivacyRequiredStableMs),
+                correctionCount);
+        }
+        return true;
+    };
 
     while (true) {
         const int64_t now = MonotonicMilliseconds();
@@ -1406,8 +1541,7 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                     LastResult::RecoveredAndEnded,
                     true);
             }
-            if (privacyEnforcementActive &&
-                !EnforcePrivateControls(&privacyRoute)) {
+            if (privacyEnforcementActive && !enforcePrivacy()) {
                 Log(
                     ANDROID_LOG_ERROR,
                     "Session guardian could not enforce microphone and speaker privacy.");
@@ -1470,8 +1604,7 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
             _exit(recovered ? 0 : 1);
         }
         if (phase == kGuardianIdle && !privacyEnforcementActive) {
-            if (!OpenMixerRoute(&privacyRoute) ||
-                !EnforcePrivateControls(&privacyRoute)) {
+            if (!OpenMixerRoute(&privacyRoute)) {
                 Log(
                     ANDROID_LOG_ERROR,
                     "Session guardian could not start privacy enforcement.");
@@ -1482,12 +1615,23 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                     LastResult::FailedAudio,
                     true);
             }
+            privacyPolicy.Start(MonotonicMilliseconds());
             privacyEnforcementActive = true;
+            if (!enforcePrivacy()) {
+                Log(
+                    ANDROID_LOG_ERROR,
+                    "Session guardian could not establish privacy enforcement.");
+                RecoverAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    LastResult::FailedAudio,
+                    true);
+            }
         }
         phaseDeadline =
             MonotonicMilliseconds() + GuardianPhaseTimeout(phase);
-        if (privacyEnforcementActive &&
-            !EnforcePrivateControls(&privacyRoute)) {
+        if (privacyEnforcementActive && !enforcePrivacy()) {
             Log(
                 ANDROID_LOG_ERROR,
                 "Session guardian lost microphone and speaker privacy.");
@@ -1508,7 +1652,13 @@ struct SessionGuardian {
 
 bool StartSessionGuardian(SessionGuardian* guardian) {
     int descriptors[2] = {-1, -1};
-    if (pipe2(descriptors, O_CLOEXEC) != 0) return false;
+    if (socketpair(
+            AF_UNIX,
+            SOCK_SEQPACKET | SOCK_CLOEXEC,
+            0,
+            descriptors) != 0) {
+        return false;
+    }
 
     const pid_t workerPid = getpid();
     const pid_t child = fork();

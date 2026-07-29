@@ -47,6 +47,7 @@ incoming cellular call
   -> microphone Off + speaker Off
   -> guardian enforces both mute controls every 5 ms
   -> helper confirms MODE_IN_CALL and exactly one safe Telecom call
+  -> guardian confirms 500 ms of continuously stable privacy
   -> inject root-owned main prompt while session privacy remains active
   -> capture PCM 0:0 at 48 kHz stereo PCM16
   -> stereo Goertzel detector emits one DTMF digit or an 8-second timeout
@@ -127,7 +128,11 @@ Main Mic Switch               Off
 
 One durable version-2 snapshot stores all four original values. Android can rewrite the route
 more than once after answering, so the guardian holds microphone and speaker Off throughout the
-session instead of relying on a one-time write.
+session instead of relying on a one-time write. A corrected control or unexpected startup route
+resets the 500 ms startup-stability window. A single contested mixer read/write is retried; 250
+ms of continuously unverified microphone or speaker privacy aborts the session and enters
+fail-closed recovery. The worker cannot begin prompt playback until it receives the guardian's
+stable-privacy acknowledgement over a private sequenced socket.
 
 The detector analyzes 25 ms frames on both channels, requires the same candidate on each,
 requires two stable frames, rearms after two quiet frames, and requires cellular-calibrated
@@ -137,7 +142,9 @@ channel disagreement, and non-DTMF tones.
 ## Failure recovery
 
 The guardian has phase-specific deadlines and a 75-second total ceiling. It inherits no command
-input and changes only the two audited privacy controls during a session.
+input and changes only the two audited privacy controls during a session. Its worker channel is
+a private `SOCK_SEQPACKET` socket: the worker sends fixed phase bytes, and the guardian sends
+only the stable-privacy acknowledgement.
 
 If the worker dies, times out, or reports an audio/capture/termination failure:
 
@@ -167,6 +174,7 @@ exactly one non-emergency call. It then verifies both an empty Telecom call list
 - [x] Inject prompts and capture caller audio without storing it.
 - [x] Detect live DTMF and run the fixed three-option menu.
 - [x] Keep microphone and speaker muted across Samsung route rewrites.
+- [x] Gate playback on stable privacy and tolerate bounded mixer contention.
 - [x] End completed calls and verify normal audio restoration.
 - [x] Recover from forced worker death with a durable snapshot and supervisor retry.
 - [x] Produce reproducible native builds and deterministic disabled module archives.

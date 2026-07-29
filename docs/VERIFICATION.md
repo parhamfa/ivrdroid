@@ -4,7 +4,7 @@ Date: 2026-07-29
 
 Package: `ai.rx1.ivrdroid` v0.3.0-dev
 
-Helper: v0.3.3-dev
+Helper: v0.3.4-dev
 
 Device: Samsung SM-T585 (`gtaxllte`)
 
@@ -14,7 +14,8 @@ Runtime: LineageOS 19.1, Android 12 / API 32, Magisk 30.7
 
 - Debug and release Android unit tests passed.
 - Android lint completed without findings and the debug APK assembled.
-- Native device-profile, helper-protocol, menu-policy, Telecom-guard, and DTMF tests passed.
+- Native device-profile, helper-protocol, menu-policy, privacy-stability, Telecom-guard, and
+  DTMF tests passed.
 - The arm64 helper built with warnings treated as errors using pinned Android NDK
   `25.2.9519653`.
 - Independent builds from two source/build paths produced the same helper SHA-256.
@@ -22,28 +23,42 @@ Runtime: LineageOS 19.1, Android 12 / API 32, Magisk 30.7
 - A publish-safe APK was built with an explicitly empty caller gate and checked against the
   ignored private gate.
 
-## Normal live call
+## v0.3.3 regression reproduced
 
-One allowlisted call completed the key-2 path:
+Two consecutive allowlisted calls at 15:35:36 and 15:35:47 auto-answered and then disconnected
+without playing the menu. In both sessions, early privacy succeeded, Samsung rewrote its route,
+and the guardian treated one failed immediate mixer readback as permanent privacy loss. Recovery
+ended both calls safely, but the normal path was scheduling-dependent.
 
-```text
-15:15:51.316  Answer request sent
-15:15:51.664  Early session privacy active
-15:15:51.877  Privacy re-applied after vendor route update
-15:15:52.077  Privacy re-applied after vendor route update
-15:15:52.195  Session privacy stabilized
-15:15:52.265  Main prompt injection started
-15:15:58.746  Main prompt completed
-15:15:58.831  DTMF capture started
-15:16:00.233  Digit 2 detected, dominance 779.75/779.75
-15:16:00.298  Support prompt injection started
-15:16:03.242  Support prompt completed
-15:16:03.347  Pinned Telecom end-call transaction sent
-15:16:05.223  Normal route restored and snapshot cleared
-```
+The defect was a policy error, not an unsupported audio route: a single 5 ms write/read race was
+fatal. v0.3.4 separates three observations—already private, corrected, and temporarily
+contended—then:
 
-The caller reported no microphone leakage, no tablet-speaker output, both prompts audible, and
-automatic disconnect.
+- requires 500 ms of continuous stable privacy before the first prompt;
+- resets that window after a route correction or unexpected startup route;
+- tolerates transient contention while retrying every 5 ms;
+- enters fail-closed recovery after 250 ms continuously without verified microphone and speaker
+  privacy.
+
+The guardian acknowledges stability over a private sequenced socket. The worker cannot start
+playback before receiving that acknowledgement.
+
+## Five-call normal-path regression soak
+
+Five consecutive allowlisted calls completed the key-2 path without restarting the helper:
+
+| Call | Session interval | Stable-route result | DTMF 2 dominance | Final result |
+|---:|---|---|---:|---|
+| 1 | 15:49:32–15:49:46 | 500 ms after 2 corrections | 394 | `SESSION_COMPLETE` |
+| 2 | 15:49:58–15:50:12 | 500 ms after 2 corrections | 299 | `SESSION_COMPLETE` |
+| 3 | 15:50:23–15:50:37 | 500 ms after 2 corrections | 761 | `SESSION_COMPLETE` |
+| 4 | 15:50:45–15:50:59 | 500 ms after 2 corrections | 432 | `SESSION_COMPLETE` |
+| 5 | 15:51:07–15:51:22 | 500 ms after 2 corrections | 403 | `SESSION_COMPLETE` |
+
+All five sessions ran in helper PID 7589. Each played the main prompt, detected key 2 on both
+PCM channels, played the support prompt, sent the pinned Telecom hangup, and restored the exact
+pre-call mixer snapshot. The caller reported no microphone leakage, no tablet-speaker output,
+both prompts audible, and automatic disconnect on all five calls.
 
 Observed routes:
 
@@ -64,7 +79,7 @@ Final state:
 - helper boot marker: `disable` present;
 - default dialer: unchanged.
 
-## Forced worker-death recovery
+## v0.3.4 forced worker-death recovery
 
 A failure injector validated `/data/adb/ivrdroid/helper.pid`, waited for `PLAYING_MAIN`, allowed
 roughly one second of prompt playback, and sent `SIGKILL` only to the menu worker.
@@ -75,22 +90,22 @@ disconnected automatically.
 Device evidence:
 
 ```text
-15:18:04.905  Early session privacy active
-15:18:05.132  Privacy re-applied after vendor route update
-15:18:05.335  Privacy re-applied after vendor route update
-15:18:05.536  Main prompt injection started
-15:18:06.xxx  Worker killed
-15:18:06.759  Guardian sent pinned Telecom end-call transaction
-15:18:11.008  First hangup verification timed out; privacy and snapshot retained
-15:18:11.093  Supervisor found the unfinished mixer transaction
-15:18:11.172  Stale-transaction recovery retried the Telecom hangup
-15:18:12.965  Helper returned READY
+15:55:10.046  Answer request sent
+15:55:10.387  Early session privacy active
+15:55:10.610  Privacy re-applied after vendor route update
+15:55:10.811  Privacy re-applied after vendor route update
+15:55:11.313  Privacy stable for 500 ms after 2 corrections
+15:55:11.369  Main prompt injection started
+15:55:12.xxx  PID 7589 killed after target revalidation
+15:55:12.598  RECOVERING with speaker Off and microphone Off
+15:55:12.621  Guardian sent pinned Telecom end-call transaction
+15:55:14.541  Normal route restored
+15:55:14.745  Replacement helper PID 22127 returned READY
 ```
 
-During `PLAYING_MAIN`, `RECOVERING`, and the retry interval, both `SPK Switch` and
-`Main Mic Switch` remained `Off`. The first binder transaction did not complete, so the
-supervisor retry—not the first guardian attempt—finished termination. This is an expected
-fail-closed recovery path, not evidence that the binder call is perfectly reliable.
+During `PLAYING_MAIN` and `RECOVERING`, both `SPK Switch` and `Main Mic Switch` remained `Off`.
+The caller heard about one second of the prompt, then silence, no local audio leakage, and an
+automatic disconnect.
 
 Final state:
 
@@ -102,23 +117,20 @@ Final state:
 - normal mixer route restored;
 - replacement helper process: alive.
 
-## Regression found and contained
+## Regression history
 
-Helper v0.3.2 attempted a one-time mute as soon as the first in-call mixer baseline appeared.
-Samsung rewrote that route later, causing the helper to reject prompt playback. Its old recovery
-ordering restored the microphone before attempting hangup, which exposed background audio on
-failed sessions.
-
-The device was rolled back to v0.3.1 immediately. v0.3.3 replaced the one-time mute with
-session-wide guardian enforcement and changed recovery to terminate first and restore second.
-Both the normal and forced-death tests above validate those changes.
+- v0.3.2 used a one-time mute and could restore the microphone before a failed hangup.
+- v0.3.3 added session-wide guardian enforcement and terminate-before-restore recovery, but made
+  one contested mixer sample fatal.
+- v0.3.4 retains the fail-closed ordering, adds bounded contention handling, and gates playback
+  on a continuous stable-privacy window.
 
 ## Packaged artifacts
 
 ```text
 e26ae84ffe55f58f48c1e8e593f197cde61f0cab935308d5974bab908f9f5d77  app-debug.apk
-90c2e18d6fa9cccb5d966eb091ab906104cdf969bd2ff80816e0a2df213cb3a6  ivrdroid-helper
-0c638847dc8cc0cd252db3f85bc66be7bf21b4249779d54a366ee972f7eecf2c  IVRdroid-helper-0.3.3-dev-disabled.zip
+cd56dea3821903a8a13c3fb549fc116ab0e5601df00819e9bf00f564b91527fe  ivrdroid-helper
+a786fa9b06081d430783af6d5dda194c58814f384f833ef420c4d8622af7241f  IVRdroid-helper-0.3.4-dev-disabled.zip
 ```
 
 The recorded APK is the publish-safe empty-gate build, not the private APK installed for tablet

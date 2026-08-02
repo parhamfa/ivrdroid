@@ -120,12 +120,26 @@ The first profile is narrowly pinned to:
 The helper refuses to serve after a ROM identity change. Another model, build, or update needs a
 fresh audio and Telecom audit.
 
+## License
+
+Copyright (C) 2026 Parham Fatemi.
+
+Unless a file or directory carries a different notice, project-authored source code and
+documentation are licensed under the GNU Affero General Public License version 3 only
+(`AGPL-3.0-only`). Modified versions that are conveyed must remain under the AGPL, and users who
+interact with a modified version over a network must be offered its Corresponding Source as
+required by section 13. See [LICENSE](LICENSE).
+
+Third-party components retain their own licenses. In particular, vendored TinyALSA remains under
+the BSD terms in `helper/third_party/tinyalsa/NOTICE`. The synthesized WAV files under
+`helper/prompts/` are temporary test fixtures and are not granted under the project AGPL license.
+
 ## Publication note
 
-Before a public release, add a project license, replace the synthesized test prompts with
-publication-cleared recordings, replace the fixed menu with a validated configuration format,
-automate the current fault-injection suite, validate physical-SIM removal if that deployment
-scenario matters, and add explicitly audited device profiles.
+Before a public release, replace the synthesized test prompts with publication-cleared
+recordings, replace the fixed menu with a validated configuration format, automate the current
+fault-injection suite, validate physical-SIM removal if that deployment scenario matters, and
+add explicitly audited device profiles.
 
 Vendored TinyALSA retains its BSD license.
 

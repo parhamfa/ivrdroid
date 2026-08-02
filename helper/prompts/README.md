@@ -11,5 +11,5 @@ They are 48 kHz, stereo, signed 16-bit PCM and are intentionally shorter than th
 15-second prompt-phase deadline.
 
 The recordings were synthesized with a local macOS system voice. They are test fixtures, not
-publication-cleared project assets. Replace them with recordings whose redistribution terms are
-known before publishing a release.
+publication-cleared project assets and are not granted under IVRdroid's AGPL license. Replace
+them with recordings whose redistribution terms are known before publishing a release.

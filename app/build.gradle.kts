@@ -25,8 +25,8 @@ android {
         applicationId = "ai.rx1.ivrdroid"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.3.0-dev"
+        versionCode = 5
+        versionName = "0.3.1-dev"
 
         buildConfigField("String", "TEST_CALLER_E164", "\"$testCallerE164\"")
         testInstrumentationRunner = "android.app.Instrumentation"

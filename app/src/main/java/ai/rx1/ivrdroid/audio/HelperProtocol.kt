@@ -7,6 +7,9 @@ data class HelperBridgeState(
     val isIdle: Boolean
         get() = current == HelperProtocol.READY
 
+    val isArmingPrivacy: Boolean
+        get() = current == HelperProtocol.ARMING_PRIVACY
+
     val hasClaimedSession: Boolean
         get() = current == HelperProtocol.WAITING_FOR_CALL
 }
@@ -14,6 +17,7 @@ data class HelperBridgeState(
 object HelperProtocol {
     const val START_MENU_REQUEST = "START_MENU\n"
     const val READY = "READY"
+    const val ARMING_PRIVACY = "ARMING_PRIVACY"
     const val WAITING_FOR_CALL = "WAITING_FOR_CALL"
     const val INITIAL_STATUS = "NOT_INSTALLED"
     const val INITIAL_LAST_RESULT = "NONE"

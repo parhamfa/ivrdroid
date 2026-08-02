@@ -71,7 +71,7 @@ class GatedCallScreeningService : CallScreeningService() {
             answerCurrentRingingCall()
             return
         }
-        if (!state.isIdle) {
+        if (!state.isIdle && !state.isArmingPrivacy) {
             Log.e(TAG, "Helper entered ${state.current} before claiming the call; not answering.")
             return
         }
@@ -125,7 +125,7 @@ class GatedCallScreeningService : CallScreeningService() {
         const val TAG = "IVRdroidScreen"
         const val CLAIM_POLL_INTERVAL_MS = 50L
         const val CLAIM_CANCELLATION_SETTLE_MS = 250L
-        const val MAXIMUM_CLAIM_POLLS = 40
+        const val MAXIMUM_CLAIM_POLLS = 100
         val latestIncomingCall = AtomicLong()
     }
 }

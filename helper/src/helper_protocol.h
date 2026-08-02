@@ -10,7 +10,10 @@ enum class Command {
 };
 
 enum class CurrentState {
+    WaitingForSystem,
+    BlockedByCall,
     Ready,
+    ArmingPrivacy,
     WaitingForCall,
     PlayingMain,
     ListeningDtmf,
@@ -19,6 +22,7 @@ enum class CurrentState {
     PlayingSupport,
     PlayingOperator,
     EndingCall,
+    Preempting,
     Recovering,
     Error,
     Stopped,
@@ -29,6 +33,10 @@ enum class LastResult {
     SessionComplete,
     RemoteHangup,
     RecoveredAndEnded,
+    RecoveredAfterReboot,
+    EmergencyPreempted,
+    ExternalCallPreempted,
+    UnverifiedCallPreempted,
     RecoveryHangupSkipped,
     FailedRestore,
     FailedAudio,

@@ -22,6 +22,10 @@ compile_test() {
 }
 
 compile_test \
+    call_safety_policy_test \
+    "$HELPER_DIR/src/call_safety_policy.cpp" \
+    "$TEST_DIR/call_safety_policy_test.cpp"
+compile_test \
     dtmf_detector_test \
     "$HELPER_DIR/src/dtmf_detector.cpp" \
     "$TEST_DIR/dtmf_detector_test.cpp"
@@ -29,6 +33,10 @@ compile_test \
     menu_policy_test \
     "$HELPER_DIR/src/menu_policy.cpp" \
     "$TEST_DIR/menu_policy_test.cpp"
+compile_test \
+    mixer_route_policy_test \
+    "$HELPER_DIR/src/mixer_route_policy.cpp" \
+    "$TEST_DIR/mixer_route_policy_test.cpp"
 compile_test \
     protocol_test \
     "$HELPER_DIR/src/helper_protocol.cpp" \
@@ -38,6 +46,10 @@ compile_test \
     "$HELPER_DIR/src/privacy_policy.cpp" \
     "$TEST_DIR/privacy_policy_test.cpp"
 compile_test \
+    session_snapshot_test \
+    "$HELPER_DIR/src/session_snapshot.cpp" \
+    "$TEST_DIR/session_snapshot_test.cpp"
+compile_test \
     telecom_guard_test \
     "$HELPER_DIR/src/telecom_guard.cpp" \
     "$TEST_DIR/telecom_guard_test.cpp"
@@ -46,9 +58,12 @@ compile_test \
     "$HELPER_DIR/src/device_profile.cpp" \
     "$TEST_DIR/device_profile_test.cpp"
 
+"$BUILD_DIR/call_safety_policy_test"
 "$BUILD_DIR/dtmf_detector_test"
 "$BUILD_DIR/menu_policy_test"
+"$BUILD_DIR/mixer_route_policy_test"
 "$BUILD_DIR/protocol_test"
 "$BUILD_DIR/privacy_policy_test"
+"$BUILD_DIR/session_snapshot_test"
 "$BUILD_DIR/telecom_guard_test"
 "$BUILD_DIR/device_profile_test"

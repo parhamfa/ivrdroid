@@ -1,8 +1,11 @@
+#include "call_safety_policy.h"
 #include "device_profile.h"
 #include "dtmf_detector.h"
 #include "helper_protocol.h"
 #include "menu_policy.h"
+#include "mixer_route_policy.h"
 #include "privacy_policy.h"
+#include "session_snapshot.h"
 #include "telecom_guard.h"
 
 #include <android/log.h>
@@ -11,6 +14,7 @@
 #include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/poll.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
@@ -18,6 +22,7 @@
 #include <sys/wait.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdint>
@@ -58,6 +63,7 @@ constexpr char kLockPath[] = "/data/adb/ivrdroid/helper.lock";
 constexpr char kPidPath[] = "/data/adb/ivrdroid/helper.pid";
 constexpr char kSnapshotPath[] = "/data/adb/ivrdroid/mixer.snapshot";
 constexpr char kSnapshotTempPath[] = "/data/adb/ivrdroid/.mixer.snapshot.tmp";
+constexpr char kBootIdPath[] = "/proc/sys/kernel/random/boot_id";
 
 constexpr char kMainPromptPath[] =
     "/data/adb/modules/ivrdroid_helper/prompts/main-menu.wav";
@@ -69,6 +75,7 @@ constexpr char kOperatorPromptPath[] =
     "/data/adb/modules/ivrdroid_helper/prompts/operator-unavailable.wav";
 
 constexpr char kServicePath[] = "/system/bin/service";
+constexpr char kDumpsysPath[] = "/system/bin/dumpsys";
 constexpr int kCallWaitIterations = 100;
 constexpr useconds_t kCallWaitSleepUs = 100'000;
 constexpr int kMixerRouteWaitIterations = 5'000;
@@ -78,10 +85,27 @@ constexpr int kPrivacyInitialAttempts = 125;
 constexpr int kPrivacyRecoveryAttempts = 125;
 constexpr int64_t kPrivacyRequiredStableMs = 500;
 constexpr int64_t kPrivacyMaximumUnverifiedMs = 250;
+constexpr int kGuardianPrivacyArmedWaitMs = 2'000;
 constexpr int kGuardianPrivacyReadyWaitMs = 12'000;
+constexpr int kCallMonitorPollMs = 500;
+constexpr int64_t kSessionIdleConfirmationMs = 500;
+constexpr int64_t kSessionUnknownMaximumMs = 3'000;
+constexpr int64_t kRecoveryIdleConfirmationMs = 300;
+constexpr int64_t kRecoveryAudioLagMaximumMs = 5'000;
+constexpr int64_t kRecoverySingleCallConfirmationMs = 100;
+constexpr int64_t kRecoveryUnknownMaximumMs = 3'000;
+constexpr int64_t kRecoveryHangupRetryMs = 2'000;
+constexpr int64_t kRecoveryTotalMaximumMs = 8'000;
+constexpr unsigned int kRecoveryMaximumHangupAttempts = 2;
+constexpr useconds_t kRecoveryPollSleepUs = 100'000;
+constexpr int64_t kSystemIdleConfirmationMs = 500;
+constexpr useconds_t kSystemReadinessPollSleepUs = 250'000;
 constexpr off_t kMaximumPromptBytes = 4 * 1024 * 1024;
 constexpr off_t kMaximumCommandBytes = 64;
 constexpr size_t kMaximumTelecomDumpBytes = 512 * 1024;
+constexpr size_t kMaximumAudioDumpBytes = 1024 * 1024;
+constexpr int64_t kDumpsysTimeoutMs = 1'000;
+constexpr int64_t kTelecomEndCallTimeoutMs = 2'000;
 constexpr unsigned int kDtmfFrameCount = 1'200;
 constexpr unsigned int kDtmfPeriodCount = 4;
 constexpr unsigned int kDtmfTimeoutFrames = 8 * 40;
@@ -95,6 +119,7 @@ constexpr int kGuardianEndCallMs = 6'000;
 constexpr int64_t kGuardianTotalMs = 75'000;
 
 constexpr char kGuardianPrompt = 'P';
+constexpr char kGuardianArmPrivacy = 'B';
 constexpr char kGuardianIdle = 'I';
 constexpr char kGuardianDtmf = 'L';
 constexpr char kGuardianEndCall = 'E';
@@ -103,15 +128,18 @@ constexpr char kGuardianRemoteHangup = 'H';
 constexpr char kGuardianAudioFailure = 'A';
 constexpr char kGuardianCaptureFailure = 'C';
 constexpr char kGuardianEndCallFailure = 'T';
+constexpr char kGuardianEmergencyPreempt = 'X';
+constexpr char kGuardianExternalPreempt = 'M';
+constexpr char kGuardianUnverifiedPreempt = 'U';
+constexpr char kGuardianPrivacyArmed = 'Q';
 constexpr char kGuardianPrivacyReady = 'R';
-
-constexpr uint32_t kSnapshotMagic = 0x49565231U;  // IVR1
-constexpr uint32_t kSnapshotVersion = 2;
-constexpr uint32_t kSnapshotChecksumSalt = 0xA5C39E71U;
 
 volatile sig_atomic_t gStopRequested = 0;
 uid_t gAppUid = 0;
 const ivrdroid::DeviceProfile* gProfile = nullptr;
+std::string gBootId;
+
+int64_t MonotonicMilliseconds();
 
 void Log(int priority, const char* format, ...) {
     va_list args;
@@ -166,6 +194,49 @@ std::string GetProperty(const char* key) {
     char value[PROP_VALUE_MAX] = {};
     const int length = __system_property_get(key, value);
     return length > 0 ? std::string(value, static_cast<size_t>(length)) : std::string();
+}
+
+bool InitializeBootIdentity() {
+    const int fd = open(kBootIdPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        Log(ANDROID_LOG_ERROR, "Cannot read the kernel boot identity.");
+        return false;
+    }
+
+    std::array<char, 64> value {};
+    ssize_t count = -1;
+    do {
+        count = read(fd, value.data(), value.size());
+    } while (count < 0 && errno == EINTR);
+    close(fd);
+    if (count <= 0) {
+        Log(ANDROID_LOG_ERROR, "Kernel boot identity is empty.");
+        return false;
+    }
+
+    size_t length = static_cast<size_t>(count);
+    while (length > 0 &&
+           (value[length - 1] == '\n' || value[length - 1] == '\r')) {
+        --length;
+    }
+    const std::string_view bootId(value.data(), length);
+    if (!ivrdroid::IsValidBootId(bootId)) {
+        Log(ANDROID_LOG_ERROR, "Kernel boot identity has an unsafe format.");
+        return false;
+    }
+    gBootId.assign(bootId);
+    return true;
+}
+
+uint64_t GenerateSessionId() {
+    const int fd = open(
+        "/dev/urandom",
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return 0;
+    uint64_t sessionId = 0;
+    const bool readOk = ReadAll(fd, &sessionId, sizeof(sessionId));
+    close(fd);
+    return readOk && sessionId != 0 ? sessionId : 0;
 }
 
 bool ValidateDevice() {
@@ -292,20 +363,181 @@ void WriteLastResult(LastResult result) {
     }
 }
 
-bool IsAudioInCall() {
-    FILE* pipe = popen("/system/bin/dumpsys audio 2>/dev/null", "r");
-    if (pipe == nullptr) return false;
+bool CaptureDumpsys(
+    const char* service,
+    size_t maximumBytes,
+    std::string* output) {
+    int descriptors[2] = {-1, -1};
+    if (pipe2(descriptors, O_CLOEXEC) != 0) return false;
 
-    bool inCall = false;
-    char line[512] = {};
-    while (std::fgets(line, sizeof(line), pipe) != nullptr) {
-        if (std::strstr(line, "Actual mode = MODE_IN_CALL") != nullptr) {
-            inCall = true;
+    const pid_t parentPid = getpid();
+    const pid_t child = fork();
+    if (child < 0) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return false;
+    }
+    if (child == 0) {
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+            getppid() != parentPid) {
+            _exit(126);
+        }
+        close(descriptors[0]);
+        if (dup2(descriptors[1], STDOUT_FILENO) < 0) _exit(126);
+        close(descriptors[1]);
+
+        const int nullFd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (nullFd >= 0) {
+            dup2(nullFd, STDERR_FILENO);
+            close(nullFd);
+        }
+        execl(
+            kDumpsysPath,
+            kDumpsysPath,
+            service,
+            static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    close(descriptors[1]);
+    const int existingFlags = fcntl(descriptors[0], F_GETFL);
+    if (existingFlags < 0 ||
+        fcntl(descriptors[0], F_SETFL, existingFlags | O_NONBLOCK) != 0) {
+        close(descriptors[0]);
+        kill(child, SIGKILL);
+        while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+        return false;
+    }
+
+    output->clear();
+    bool complete = false;
+    bool valid = true;
+    const int64_t deadline =
+        MonotonicMilliseconds() + kDumpsysTimeoutMs;
+    std::array<char, 4096> buffer {};
+    while (!complete && valid) {
+        const int64_t remaining =
+            deadline - MonotonicMilliseconds();
+        if (remaining <= 0) {
+            valid = false;
+            break;
+        }
+
+        pollfd descriptor {
+            descriptors[0],
+            POLLIN | POLLHUP | POLLERR,
+            0,
+        };
+        const int result = poll(
+            &descriptor,
+            1,
+            static_cast<int>(remaining));
+        if (result == 0) {
+            valid = false;
+            break;
+        }
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            valid = false;
+            break;
+        }
+        if ((descriptor.revents & (POLLIN | POLLHUP)) != 0) {
+            while (true) {
+                const ssize_t count = read(
+                    descriptors[0],
+                    buffer.data(),
+                    buffer.size());
+                if (count > 0) {
+                    if (output->size() + static_cast<size_t>(count) >
+                        maximumBytes) {
+                        valid = false;
+                        break;
+                    }
+                    output->append(
+                        buffer.data(),
+                        static_cast<size_t>(count));
+                    continue;
+                }
+                if (count == 0) {
+                    complete = true;
+                    break;
+                }
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                valid = false;
+                break;
+            }
+        }
+        if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0) {
+            valid = false;
+        }
+    }
+    close(descriptors[0]);
+
+    if (!valid || !complete) kill(child, SIGKILL);
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            valid = false;
             break;
         }
     }
-    pclose(pipe);
-    return inCall;
+    return
+        valid &&
+        complete &&
+        WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0;
+}
+
+enum class AudioModeState {
+    Normal,
+    InCall,
+    Unknown,
+};
+
+AudioModeState ReadAudioModeState() {
+    std::string dump;
+    if (!CaptureDumpsys(
+            "audio",
+            kMaximumAudioDumpBytes,
+            &dump)) {
+        return AudioModeState::Unknown;
+    }
+    if (dump.find("Actual mode = MODE_IN_CALL") != std::string::npos) {
+        return AudioModeState::InCall;
+    }
+    return dump.find("Actual mode = MODE_") != std::string::npos
+        ? AudioModeState::Normal
+        : AudioModeState::Unknown;
+}
+
+bool IsAudioInCall() {
+    return ReadAudioModeState() == AudioModeState::InCall;
+}
+
+ivrdroid::AudioCallDisposition ToAudioCallDisposition(
+    AudioModeState state) {
+    switch (state) {
+        case AudioModeState::Normal:
+            return ivrdroid::AudioCallDisposition::Normal;
+        case AudioModeState::InCall:
+            return ivrdroid::AudioCallDisposition::InCall;
+        case AudioModeState::Unknown:
+            return ivrdroid::AudioCallDisposition::Unknown;
+    }
+    return ivrdroid::AudioCallDisposition::Unknown;
+}
+
+const char* AudioModeName(AudioModeState state) {
+    switch (state) {
+        case AudioModeState::Normal:
+            return "NORMAL";
+        case AudioModeState::InCall:
+            return "IN_CALL";
+        case AudioModeState::Unknown:
+            return "UNKNOWN";
+    }
+    return "UNKNOWN";
 }
 
 bool WaitForInCall() {
@@ -318,13 +550,14 @@ bool WaitForInCall() {
     return false;
 }
 
-enum class LiveCallState {
-    None,
-    SingleSafe,
-    UnsafeOrUnknown,
+struct LiveCallObservation {
+    ivrdroid::CallDisposition disposition =
+        ivrdroid::CallDisposition::Unknown;
+    uint64_t identityHash = 0;
 };
 
-LiveCallState ReadLiveCallState();
+LiveCallObservation ReadLiveCallObservation();
+ivrdroid::CallDisposition ReadLiveCallState();
 
 int FindEnumIndex(mixer_ctl* control, const char* value) {
     const unsigned int count = mixer_ctl_get_num_enums(control);
@@ -337,12 +570,7 @@ int FindEnumIndex(mixer_ctl* control, const char* value) {
     return -1;
 }
 
-struct RouteValues {
-    int dout = -1;
-    int mixer = -1;
-    int speaker = -1;
-    int mic = -1;
-};
+using RouteValues = ivrdroid::MixerRouteState;
 
 struct MixerRoute {
     mixer* device = nullptr;
@@ -460,16 +688,36 @@ RouteValues ExpectedRoute(const MixerRoute& route) {
     };
 }
 
+RouteValues NormalRoute(const MixerRoute& route) {
+    return {
+        route.normalDout,
+        route.normalMixer,
+        route.normalSpeaker,
+        route.normalMic,
+    };
+}
+
 RouteValues PrivacyRoute(const MixerRoute& route) {
     return {route.expectedDout, route.expectedMixer, 0, 0};
 }
 
-bool ValidateExpectedBaseline(const MixerRoute& route, const RouteValues& snapshot) {
-    const RouteValues expected = ExpectedRoute(route);
-    if (!SameRoute(snapshot, expected)) {
+RouteValues PreAnswerPrivacyRoute(const RouteValues& normal) {
+    return ivrdroid::PrivatePreAnswerRoute(normal);
+}
+
+bool ValidatePreAnswerBaseline(
+    const MixerRoute& route,
+    const RouteValues& snapshot) {
+    const RouteValues normal = NormalRoute(route);
+    const bool valid =
+        ivrdroid::IsValidPreAnswerBaseline(
+            snapshot,
+            normal,
+            route.appliedDout);
+    if (!valid) {
         Log(
             ANDROID_LOG_ERROR,
-            "Refusing unexpected in-call baseline: "
+            "Refusing unexpected pre-answer mixer baseline: "
             "dout=%d mixer=%d speaker=%d mic=%d.",
             snapshot.dout,
             snapshot.mixer,
@@ -483,14 +731,6 @@ bool ValidateExpectedBaseline(const MixerRoute& route, const RouteValues& snapsh
 bool SetAndVerify(mixer_ctl* control, int value) {
     return mixer_ctl_set_value(control, 0, value) == 0 &&
         mixer_ctl_get_value(control, 0) == value;
-}
-
-bool ApplyPrivacyRoute(MixerRoute* route) {
-    if (!SetAndVerify(route->speaker, 0)) return false;
-    if (!SetAndVerify(route->mic, 0)) return false;
-    if (!SetAndVerify(route->mixerEnable, route->expectedMixer)) return false;
-    if (!SetAndVerify(route->dout, route->expectedDout)) return false;
-    return SameRoute(ReadRoute(*route), PrivacyRoute(*route));
 }
 
 ivrdroid::PrivacyObservation EnforcePrivateControls(
@@ -517,21 +757,31 @@ ivrdroid::PrivacyObservation EnforcePrivateControls(
         : ivrdroid::PrivacyObservation::Private;
 }
 
+bool ApplyPreAnswerPrivacyRoute(MixerRoute* route) {
+    const RouteValues target =
+        PreAnswerPrivacyRoute(NormalRoute(*route));
+    // Mute both physical endpoints before changing the route that Android
+    // will inherit when Telecom answers the call.
+    return
+        SetAndVerify(route->speaker, target.speaker) &&
+        SetAndVerify(route->mic, target.mic) &&
+        SetAndVerify(route->mixerEnable, target.mixer) &&
+        SetAndVerify(route->dout, target.dout) &&
+        SameRoute(ReadRoute(*route), target);
+}
+
 bool EstablishInitialPrivacy(MixerRoute* route) {
     for (int attempt = 0;
          attempt < kPrivacyInitialAttempts && !gStopRequested;
          ++attempt) {
-        bool startupRouteReady = false;
-        const ivrdroid::PrivacyObservation observation =
-            EnforcePrivateControls(route, &startupRouteReady);
-        if (observation != ivrdroid::PrivacyObservation::Contended) {
+        if (ApplyPreAnswerPrivacyRoute(route)) {
             return true;
         }
         usleep(kMixerRouteWaitSleepUs);
     }
     Log(
         ANDROID_LOG_ERROR,
-        "Could not verify the initial microphone and speaker mute.");
+        "Could not verify the normalized private pre-answer route.");
     return false;
 }
 
@@ -548,20 +798,34 @@ bool RouteContainsOnlyOurChanges(
     const RouteValues& snapshot,
     const RouteValues& current) {
     const RouteValues injection = InjectionRoute(route);
+    const RouteValues expected = ExpectedRoute(route);
     const RouteValues privacy = PrivacyRoute(route);
+    const RouteValues normal = NormalRoute(route);
+    const RouteValues preAnswerPrivacy =
+        PreAnswerPrivacyRoute(normal);
     const bool fieldsKnown =
         (current.dout == snapshot.dout ||
          current.dout == injection.dout ||
-         current.dout == privacy.dout) &&
+         current.dout == expected.dout ||
+         current.dout == privacy.dout ||
+         current.dout == normal.dout) &&
         (current.mixer == snapshot.mixer ||
          current.mixer == injection.mixer ||
-         current.mixer == privacy.mixer) &&
+         current.mixer == expected.mixer ||
+         current.mixer == privacy.mixer ||
+         current.mixer == normal.mixer) &&
         (current.speaker == snapshot.speaker ||
          current.speaker == injection.speaker ||
-         current.speaker == privacy.speaker) &&
+         current.speaker == expected.speaker ||
+         current.speaker == privacy.speaker ||
+         current.speaker == normal.speaker ||
+         current.speaker == preAnswerPrivacy.speaker) &&
         (current.mic == snapshot.mic ||
          current.mic == injection.mic ||
-         current.mic == privacy.mic);
+         current.mic == expected.mic ||
+         current.mic == privacy.mic ||
+         current.mic == normal.mic ||
+         current.mic == preAnswerPrivacy.mic);
     return fieldsKnown && !SameRoute(current, snapshot);
 }
 
@@ -592,92 +856,152 @@ bool RestoreRoute(const RouteValues& snapshot, bool onlyIfOwned) {
     return restored;
 }
 
-bool RestoreNormalRouteAfterEndedCall(const RouteValues& snapshot) {
+bool RestoreRouteForPreemption(const RouteValues& snapshot) {
     MixerRoute route {};
     if (!OpenMixerRoute(&route)) return false;
 
+    if (!ValidatePreAnswerBaseline(route, snapshot)) {
+        Log(
+            ANDROID_LOG_ERROR,
+            "Preemption snapshot is not the audited pre-answer baseline.");
+        CloseMixerRoute(&route);
+        return false;
+    }
+
     const RouteValues current = ReadRoute(route);
-    const RouteValues normal {
-        route.normalDout,
-        route.normalMixer,
-        route.normalSpeaker,
-        route.normalMic,
-    };
-    if (SameRoute(current, normal)) {
+    if (SameRoute(current, snapshot)) {
         CloseMixerRoute(&route);
         return true;
     }
 
+    const RouteValues expected = ExpectedRoute(route);
     const RouteValues injection = InjectionRoute(route);
-    const RouteValues privacy = PrivacyRoute(route);
-    const bool fieldsKnown =
-        (current.dout == snapshot.dout ||
-         current.dout == injection.dout ||
-         current.dout == privacy.dout ||
-         current.dout == normal.dout) &&
-        (current.mixer == snapshot.mixer ||
-         current.mixer == injection.mixer ||
-         current.mixer == privacy.mixer ||
-         current.mixer == normal.mixer) &&
-        (current.speaker == snapshot.speaker ||
-         current.speaker == injection.speaker ||
-         current.speaker == privacy.speaker ||
-         current.speaker == normal.speaker) &&
-        (current.mic == snapshot.mic ||
-         current.mic == injection.mic ||
-         current.mic == privacy.mic ||
-         current.mic == normal.mic);
-    if (!fieldsKnown) {
+    const bool ownedPreAnswerRoute =
+        ivrdroid::IsOwnedPreAnswerRoute(
+            current,
+            snapshot,
+            NormalRoute(route));
+    const bool ownedActiveCallRoute =
+        (current.dout == expected.dout ||
+         current.dout == injection.dout) &&
+        (current.mixer == expected.mixer ||
+         current.mixer == injection.mixer) &&
+        (current.speaker == expected.speaker ||
+         current.speaker == 0) &&
+        (current.mic == expected.mic ||
+         current.mic == 0);
+
+    const AudioModeState audioState = ReadAudioModeState();
+    const RouteValues* target = nullptr;
+    if (audioState == AudioModeState::InCall &&
+        ownedActiveCallRoute) {
+        target = &expected;
+    } else if (audioState == AudioModeState::Normal &&
+               ownedPreAnswerRoute) {
+        target = &snapshot;
+    } else {
         Log(
             ANDROID_LOG_WARN,
-            "Normal route changed externally; refusing recovery overwrite.");
+            "Call preemption found an external or ambiguous mixer route; "
+            "releasing ownership without overwriting it.");
         CloseMixerRoute(&route);
         return true;
     }
 
     const bool restored =
-        SetAndVerify(route.dout, normal.dout) &&
-        SetAndVerify(route.mixerEnable, normal.mixer) &&
-        SetAndVerify(route.mic, normal.mic) &&
-        SetAndVerify(route.speaker, normal.speaker) &&
-        SameRoute(ReadRoute(route), normal);
+        SetAndVerify(route.dout, target->dout) &&
+        SetAndVerify(route.mixerEnable, target->mixer) &&
+        SetAndVerify(route.mic, target->mic) &&
+        SetAndVerify(route.speaker, target->speaker) &&
+        SameRoute(ReadRoute(route), *target);
     CloseMixerRoute(&route);
     return restored;
 }
 
-#pragma pack(push, 1)
-struct SnapshotFile {
-    uint32_t magic;
-    uint32_t version;
-    int32_t dout;
-    int32_t mixer;
-    int32_t speaker;
-    int32_t mic;
-    uint32_t checksum;
-};
-#pragma pack(pop)
+bool RestoreAuditedPostCallRoute(
+    const RouteValues& snapshot) {
+    MixerRoute route {};
+    if (!OpenMixerRoute(&route)) return false;
 
-uint32_t SnapshotChecksum(const SnapshotFile& snapshot) {
-    return snapshot.magic ^
-        snapshot.version ^
-        static_cast<uint32_t>(snapshot.dout) ^
-        static_cast<uint32_t>(snapshot.mixer) ^
-        static_cast<uint32_t>(snapshot.speaker) ^
-        static_cast<uint32_t>(snapshot.mic) ^
-        kSnapshotChecksumSalt;
+    if (!ValidatePreAnswerBaseline(route, snapshot)) {
+        CloseMixerRoute(&route);
+        return false;
+    }
+
+    const RouteValues current = ReadRoute(route);
+    const RouteValues normal = NormalRoute(route);
+    const RouteValues postCall =
+        ivrdroid::AuditedPostCallRoute(
+            normal,
+            snapshot);
+    if (SameRoute(current, postCall)) {
+        CloseMixerRoute(&route);
+        return true;
+    }
+
+    const RouteValues injection = InjectionRoute(route);
+    const RouteValues expected = ExpectedRoute(route);
+    const RouteValues privacy = PrivacyRoute(route);
+    const RouteValues preAnswerPrivacy =
+        PreAnswerPrivacyRoute(snapshot);
+    const bool fieldsKnown =
+        (current.dout == snapshot.dout ||
+         current.dout == injection.dout ||
+         current.dout == expected.dout ||
+         current.dout == privacy.dout ||
+         current.dout == normal.dout) &&
+        (current.mixer == snapshot.mixer ||
+         current.mixer == injection.mixer ||
+         current.mixer == expected.mixer ||
+         current.mixer == privacy.mixer ||
+         current.mixer == normal.mixer) &&
+        (current.speaker == snapshot.speaker ||
+         current.speaker == injection.speaker ||
+         current.speaker == expected.speaker ||
+         current.speaker == privacy.speaker ||
+         current.speaker == normal.speaker ||
+         current.speaker == preAnswerPrivacy.speaker) &&
+        (current.mic == snapshot.mic ||
+         current.mic == injection.mic ||
+         current.mic == expected.mic ||
+         current.mic == privacy.mic ||
+         current.mic == normal.mic ||
+         current.mic == preAnswerPrivacy.mic);
+    if (!fieldsKnown) {
+        Log(
+            ANDROID_LOG_WARN,
+            "Pre-answer route changed externally; refusing recovery overwrite.");
+        CloseMixerRoute(&route);
+        return true;
+    }
+
+    const bool restored =
+        SetAndVerify(route.dout, postCall.dout) &&
+        SetAndVerify(route.mixerEnable, postCall.mixer) &&
+        SetAndVerify(route.mic, postCall.mic) &&
+        SetAndVerify(route.speaker, postCall.speaker) &&
+        SameRoute(ReadRoute(route), postCall);
+    CloseMixerRoute(&route);
+    return restored;
 }
 
-bool PersistSnapshot(const RouteValues& route) {
-    SnapshotFile snapshot {
-        kSnapshotMagic,
-        kSnapshotVersion,
-        route.dout,
-        route.mixer,
-        route.speaker,
-        route.mic,
-        0,
-    };
-    snapshot.checksum = SnapshotChecksum(snapshot);
+bool PersistSnapshot(
+    const RouteValues& route,
+    uint64_t callIdentityHash) {
+    ivrdroid::PersistentSessionSnapshot snapshot {};
+    const uint64_t sessionId = GenerateSessionId();
+    if (!ivrdroid::BuildSessionSnapshot(
+            gBootId,
+            sessionId,
+            callIdentityHash,
+            route.dout,
+            route.mixer,
+            route.speaker,
+            route.mic,
+            &snapshot)) {
+        Log(ANDROID_LOG_ERROR, "Could not create a boot-scoped mixer snapshot.");
+        return false;
+    }
 
     unlink(kSnapshotTempPath);
     const int fd = open(
@@ -697,41 +1021,64 @@ bool PersistSnapshot(const RouteValues& route) {
         SyncDirectory(kStateDir);
         return false;
     }
+    Log(
+        ANDROID_LOG_INFO,
+        "Persisted mixer transaction %016llx for the current boot.",
+        static_cast<unsigned long long>(sessionId));
     return true;
 }
 
-bool LoadSnapshot(RouteValues* route) {
+bool LoadSnapshot(
+    ivrdroid::PersistentSessionSnapshot* snapshot) {
     const int fd = open(kSnapshotPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return false;
 
     struct stat state {};
-    SnapshotFile snapshot {};
     const bool readOk =
         fstat(fd, &state) == 0 &&
         S_ISREG(state.st_mode) &&
         state.st_uid == 0 &&
-        state.st_size == static_cast<off_t>(sizeof(snapshot)) &&
-        ReadAll(fd, &snapshot, sizeof(snapshot));
+        state.st_size == static_cast<off_t>(sizeof(*snapshot)) &&
+        ReadAll(fd, snapshot, sizeof(*snapshot));
     close(fd);
     if (!readOk ||
-        snapshot.magic != kSnapshotMagic ||
-        snapshot.version != kSnapshotVersion ||
-        snapshot.checksum != SnapshotChecksum(snapshot)) {
+        !ivrdroid::ValidateSessionSnapshot(*snapshot)) {
         Log(ANDROID_LOG_ERROR, "Persistent mixer snapshot is invalid.");
         return false;
     }
-
-    *route = {snapshot.dout, snapshot.mixer, snapshot.speaker, snapshot.mic};
     return true;
 }
 
-void ClearSnapshot() {
+RouteValues SnapshotRoute(
+    const ivrdroid::PersistentSessionSnapshot& snapshot) {
+    return {
+        snapshot.dout,
+        snapshot.mixer,
+        snapshot.speaker,
+        snapshot.mic,
+    };
+}
+
+bool ClearSnapshot() {
     bool changed = false;
-    if (unlink(kSnapshotPath) == 0) changed = true;
-    if (unlink(kSnapshotTempPath) == 0) changed = true;
+    bool cleared = true;
+    if (unlink(kSnapshotPath) == 0) {
+        changed = true;
+    } else if (errno != ENOENT) {
+        cleared = false;
+    }
+    if (unlink(kSnapshotTempPath) == 0) {
+        changed = true;
+    } else if (errno != ENOENT) {
+        cleared = false;
+    }
     if (changed && !SyncDirectory(kStateDir)) {
         Log(ANDROID_LOG_ERROR, "Could not durably clear the mixer snapshot.");
+        cleared = false;
     }
+    return cleared &&
+        access(kSnapshotPath, F_OK) != 0 &&
+        errno == ENOENT;
 }
 
 enum class MixerRecoveryResult {
@@ -740,24 +1087,36 @@ enum class MixerRecoveryResult {
     Failed,
 };
 
-MixerRecoveryResult RecoverMixerSnapshot() {
+enum class MixerRestoreTarget {
+    OriginalCallRoute,
+    AuditedPostCall,
+};
+
+MixerRecoveryResult RecoverMixerSnapshot(
+    MixerRestoreTarget target) {
     if (access(kSnapshotPath, F_OK) != 0) {
         return errno == ENOENT
             ? MixerRecoveryResult::NoSnapshot
             : MixerRecoveryResult::Failed;
     }
-    RouteValues snapshot {};
-    if (!LoadSnapshot(&snapshot)) {
+    ivrdroid::PersistentSessionSnapshot snapshot {};
+    if (!LoadSnapshot(&snapshot) ||
+        ivrdroid::ClassifySnapshotBoot(snapshot, gBootId) !=
+            ivrdroid::SnapshotBootRelation::SameBoot) {
+        Log(
+            ANDROID_LOG_ERROR,
+            "Refusing mixer recovery from another boot.");
         return MixerRecoveryResult::Failed;
     }
-    const bool restored = IsAudioInCall()
-        ? RestoreRoute(snapshot, true)
-        : RestoreNormalRouteAfterEndedCall(snapshot);
+    const RouteValues route = SnapshotRoute(snapshot);
+    const bool restored =
+        target == MixerRestoreTarget::OriginalCallRoute
+        ? RestoreRouteForPreemption(route)
+        : RestoreAuditedPostCallRoute(route);
     if (!restored) return MixerRecoveryResult::Failed;
-    ClearSnapshot();
-    return access(kSnapshotPath, F_OK) == 0
-        ? MixerRecoveryResult::Failed
-        : MixerRecoveryResult::Restored;
+    return ClearSnapshot()
+        ? MixerRecoveryResult::Restored
+        : MixerRecoveryResult::Failed;
 }
 
 bool ValidatePromptFile(const char* path) {
@@ -957,9 +1316,12 @@ bool NotifyGuardian(int fd, char phase) {
     }
 }
 
-bool WaitForGuardianPrivacyReady(int fd) {
+bool WaitForGuardianMessage(
+    int fd,
+    char expectedMessage,
+    int timeoutMilliseconds) {
     const int64_t deadline =
-        MonotonicMilliseconds() + kGuardianPrivacyReadyWaitMs;
+        MonotonicMilliseconds() + timeoutMilliseconds;
     while (!gStopRequested) {
         const int64_t remaining =
             deadline - MonotonicMilliseconds();
@@ -978,7 +1340,7 @@ bool WaitForGuardianPrivacyReady(int fd) {
         if ((descriptor.revents & POLLIN) != 0) {
             char message = 0;
             const ssize_t count = recv(fd, &message, 1, 0);
-            return count == 1 && message == kGuardianPrivacyReady;
+            return count == 1 && message == expectedMessage;
         }
         if ((descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
             return false;
@@ -987,75 +1349,161 @@ bool WaitForGuardianPrivacyReady(int fd) {
     return false;
 }
 
+bool WaitForGuardianPrivacyReady(int fd) {
+    return WaitForGuardianMessage(
+        fd,
+        kGuardianPrivacyReady,
+        kGuardianPrivacyReadyWaitMs);
+}
+
 enum class PromptResult {
     Completed,
     RemoteHangup,
+    EmergencyPreempt,
+    ExternalPreempt,
     Failed,
 };
 
 enum class PrivacyStartResult {
     Started,
     RemoteHangup,
+    EmergencyPreempt,
+    ExternalPreempt,
     Failed,
 };
+
+PromptResult PromptResultForCallDisposition(
+    ivrdroid::CallDisposition disposition) {
+    switch (disposition) {
+        case ivrdroid::CallDisposition::Idle:
+            return PromptResult::RemoteHangup;
+        case ivrdroid::CallDisposition::Emergency:
+            return PromptResult::EmergencyPreempt;
+        case ivrdroid::CallDisposition::Multiple:
+            return PromptResult::ExternalPreempt;
+        case ivrdroid::CallDisposition::SingleSafe:
+        case ivrdroid::CallDisposition::Unknown:
+            return PromptResult::Failed;
+    }
+    return PromptResult::Failed;
+}
+
+PrivacyStartResult PrivacyResultForCallDisposition(
+    ivrdroid::CallDisposition disposition) {
+    switch (disposition) {
+        case ivrdroid::CallDisposition::Idle:
+            return PrivacyStartResult::RemoteHangup;
+        case ivrdroid::CallDisposition::Emergency:
+            return PrivacyStartResult::EmergencyPreempt;
+        case ivrdroid::CallDisposition::Multiple:
+            return PrivacyStartResult::ExternalPreempt;
+        case ivrdroid::CallDisposition::SingleSafe:
+        case ivrdroid::CallDisposition::Unknown:
+            return PrivacyStartResult::Failed;
+    }
+    return PrivacyStartResult::Failed;
+}
 
 bool RestorePrivateSession();
 
 PrivacyStartResult BeginPrivateSession(int guardianFd) {
+    WriteCurrentState(CurrentState::ArmingPrivacy);
+
+    if (ReadAudioModeState() != AudioModeState::Normal) {
+        Log(
+            ANDROID_LOG_WARN,
+            "Refusing pre-answer privacy outside MODE_NORMAL.");
+        return PrivacyResultForCallDisposition(ReadLiveCallState());
+    }
+
+    const LiveCallObservation initialCall = ReadLiveCallObservation();
+    if (initialCall.disposition !=
+            ivrdroid::CallDisposition::SingleSafe ||
+        initialCall.identityHash == 0) {
+        return PrivacyResultForCallDisposition(
+            initialCall.disposition);
+    }
+
     MixerRoute route {};
     if (!OpenMixerRoute(&route)) return PrivacyStartResult::Failed;
-    WriteCurrentState(CurrentState::WaitingForCall);
-
-    RouteValues snapshot {};
-    bool baselineFound = false;
-    for (int attempt = 0;
-         attempt < kMixerRouteWaitIterations && !gStopRequested;
-         ++attempt) {
-        const RouteValues current = ReadRoute(route);
-        if (SameRoute(current, ExpectedRoute(route))) {
-            snapshot = current;
-            baselineFound = true;
-            break;
-        }
-        usleep(kMixerRouteWaitSleepUs);
-    }
-    if (!baselineFound || !ValidateExpectedBaseline(route, snapshot)) {
+    const RouteValues snapshot = ReadRoute(route);
+    if (!ValidatePreAnswerBaseline(route, snapshot)) {
         CloseMixerRoute(&route);
-        Log(ANDROID_LOG_ERROR, "Timed out waiting for the audited in-call mixer route.");
-        return ReadLiveCallState() == LiveCallState::None
-            ? PrivacyStartResult::RemoteHangup
-            : PrivacyStartResult::Failed;
+        return PrivacyStartResult::Failed;
     }
 
-    if (!PersistSnapshot(snapshot)) {
+    if (!PersistSnapshot(snapshot, initialCall.identityHash)) {
         CloseMixerRoute(&route);
         return PrivacyStartResult::Failed;
     }
 
     const bool applied = EstablishInitialPrivacy(&route);
-    CloseMixerRoute(&route);
     if (!applied) {
+        CloseMixerRoute(&route);
         Log(
             ANDROID_LOG_ERROR,
             "Initial session privacy failed; retaining the snapshot for recovery.");
         return PrivacyStartResult::Failed;
     }
 
-    if (!NotifyGuardian(guardianFd, kGuardianIdle)) {
+    if (!NotifyGuardian(guardianFd, kGuardianArmPrivacy) ||
+        !WaitForGuardianMessage(
+            guardianFd,
+            kGuardianPrivacyArmed,
+            kGuardianPrivacyArmedWaitMs)) {
+        CloseMixerRoute(&route);
+        Log(
+            ANDROID_LOG_ERROR,
+            "Guardian did not verify pre-answer microphone and speaker privacy.");
         return PrivacyStartResult::Failed;
     }
     Log(
         ANDROID_LOG_INFO,
-        "Early session privacy active: tablet microphone and speaker are muted.");
+        "Pre-answer privacy verified: tablet microphone and speaker are muted.");
+    WriteCurrentState(CurrentState::WaitingForCall);
 
-    if (!WaitForInCall() ||
-        ReadLiveCallState() != LiveCallState::SingleSafe) {
-        const LiveCallState callState = ReadLiveCallState();
-        return callState == LiveCallState::None
-            ? PrivacyStartResult::RemoteHangup
-            : PrivacyStartResult::Failed;
+    bool privateCallRouteFound = false;
+    for (int attempt = 0;
+         attempt < kMixerRouteWaitIterations && !gStopRequested;
+         ++attempt) {
+        bool startupRouteReady = false;
+        const ivrdroid::PrivacyObservation observation =
+            EnforcePrivateControls(&route, &startupRouteReady);
+        if (observation != ivrdroid::PrivacyObservation::Contended &&
+            startupRouteReady &&
+            SameRoute(ReadRoute(route), PrivacyRoute(route))) {
+            privateCallRouteFound = true;
+            break;
+        }
+        usleep(kMixerRouteWaitSleepUs);
+    }
+    CloseMixerRoute(&route);
+    if (!privateCallRouteFound) {
+        Log(
+            ANDROID_LOG_ERROR,
+            "Timed out waiting for the audited private in-call mixer route.");
+        return PrivacyResultForCallDisposition(ReadLiveCallState());
     }
 
+    if (!WaitForInCall()) {
+        return PrivacyResultForCallDisposition(ReadLiveCallState());
+    }
+    const LiveCallObservation activeCall = ReadLiveCallObservation();
+    if (activeCall.disposition !=
+        ivrdroid::CallDisposition::SingleSafe) {
+        return PrivacyResultForCallDisposition(
+            activeCall.disposition);
+    }
+    if (activeCall.identityHash != initialCall.identityHash) {
+        Log(
+            ANDROID_LOG_WARN,
+            "Telecom call identity changed while IVR privacy was starting.");
+        return PrivacyStartResult::ExternalPreempt;
+    }
+
+    if (!NotifyGuardian(guardianFd, kGuardianIdle)) {
+        return PrivacyStartResult::Failed;
+    }
     if (!WaitForGuardianPrivacyReady(guardianFd)) {
         Log(
             ANDROID_LOG_ERROR,
@@ -1078,7 +1526,8 @@ bool HasPrivateSessionRoute() {
 }
 
 bool RestorePrivateSession() {
-    const MixerRecoveryResult result = RecoverMixerSnapshot();
+    const MixerRecoveryResult result = RecoverMixerSnapshot(
+        MixerRestoreTarget::AuditedPostCall);
     if (result != MixerRecoveryResult::Restored) {
         Log(ANDROID_LOG_ERROR, "Could not restore the session privacy snapshot.");
         return false;
@@ -1092,9 +1541,7 @@ PromptResult ProcessPrompt(
     CurrentState playingState,
     int guardianFd) {
     if (!IsAudioInCall()) {
-        return ReadLiveCallState() == LiveCallState::None
-            ? PromptResult::RemoteHangup
-            : PromptResult::Failed;
+        return PromptResultForCallDisposition(ReadLiveCallState());
     }
     if (!ValidatePromptFile(promptPath) ||
         !NotifyGuardian(guardianFd, kGuardianPrompt)) {
@@ -1131,9 +1578,7 @@ PromptResult ProcessPrompt(
 
     if (!played) {
         Log(ANDROID_LOG_WARN, "Prompt stopped early; privacy route was restored.");
-        return ReadLiveCallState() == LiveCallState::None
-            ? PromptResult::RemoteHangup
-            : PromptResult::Failed;
+        return PromptResultForCallDisposition(ReadLiveCallState());
     }
     Log(ANDROID_LOG_INFO, "Prompt completed; session privacy remains active.");
     return PromptResult::Completed;
@@ -1143,6 +1588,8 @@ enum class DtmfResultKind {
     Digit,
     Timeout,
     CallEnded,
+    EmergencyPreempt,
+    ExternalPreempt,
     CaptureError,
     Stopped,
 };
@@ -1154,7 +1601,20 @@ struct DtmfResult {
 
 DtmfResult CaptureDtmfDigit(int guardianFd) {
     if (gProfile == nullptr) return {DtmfResultKind::CaptureError, 0};
-    if (!IsAudioInCall()) return {DtmfResultKind::CallEnded, 0};
+    if (!IsAudioInCall()) {
+        const ivrdroid::CallDisposition disposition =
+            ReadLiveCallState();
+        if (disposition == ivrdroid::CallDisposition::Idle) {
+            return {DtmfResultKind::CallEnded, 0};
+        }
+        if (disposition == ivrdroid::CallDisposition::Emergency) {
+            return {DtmfResultKind::EmergencyPreempt, 0};
+        }
+        if (disposition == ivrdroid::CallDisposition::Multiple) {
+            return {DtmfResultKind::ExternalPreempt, 0};
+        }
+        return {DtmfResultKind::CaptureError, 0};
+    }
     if (!HasPrivateSessionRoute()) {
         Log(ANDROID_LOG_ERROR, "Session privacy route changed before DTMF capture.");
         return {DtmfResultKind::CaptureError, 0};
@@ -1232,9 +1692,18 @@ DtmfResult CaptureDtmfDigit(int guardianFd) {
         if ((frame + 1) % kDtmfCallCheckFrames == 0 &&
             !IsAudioInCall()) {
             pcm_close(input);
-            return ReadLiveCallState() == LiveCallState::None
-                ? DtmfResult {DtmfResultKind::CallEnded, 0}
-                : DtmfResult {DtmfResultKind::CaptureError, 0};
+            const ivrdroid::CallDisposition disposition =
+                ReadLiveCallState();
+            if (disposition == ivrdroid::CallDisposition::Idle) {
+                return {DtmfResultKind::CallEnded, 0};
+            }
+            if (disposition == ivrdroid::CallDisposition::Emergency) {
+                return {DtmfResultKind::EmergencyPreempt, 0};
+            }
+            if (disposition == ivrdroid::CallDisposition::Multiple) {
+                return {DtmfResultKind::ExternalPreempt, 0};
+            }
+            return {DtmfResultKind::CaptureError, 0};
         }
     }
 
@@ -1245,50 +1714,64 @@ DtmfResult CaptureDtmfDigit(int guardianFd) {
 }
 
 bool ReadTelecomDump(std::string* dump) {
-    FILE* pipe = popen("/system/bin/dumpsys telecom 2>/dev/null", "r");
-    if (pipe == nullptr) return false;
-
-    dump->clear();
-    bool foundStart = false;
-    bool foundEnd = false;
-    char line[4096] = {};
-    while (std::fgets(line, sizeof(line), pipe) != nullptr) {
-        const bool isStart = std::strstr(line, "mCalls:") != nullptr;
-        if (isStart) foundStart = true;
-        if (foundStart) {
-            const size_t length = std::strlen(line);
-            if (dump->size() + length > kMaximumTelecomDumpBytes) break;
-            dump->append(line, length);
-            if (std::strstr(line, "mCallAudioManager:") != nullptr) {
-                foundEnd = true;
-                break;
-            }
-        }
+    std::string fullDump;
+    if (!CaptureDumpsys(
+            "telecom",
+            kMaximumTelecomDumpBytes,
+            &fullDump)) {
+        return false;
     }
-    pclose(pipe);
-    return foundStart && foundEnd;
+
+    const size_t calls = fullDump.find("mCalls:");
+    if (calls == std::string::npos) return false;
+    const size_t start = fullDump.rfind('\n', calls);
+    const size_t audioManager =
+        fullDump.find("mCallAudioManager:", calls);
+    if (audioManager == std::string::npos) return false;
+    const size_t end = fullDump.find('\n', audioManager);
+    *dump = fullDump.substr(
+        start == std::string::npos ? 0 : start + 1,
+        (end == std::string::npos ? fullDump.size() : end + 1) -
+            (start == std::string::npos ? 0 : start + 1));
+    return true;
 }
 
-LiveCallState ReadLiveCallState() {
+LiveCallObservation ReadLiveCallObservation() {
     std::string dump;
-    if (!ReadTelecomDump(&dump)) return LiveCallState::UnsafeOrUnknown;
+    if (!ReadTelecomDump(&dump)) {
+        return {};
+    }
     const ivrdroid::TelecomCallSnapshot snapshot =
         ivrdroid::ParseTelecomCallSnapshot(dump);
-    if (!snapshot.parsed) return LiveCallState::UnsafeOrUnknown;
-    if (snapshot.liveCallCount == 0) return LiveCallState::None;
-    return ivrdroid::CanForceEndSingleCall(snapshot)
-        ? LiveCallState::SingleSafe
-        : LiveCallState::UnsafeOrUnknown;
+    return {
+        ivrdroid::ClassifyCallDisposition(snapshot),
+        ivrdroid::StableCallIdentityHash(snapshot),
+    };
+}
+
+ivrdroid::CallDisposition ReadLiveCallState() {
+    return ReadLiveCallObservation().disposition;
 }
 
 bool SendFixedTelecomEndCall() {
     if (gProfile == nullptr) return false;
+    const pid_t parentPid = getpid();
     const pid_t child = fork();
     if (child < 0) {
         Log(ANDROID_LOG_ERROR, "Could not fork the pinned Telecom end-call transaction.");
         return false;
     }
     if (child == 0) {
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+            getppid() != parentPid) {
+            _exit(126);
+        }
+        const int nullFd = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (nullFd >= 0) {
+            dup2(nullFd, STDOUT_FILENO);
+            dup2(nullFd, STDERR_FILENO);
+            close(nullFd);
+        }
         execl(
             kServicePath,
             kServicePath,
@@ -1301,47 +1784,156 @@ bool SendFixedTelecomEndCall() {
         _exit(127);
     }
 
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno != EINTR) return false;
+    const int64_t deadline =
+        MonotonicMilliseconds() + kTelecomEndCallTimeoutMs;
+    while (MonotonicMilliseconds() < deadline) {
+        int status = 0;
+        const pid_t result = waitpid(child, &status, WNOHANG);
+        if (result == child) {
+            return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        }
+        if (result < 0 && errno != EINTR) return false;
+        usleep(50'000);
     }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    kill(child, SIGKILL);
+    while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+    Log(
+        ANDROID_LOG_ERROR,
+        "Pinned Telecom end-call transaction timed out.");
+    return false;
 }
+
+bool ForcePrivateRouteForRecovery();
 
 enum class EndCallResult {
     Ended,
-    NoCall,
-    Skipped,
+    EmergencyPreempt,
+    ExternalPreempt,
+    UnverifiedPreempt,
     Failed,
 };
 
 EndCallResult EndSingleCallAndWait() {
-    const LiveCallState initialState = ReadLiveCallState();
-    if (initialState == LiveCallState::None) return EndCallResult::NoCall;
-    if (initialState != LiveCallState::SingleSafe) {
-        Log(ANDROID_LOG_WARN, "Refusing global hangup: Telecom state is unsafe.");
-        return EndCallResult::Skipped;
-    }
-
-    const LiveCallState confirmedState = ReadLiveCallState();
-    if (confirmedState == LiveCallState::None) return EndCallResult::NoCall;
-    if (confirmedState != LiveCallState::SingleSafe) {
+    ivrdroid::PersistentSessionSnapshot sessionSnapshot {};
+    if (!LoadSnapshot(&sessionSnapshot) ||
+        ivrdroid::ClassifySnapshotBoot(sessionSnapshot, gBootId) !=
+            ivrdroid::SnapshotBootRelation::SameBoot ||
+        sessionSnapshot.callIdentityHash == 0) {
         Log(
             ANDROID_LOG_WARN,
-            "Refusing global hangup: Telecom state changed before execution.");
-        return EndCallResult::Skipped;
+            "No trustworthy current-boot call identity is available; "
+            "refusing a global hangup.");
+        return EndCallResult::UnverifiedPreempt;
     }
 
-    Log(ANDROID_LOG_INFO, "Sending the pinned Telecom end-call transaction.");
-    if (!SendFixedTelecomEndCall()) return EndCallResult::Failed;
-    for (int attempt = 0; attempt < 30; ++attempt) {
-        if (ReadLiveCallState() == LiveCallState::None &&
-            !IsAudioInCall()) {
+    ivrdroid::CallRecoveryPolicy policy(
+        kRecoveryIdleConfirmationMs,
+        kRecoveryAudioLagMaximumMs,
+        kRecoverySingleCallConfirmationMs,
+        kRecoveryUnknownMaximumMs,
+        kRecoveryHangupRetryMs,
+        kRecoveryTotalMaximumMs,
+        kRecoveryMaximumHangupAttempts);
+    policy.Start(MonotonicMilliseconds());
+
+    while (!gStopRequested) {
+        const LiveCallObservation call =
+            ReadLiveCallObservation();
+        const ivrdroid::CallDisposition disposition =
+            call.disposition;
+        if (disposition ==
+                ivrdroid::CallDisposition::SingleSafe &&
+            call.identityHash !=
+                sessionSnapshot.callIdentityHash) {
+            Log(
+                ANDROID_LOG_WARN,
+                "Telecom now exposes a different call; refusing to end it.");
+            return EndCallResult::ExternalPreempt;
+        }
+        const AudioModeState audioState = ReadAudioModeState();
+        const int64_t now = MonotonicMilliseconds();
+        const ivrdroid::CallRecoveryDecision decision =
+            policy.Observe(
+                disposition,
+                ToAudioCallDisposition(audioState),
+                now);
+
+        if (decision == ivrdroid::CallRecoveryDecision::EmergencyPreempt) {
+            Log(
+                ANDROID_LOG_WARN,
+                "Emergency call detected; yielding without a Telecom hangup.");
+            return EndCallResult::EmergencyPreempt;
+        }
+        if (decision == ivrdroid::CallRecoveryDecision::ExternalPreempt) {
+            Log(
+                ANDROID_LOG_WARN,
+                "Multiple calls detected; yielding without a global hangup.");
+            return EndCallResult::ExternalPreempt;
+        }
+        if (decision == ivrdroid::CallRecoveryDecision::UnverifiedPreempt) {
+            Log(
+                ANDROID_LOG_WARN,
+                "Telecom state remained unverified; yielding audio ownership "
+                "without a global hangup.");
+            return EndCallResult::UnverifiedPreempt;
+        }
+        if (decision == ivrdroid::CallRecoveryDecision::Complete) {
             return EndCallResult::Ended;
         }
-        usleep(100'000);
+        if (decision ==
+            ivrdroid::CallRecoveryDecision::CompleteAfterAudioLag) {
+            Log(
+                ANDROID_LOG_WARN,
+                "Telecom remained idle while Android audio mode lagged; "
+                "restoring the audited normal route.");
+            return EndCallResult::Ended;
+        }
+        if (decision == ivrdroid::CallRecoveryDecision::Fail) {
+            Log(
+                ANDROID_LOG_ERROR,
+                "Could not reconcile Telecom and audio state within the recovery bound.");
+            return EndCallResult::Failed;
+        }
+
+        if (disposition != ivrdroid::CallDisposition::Unknown &&
+            !ForcePrivateRouteForRecovery()) {
+            return EndCallResult::Failed;
+        }
+        if (decision == ivrdroid::CallRecoveryDecision::RequestHangup) {
+            const LiveCallObservation finalCheck =
+                ReadLiveCallObservation();
+            if (finalCheck.disposition ==
+                ivrdroid::CallDisposition::Emergency) {
+                return EndCallResult::EmergencyPreempt;
+            }
+            if (finalCheck.disposition ==
+                    ivrdroid::CallDisposition::Multiple ||
+                (finalCheck.disposition ==
+                    ivrdroid::CallDisposition::SingleSafe &&
+                 finalCheck.identityHash !=
+                    sessionSnapshot.callIdentityHash)) {
+                return EndCallResult::ExternalPreempt;
+            }
+            if (finalCheck.disposition !=
+                    ivrdroid::CallDisposition::SingleSafe ||
+                finalCheck.identityHash == 0) {
+                return EndCallResult::UnverifiedPreempt;
+            }
+            Log(
+                ANDROID_LOG_INFO,
+                "Sending the pinned Telecom end-call transaction.");
+            const bool sent = SendFixedTelecomEndCall();
+            if (!policy.RecordHangupAttempt(now)) {
+                return EndCallResult::Failed;
+            }
+            if (!sent) {
+                Log(
+                    ANDROID_LOG_WARN,
+                    "Pinned Telecom hangup failed; retaining privacy before one bounded retry.");
+            }
+        }
+        usleep(kRecoveryPollSleepUs);
     }
-    Log(ANDROID_LOG_ERROR, "Telecom returned without ending the active call.");
     return EndCallResult::Failed;
 }
 
@@ -1378,7 +1970,11 @@ bool ForcePrivateRouteForRecovery() {
     for (int attempt = 0;
          attempt < kPrivacyRecoveryAttempts && !gStopRequested;
          ++attempt) {
-        if (ApplyPrivacyRoute(&route)) {
+        bool startupRouteReady = false;
+        if (EnforcePrivateControls(
+                &route,
+                &startupRouteReady) !=
+            ivrdroid::PrivacyObservation::Contended) {
             applied = true;
             break;
         }
@@ -1393,21 +1989,52 @@ bool ForcePrivateRouteForRecovery() {
     return applied;
 }
 
-bool RecoverAndEndFailedSession(LastResult failureResult) {
-    WriteCurrentState(CurrentState::Recovering);
-    if (!ForcePrivateRouteForRecovery()) {
-        WriteLastResult(LastResult::FailedRestore);
-        WriteCurrentState(CurrentState::Error);
-        Log(ANDROID_LOG_ERROR, "Session guardian could not retain mixer privacy.");
-        return false;
+bool ReleaseSessionForPreemption(LastResult result) {
+    WriteCurrentState(CurrentState::Preempting);
+    bool released = true;
+    if (access(kSnapshotPath, F_OK) == 0) {
+        ivrdroid::PersistentSessionSnapshot snapshot {};
+        if (LoadSnapshot(&snapshot) &&
+            ivrdroid::ClassifySnapshotBoot(snapshot, gBootId) ==
+                ivrdroid::SnapshotBootRelation::SameBoot) {
+            if (!RestoreRouteForPreemption(
+                    SnapshotRoute(snapshot))) {
+                Log(
+                    ANDROID_LOG_ERROR,
+                    "Could not restore the owned mixer route during call preemption.");
+                released = false;
+            }
+        } else {
+            Log(
+                ANDROID_LOG_WARN,
+                "Discarding an unusable mixer snapshot during call preemption.");
+        }
+        if (!ClearSnapshot()) {
+            released = false;
+        }
+    } else if (errno != ENOENT) {
+        released = false;
     }
 
+    WriteLastResult(result);
+    WriteCurrentState(CurrentState::BlockedByCall);
+    return released;
+}
+
+bool RecoverAndEndFailedSession(LastResult failureResult) {
+    WriteCurrentState(CurrentState::Recovering);
     const EndCallResult endResult = EndSingleCallAndWait();
-    if (endResult == EndCallResult::Skipped) {
-        ForcePrivateRouteForRecovery();
-        WriteLastResult(LastResult::RecoveryHangupSkipped);
-        WriteCurrentState(CurrentState::Error);
-        return false;
+    if (endResult == EndCallResult::EmergencyPreempt) {
+        return ReleaseSessionForPreemption(
+            LastResult::EmergencyPreempted);
+    }
+    if (endResult == EndCallResult::ExternalPreempt) {
+        return ReleaseSessionForPreemption(
+            LastResult::ExternalCallPreempted);
+    }
+    if (endResult == EndCallResult::UnverifiedPreempt) {
+        return ReleaseSessionForPreemption(
+            LastResult::UnverifiedCallPreempted);
     }
     if (endResult == EndCallResult::Failed) {
         ForcePrivateRouteForRecovery();
@@ -1416,7 +2043,8 @@ bool RecoverAndEndFailedSession(LastResult failureResult) {
         return false;
     }
 
-    const MixerRecoveryResult mixerResult = RecoverMixerSnapshot();
+    const MixerRecoveryResult mixerResult = RecoverMixerSnapshot(
+        MixerRestoreTarget::AuditedPostCall);
     if (mixerResult == MixerRecoveryResult::Failed) {
         WriteLastResult(LastResult::FailedRestore);
         WriteCurrentState(CurrentState::Error);
@@ -1429,13 +2057,126 @@ bool RecoverAndEndFailedSession(LastResult failureResult) {
     return true;
 }
 
+struct CallMonitor {
+    int eventFd = -1;
+    pid_t pid = -1;
+};
+
+struct CallMonitorEvent {
+    uint64_t identityHash;
+    uint8_t disposition;
+    std::array<uint8_t, 7> reserved;
+};
+
+static_assert(sizeof(CallMonitorEvent) == 16);
+
+[[noreturn]] void CallMonitorProcess(
+    int eventFd,
+    int inheritedControlFd,
+    pid_t guardianPid) {
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    close(inheritedControlFd);
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+        getppid() != guardianPid) {
+        close(eventFd);
+        _exit(1);
+    }
+
+    while (true) {
+        const LiveCallObservation observation =
+            ReadLiveCallObservation();
+        const CallMonitorEvent event {
+            observation.identityHash,
+            static_cast<uint8_t>(observation.disposition),
+            {},
+        };
+        const ssize_t sent = send(
+            eventFd,
+            &event,
+            sizeof(event),
+            MSG_NOSIGNAL);
+        if (sent != static_cast<ssize_t>(sizeof(event))) {
+            close(eventFd);
+            _exit(0);
+        }
+        usleep(static_cast<useconds_t>(kCallMonitorPollMs * 1'000));
+    }
+}
+
+bool StartCallMonitor(
+    CallMonitor* monitor,
+    int guardianControlFd) {
+    int descriptors[2] = {-1, -1};
+    if (socketpair(
+            AF_UNIX,
+            SOCK_SEQPACKET | SOCK_CLOEXEC,
+            0,
+            descriptors) != 0) {
+        return false;
+    }
+
+    const pid_t guardianPid = getpid();
+    const pid_t child = fork();
+    if (child < 0) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return false;
+    }
+    if (child == 0) {
+        close(descriptors[0]);
+        CallMonitorProcess(
+            descriptors[1],
+            guardianControlFd,
+            guardianPid);
+    }
+
+    close(descriptors[1]);
+    monitor->eventFd = descriptors[0];
+    monitor->pid = child;
+    return true;
+}
+
+void StopCallMonitor(CallMonitor* monitor) {
+    if (monitor->eventFd >= 0) {
+        close(monitor->eventFd);
+        monitor->eventFd = -1;
+    }
+    if (monitor->pid <= 0) return;
+
+    kill(monitor->pid, SIGTERM);
+    int status = 0;
+    while (waitpid(monitor->pid, &status, 0) < 0) {
+        if (errno != EINTR) break;
+    }
+    monitor->pid = -1;
+}
+
+[[noreturn]] void PreemptAndExitGuardian(
+    int controlFd,
+    pid_t workerPid,
+    MixerRoute* privacyRoute,
+    CallMonitor* callMonitor,
+    LastResult result,
+    bool stopWorker) {
+    if (stopWorker) kill(workerPid, SIGKILL);
+    StopCallMonitor(callMonitor);
+    CloseMixerRoute(privacyRoute);
+    const bool released = ReleaseSessionForPreemption(result);
+    close(controlFd);
+    _exit(released ? 0 : 1);
+}
+
 [[noreturn]] void RecoverAndExitGuardian(
     int controlFd,
     pid_t workerPid,
     MixerRoute* privacyRoute,
+    CallMonitor* callMonitor,
     LastResult failureResult,
     bool stopWorker) {
     if (stopWorker) kill(workerPid, SIGKILL);
+    StopCallMonitor(callMonitor);
     CloseMixerRoute(privacyRoute);
     const bool recovered = RecoverAndEndFailedSession(failureResult);
     close(controlFd);
@@ -1452,14 +2193,28 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
         MonotonicMilliseconds() + kGuardianWaitForCallMs;
     MixerRoute privacyRoute {};
     bool privacyEnforcementActive = false;
+    bool privacyArmedSent = false;
     bool privacyReadySent = false;
     unsigned int correctionCount = 0;
     unsigned int consecutiveContendedSamples = 0;
+    char currentPhase = 0;
+    uint64_t expectedCallIdentityHash = 0;
+    RouteValues preAnswerSnapshot {};
+    CallMonitor callMonitor;
     ivrdroid::PrivacyStabilityPolicy privacyPolicy(
         kPrivacyRequiredStableMs,
         kPrivacyMaximumUnverifiedMs);
+    ivrdroid::SessionCallMonitorPolicy callPolicy(
+        kSessionIdleConfirmationMs,
+        kSessionUnknownMaximumMs);
 
     const auto enforcePrivacy = [&]() {
+        if (!privacyArmedSent &&
+            !ApplyPreAnswerPrivacyRoute(&privacyRoute)) {
+            Log(
+                ANDROID_LOG_WARN,
+                "Pre-answer route changed before guardian verification; retrying.");
+        }
         bool startupRouteReady = false;
         const ivrdroid::PrivacyObservation observation =
             EnforcePrivateControls(
@@ -1493,6 +2248,25 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
             }
         }
 
+        if (!privacyArmedSent) {
+            const RouteValues preAnswerPrivacy =
+                PreAnswerPrivacyRoute(NormalRoute(privacyRoute));
+            if (SameRoute(ReadRoute(privacyRoute), preAnswerPrivacy)) {
+                if (!NotifyGuardian(
+                        controlFd,
+                        kGuardianPrivacyArmed)) {
+                    Log(
+                        ANDROID_LOG_ERROR,
+                        "Could not acknowledge pre-answer session privacy.");
+                    return false;
+                }
+                privacyArmedSent = true;
+                Log(
+                    ANDROID_LOG_INFO,
+                    "Guardian verified pre-answer microphone and speaker privacy.");
+            }
+        }
+
         if (decision == ivrdroid::PrivacyDecision::Abort) {
             Log(
                 ANDROID_LOG_ERROR,
@@ -1501,6 +2275,7 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
             return false;
         }
         if (decision == ivrdroid::PrivacyDecision::Ready &&
+            privacyArmedSent &&
             !privacyReadySent) {
             if (!NotifyGuardian(controlFd, kGuardianPrivacyReady)) {
                 Log(
@@ -1528,8 +2303,16 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
             : nextDeadline;
         const int timeout = static_cast<int>(
             std::max<int64_t>(0, nextWake - now));
-        pollfd descriptor {controlFd, POLLIN | POLLHUP, 0};
-        const int result = poll(&descriptor, 1, timeout);
+        std::array<pollfd, 2> descriptors {{
+            {controlFd, POLLIN | POLLHUP, 0},
+            {callMonitor.eventFd, POLLIN | POLLHUP, 0},
+        }};
+        const nfds_t descriptorCount =
+            callMonitor.eventFd >= 0 ? 2 : 1;
+        const int result = poll(
+            descriptors.data(),
+            descriptorCount,
+            timeout);
 
         if (result == 0) {
             if (MonotonicMilliseconds() >= nextDeadline) {
@@ -1538,6 +2321,7 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                     controlFd,
                     workerPid,
                     &privacyRoute,
+                    &callMonitor,
                     LastResult::RecoveredAndEnded,
                     true);
             }
@@ -1549,6 +2333,7 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                     controlFd,
                     workerPid,
                     &privacyRoute,
+                    &callMonitor,
                     LastResult::FailedAudio,
                     true);
             }
@@ -1560,34 +2345,212 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                 controlFd,
                 workerPid,
                 &privacyRoute,
+                &callMonitor,
                 LastResult::RecoveredAndEnded,
                 true);
         }
 
         char phase = 0;
-        const ssize_t count = read(controlFd, &phase, 1);
-        if (count == 0) {
-            RecoverAndExitGuardian(
-                controlFd,
-                workerPid,
-                &privacyRoute,
-                LastResult::RecoveredAndEnded,
-                false);
+        bool controlClosed = false;
+        if ((descriptors[0].revents & POLLIN) != 0) {
+            const ssize_t count = recv(controlFd, &phase, 1, 0);
+            if (count == 1) {
+                currentPhase = phase;
+            } else if (count == 0) {
+                controlClosed = true;
+            } else if (errno != EINTR) {
+                controlClosed = true;
+            }
+        } else if ((descriptors[0].revents &
+                    (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            controlClosed = true;
         }
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            RecoverAndExitGuardian(
+
+        if (callMonitor.eventFd >= 0 &&
+            (descriptors[1].revents & POLLIN) != 0) {
+            CallMonitorEvent event {};
+            const ssize_t count = recv(
+                callMonitor.eventFd,
+                &event,
+                sizeof(event),
+                0);
+            const bool reservedClear = std::all_of(
+                event.reserved.begin(),
+                event.reserved.end(),
+                [](uint8_t value) { return value == 0; });
+            if (count != static_cast<ssize_t>(sizeof(event)) ||
+                event.disposition > static_cast<uint8_t>(
+                    ivrdroid::CallDisposition::Unknown) ||
+                !reservedClear) {
+                Log(
+                    ANDROID_LOG_ERROR,
+                    "Independent call monitor returned an invalid observation.");
+                PreemptAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    &callMonitor,
+                    LastResult::UnverifiedCallPreempted,
+                    true);
+            }
+
+            const auto disposition =
+                static_cast<ivrdroid::CallDisposition>(
+                    event.disposition);
+            if (disposition ==
+                    ivrdroid::CallDisposition::SingleSafe &&
+                (event.identityHash == 0 ||
+                 event.identityHash != expectedCallIdentityHash)) {
+                Log(
+                    ANDROID_LOG_WARN,
+                    "Independent call monitor detected a different call.");
+                PreemptAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    &callMonitor,
+                    LastResult::ExternalCallPreempted,
+                    true);
+            }
+            const bool endingCall =
+                currentPhase == kGuardianEndCall ||
+                currentPhase == kGuardianDone;
+            const ivrdroid::SessionCallDecision callDecision =
+                callPolicy.Observe(
+                    disposition,
+                    endingCall,
+                    MonotonicMilliseconds());
+            if (callDecision ==
+                ivrdroid::SessionCallDecision::EmergencyPreempt) {
+                Log(
+                    ANDROID_LOG_WARN,
+                    "Call monitor detected an emergency; releasing IVR audio ownership.");
+                PreemptAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    &callMonitor,
+                    LastResult::EmergencyPreempted,
+                    true);
+            }
+            if (callDecision ==
+                ivrdroid::SessionCallDecision::ExternalPreempt) {
+                Log(
+                    ANDROID_LOG_WARN,
+                    "Call monitor detected multiple calls; yielding to Android.");
+                PreemptAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    &callMonitor,
+                    LastResult::ExternalCallPreempted,
+                    true);
+            }
+            if (callDecision ==
+                ivrdroid::SessionCallDecision::RemoteEnded) {
+                Log(
+                    ANDROID_LOG_INFO,
+                    "Call monitor confirmed that the remote call ended.");
+                RecoverAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    &callMonitor,
+                    LastResult::RemoteHangup,
+                    true);
+            }
+            if (callDecision ==
+                ivrdroid::SessionCallDecision::UnverifiedPreempt) {
+                Log(
+                    ANDROID_LOG_WARN,
+                    "Call monitor could not verify Telecom state; "
+                    "releasing IVR audio ownership.");
+                PreemptAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    &callMonitor,
+                    LastResult::UnverifiedCallPreempted,
+                    true);
+            }
+        } else if (callMonitor.eventFd >= 0 &&
+                   (descriptors[1].revents &
+                    (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            Log(
+                ANDROID_LOG_ERROR,
+                "Independent call monitor exited; releasing IVR audio ownership.");
+            PreemptAndExitGuardian(
                 controlFd,
                 workerPid,
                 &privacyRoute,
-                LastResult::RecoveredAndEnded,
+                &callMonitor,
+                LastResult::UnverifiedCallPreempted,
                 true);
         }
 
-        if (phase == kGuardianDone || phase == kGuardianRemoteHangup) {
+        if (controlClosed) {
+            RecoverAndExitGuardian(
+                controlFd,
+                workerPid,
+                &privacyRoute,
+                &callMonitor,
+                LastResult::RecoveredAndEnded,
+                false);
+        }
+        if (phase == 0) {
+            if (privacyEnforcementActive && !enforcePrivacy()) {
+                RecoverAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    &callMonitor,
+                    LastResult::FailedAudio,
+                    true);
+            }
+            continue;
+        }
+
+        if (phase == kGuardianDone) {
+            StopCallMonitor(&callMonitor);
             CloseMixerRoute(&privacyRoute);
             close(controlFd);
             _exit(0);
+        }
+        if (phase == kGuardianRemoteHangup) {
+            RecoverAndExitGuardian(
+                controlFd,
+                workerPid,
+                &privacyRoute,
+                &callMonitor,
+                LastResult::RemoteHangup,
+                false);
+        }
+        if (phase == kGuardianEmergencyPreempt) {
+            PreemptAndExitGuardian(
+                controlFd,
+                workerPid,
+                &privacyRoute,
+                &callMonitor,
+                LastResult::EmergencyPreempted,
+                false);
+        }
+        if (phase == kGuardianExternalPreempt) {
+            PreemptAndExitGuardian(
+                controlFd,
+                workerPid,
+                &privacyRoute,
+                &callMonitor,
+                LastResult::ExternalCallPreempted,
+                false);
+        }
+        if (phase == kGuardianUnverifiedPreempt) {
+            PreemptAndExitGuardian(
+                controlFd,
+                workerPid,
+                &privacyRoute,
+                &callMonitor,
+                LastResult::UnverifiedCallPreempted,
+                false);
         }
         if (phase == kGuardianAudioFailure ||
             phase == kGuardianCaptureFailure ||
@@ -1598,23 +2561,62 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                     : phase == kGuardianEndCallFailure
                         ? LastResult::FailedEndCall
                         : LastResult::FailedAudio;
-            CloseMixerRoute(&privacyRoute);
-            const bool recovered = RecoverAndEndFailedSession(failureResult);
-            close(controlFd);
-            _exit(recovered ? 0 : 1);
+            RecoverAndExitGuardian(
+                controlFd,
+                workerPid,
+                &privacyRoute,
+                &callMonitor,
+                failureResult,
+                false);
         }
-        if (phase == kGuardianIdle && !privacyEnforcementActive) {
-            if (!OpenMixerRoute(&privacyRoute)) {
+        if (phase == kGuardianArmPrivacy &&
+            !privacyEnforcementActive) {
+            ivrdroid::PersistentSessionSnapshot snapshot {};
+            if (!LoadSnapshot(&snapshot) ||
+                ivrdroid::ClassifySnapshotBoot(snapshot, gBootId) !=
+                    ivrdroid::SnapshotBootRelation::SameBoot ||
+                snapshot.callIdentityHash == 0) {
                 Log(
                     ANDROID_LOG_ERROR,
-                    "Session guardian could not start privacy enforcement.");
+                    "Session guardian could not load the owned call identity.");
+                PreemptAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    &callMonitor,
+                    LastResult::UnverifiedCallPreempted,
+                    true);
+            }
+            expectedCallIdentityHash = snapshot.callIdentityHash;
+            preAnswerSnapshot = SnapshotRoute(snapshot);
+            if (!StartCallMonitor(&callMonitor, controlFd) ||
+                !OpenMixerRoute(&privacyRoute)) {
+                Log(
+                    ANDROID_LOG_ERROR,
+                    "Session guardian could not start its independent monitors.");
                 RecoverAndExitGuardian(
                     controlFd,
                     workerPid,
                     &privacyRoute,
+                    &callMonitor,
                     LastResult::FailedAudio,
                     true);
             }
+            if (!ValidatePreAnswerBaseline(
+                    privacyRoute,
+                    preAnswerSnapshot)) {
+                Log(
+                    ANDROID_LOG_ERROR,
+                    "Session guardian rejected the pre-answer mixer snapshot.");
+                RecoverAndExitGuardian(
+                    controlFd,
+                    workerPid,
+                    &privacyRoute,
+                    &callMonitor,
+                    LastResult::FailedAudio,
+                    true);
+            }
+            callPolicy.Start(MonotonicMilliseconds());
             privacyPolicy.Start(MonotonicMilliseconds());
             privacyEnforcementActive = true;
             if (!enforcePrivacy()) {
@@ -1625,9 +2627,23 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                     controlFd,
                     workerPid,
                     &privacyRoute,
+                    &callMonitor,
                     LastResult::FailedAudio,
                     true);
             }
+        }
+        if (phase == kGuardianIdle &&
+            !privacyEnforcementActive) {
+            Log(
+                ANDROID_LOG_ERROR,
+                "Session reached the in-call phase before privacy was armed.");
+            RecoverAndExitGuardian(
+                controlFd,
+                workerPid,
+                &privacyRoute,
+                &callMonitor,
+                LastResult::FailedAudio,
+                true);
         }
         phaseDeadline =
             MonotonicMilliseconds() + GuardianPhaseTimeout(phase);
@@ -1639,6 +2655,7 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                 controlFd,
                 workerPid,
                 &privacyRoute,
+                &callMonitor,
                 LastResult::FailedAudio,
                 true);
         }
@@ -1696,6 +2713,9 @@ bool FinishSessionGuardian(SessionGuardian* guardian, char result) {
 enum class SessionOutcome {
     Complete,
     RemoteHangup,
+    EmergencyPreempt,
+    ExternalPreempt,
+    UnverifiedPreempt,
     AudioFailure,
     CaptureFailure,
     EndCallFailure,
@@ -1732,10 +2752,19 @@ SessionOutcome FinishSuccessfulMenu(int guardianFd) {
         return SessionOutcome::EndCallFailure;
     }
     const EndCallResult endResult = EndSingleCallAndWait();
-    return endResult == EndCallResult::Ended ||
-            endResult == EndCallResult::NoCall
-        ? SessionOutcome::Complete
-        : SessionOutcome::EndCallFailure;
+    switch (endResult) {
+        case EndCallResult::Ended:
+            return SessionOutcome::Complete;
+        case EndCallResult::EmergencyPreempt:
+            return SessionOutcome::EmergencyPreempt;
+        case EndCallResult::ExternalPreempt:
+            return SessionOutcome::ExternalPreempt;
+        case EndCallResult::UnverifiedPreempt:
+            return SessionOutcome::UnverifiedPreempt;
+        case EndCallResult::Failed:
+            return SessionOutcome::EndCallFailure;
+    }
+    return SessionOutcome::EndCallFailure;
 }
 
 SessionOutcome RunFixedMenuBody(int guardianFd) {
@@ -1749,6 +2778,12 @@ SessionOutcome RunFixedMenuBody(int guardianFd) {
         if (mainPrompt == PromptResult::RemoteHangup) {
             return SessionOutcome::RemoteHangup;
         }
+        if (mainPrompt == PromptResult::EmergencyPreempt) {
+            return SessionOutcome::EmergencyPreempt;
+        }
+        if (mainPrompt == PromptResult::ExternalPreempt) {
+            return SessionOutcome::ExternalPreempt;
+        }
         if (mainPrompt != PromptResult::Completed) {
             return SessionOutcome::AudioFailure;
         }
@@ -1756,6 +2791,12 @@ SessionOutcome RunFixedMenuBody(int guardianFd) {
         const DtmfResult input = CaptureDtmfDigit(guardianFd);
         if (input.kind == DtmfResultKind::CallEnded) {
             return SessionOutcome::RemoteHangup;
+        }
+        if (input.kind == DtmfResultKind::EmergencyPreempt) {
+            return SessionOutcome::EmergencyPreempt;
+        }
+        if (input.kind == DtmfResultKind::ExternalPreempt) {
+            return SessionOutcome::ExternalPreempt;
         }
         if (input.kind == DtmfResultKind::CaptureError ||
             input.kind == DtmfResultKind::Stopped) {
@@ -1786,6 +2827,12 @@ SessionOutcome RunFixedMenuBody(int guardianFd) {
         if (terminal == PromptResult::RemoteHangup) {
             return SessionOutcome::RemoteHangup;
         }
+        if (terminal == PromptResult::EmergencyPreempt) {
+            return SessionOutcome::EmergencyPreempt;
+        }
+        if (terminal == PromptResult::ExternalPreempt) {
+            return SessionOutcome::ExternalPreempt;
+        }
         if (terminal != PromptResult::Completed) {
             return SessionOutcome::AudioFailure;
         }
@@ -1800,6 +2847,12 @@ SessionOutcome RunFixedMenu(int guardianFd) {
     const PrivacyStartResult privacy = BeginPrivateSession(guardianFd);
     if (privacy == PrivacyStartResult::RemoteHangup) {
         return SessionOutcome::RemoteHangup;
+    }
+    if (privacy == PrivacyStartResult::EmergencyPreempt) {
+        return SessionOutcome::EmergencyPreempt;
+    }
+    if (privacy == PrivacyStartResult::ExternalPreempt) {
+        return SessionOutcome::ExternalPreempt;
     }
     if (privacy != PrivacyStartResult::Started) {
         return SessionOutcome::AudioFailure;
@@ -1861,7 +2914,31 @@ bool ProcessOneCommand() {
         ivrdroid::protocol::Command::StartMenu) {
         Log(ANDROID_LOG_WARN, "Rejected malformed or unknown app request.");
         WriteLastResult(LastResult::RejectedRequest);
-        WriteCurrentState(CurrentState::Ready);
+        return true;
+    }
+
+    const ivrdroid::CallDisposition disposition = ReadLiveCallState();
+    if (disposition != ivrdroid::CallDisposition::SingleSafe) {
+        Log(
+            ANDROID_LOG_WARN,
+            "Rejected START_MENU because Telecom did not expose exactly one "
+            "non-emergency call.");
+        switch (disposition) {
+            case ivrdroid::CallDisposition::Emergency:
+                WriteLastResult(LastResult::EmergencyPreempted);
+                break;
+            case ivrdroid::CallDisposition::Multiple:
+                WriteLastResult(LastResult::ExternalCallPreempted);
+                break;
+            case ivrdroid::CallDisposition::Unknown:
+                WriteLastResult(LastResult::UnverifiedCallPreempted);
+                break;
+            case ivrdroid::CallDisposition::Idle:
+                WriteLastResult(LastResult::RejectedRequest);
+                break;
+            case ivrdroid::CallDisposition::SingleSafe:
+                break;
+        }
         return true;
     }
 
@@ -1871,11 +2948,6 @@ bool ProcessOneCommand() {
         Log(ANDROID_LOG_ERROR, "Could not start the session guardian.");
         WriteLastResult(LastResult::FailedAudio);
         WriteCurrentState(CurrentState::Error);
-        const EndCallResult endResult = EndSingleCallAndWait();
-        if (endResult == EndCallResult::Ended ||
-            endResult == EndCallResult::NoCall) {
-            WriteCurrentState(CurrentState::Ready);
-        }
         return true;
     }
 
@@ -1887,6 +2959,15 @@ bool ProcessOneCommand() {
             break;
         case SessionOutcome::RemoteHangup:
             guardianResult = kGuardianRemoteHangup;
+            break;
+        case SessionOutcome::EmergencyPreempt:
+            guardianResult = kGuardianEmergencyPreempt;
+            break;
+        case SessionOutcome::ExternalPreempt:
+            guardianResult = kGuardianExternalPreempt;
+            break;
+        case SessionOutcome::UnverifiedPreempt:
+            guardianResult = kGuardianUnverifiedPreempt;
             break;
         case SessionOutcome::AudioFailure:
             guardianResult = kGuardianAudioFailure;
@@ -1925,8 +3006,13 @@ bool ProcessOneCommand() {
             outcome == SessionOutcome::Complete
                 ? LastResult::SessionComplete
                 : LastResult::RemoteHangup);
+    } else if (outcome == SessionOutcome::EmergencyPreempt) {
+        WriteLastResult(LastResult::EmergencyPreempted);
+    } else if (outcome == SessionOutcome::ExternalPreempt) {
+        WriteLastResult(LastResult::ExternalCallPreempted);
+    } else if (outcome == SessionOutcome::UnverifiedPreempt) {
+        WriteLastResult(LastResult::UnverifiedCallPreempted);
     }
-    WriteCurrentState(CurrentState::Ready);
     return true;
 }
 
@@ -1934,24 +3020,56 @@ bool RecoverStaleSnapshot() {
     if (access(kSnapshotPath, F_OK) != 0) {
         if (errno != ENOENT) return false;
         if (access(kSnapshotTempPath, F_OK) == 0) {
-            ClearSnapshot();
+            return ClearSnapshot();
         }
         return true;
     }
 
-    Log(ANDROID_LOG_WARN, "Found an unfinished mixer transaction.");
-    WriteCurrentState(CurrentState::Recovering);
-    if (!ForcePrivateRouteForRecovery()) {
+    ivrdroid::PersistentSessionSnapshot snapshot {};
+    if (!LoadSnapshot(&snapshot)) {
+        WriteLastResult(LastResult::FailedRestore);
+        WriteCurrentState(CurrentState::Error);
+        return false;
+    }
+    const ivrdroid::SnapshotBootRelation relation =
+        ivrdroid::ClassifySnapshotBoot(snapshot, gBootId);
+    if (relation == ivrdroid::SnapshotBootRelation::Invalid) {
         WriteLastResult(LastResult::FailedRestore);
         WriteCurrentState(CurrentState::Error);
         return false;
     }
 
+    WriteCurrentState(CurrentState::Recovering);
+    if (relation == ivrdroid::SnapshotBootRelation::PreviousBoot) {
+        Log(
+            ANDROID_LOG_WARN,
+            "Found a mixer transaction from a previous boot; "
+            "discarding it without ending a call or touching the new "
+            "kernel's mixer route.");
+        if (!ClearSnapshot()) {
+            WriteLastResult(LastResult::FailedRestore);
+            WriteCurrentState(CurrentState::Error);
+            return false;
+        }
+        WriteLastResult(LastResult::RecoveredAfterReboot);
+        return true;
+    }
+
+    Log(
+        ANDROID_LOG_WARN,
+        "Found an unfinished mixer transaction from the current boot.");
     const EndCallResult endResult = EndSingleCallAndWait();
-    if (endResult == EndCallResult::Skipped) {
-        ForcePrivateRouteForRecovery();
-        WriteLastResult(LastResult::RecoveryHangupSkipped);
-        return false;
+    if (endResult == EndCallResult::EmergencyPreempt) {
+        return ReleaseSessionForPreemption(
+            LastResult::EmergencyPreempted);
+    }
+    if (endResult == EndCallResult::ExternalPreempt) {
+        return ReleaseSessionForPreemption(
+            LastResult::ExternalCallPreempted);
+    }
+    if (endResult == EndCallResult::UnverifiedPreempt) {
+        return ReleaseSessionForPreemption(
+            LastResult::UnverifiedCallPreempted);
     }
     if (endResult == EndCallResult::Failed) {
         ForcePrivateRouteForRecovery();
@@ -1959,13 +3077,55 @@ bool RecoverStaleSnapshot() {
         return false;
     }
 
-    if (RecoverMixerSnapshot() == MixerRecoveryResult::Failed) {
+    if (RecoverMixerSnapshot(MixerRestoreTarget::AuditedPostCall) ==
+        MixerRecoveryResult::Failed) {
         WriteLastResult(LastResult::FailedRestore);
         WriteCurrentState(CurrentState::Error);
         return false;
     }
     WriteLastResult(LastResult::RecoveredAndEnded);
     return true;
+}
+
+bool WaitForSystemReady() {
+    ivrdroid::SystemReadinessPolicy policy(kSystemIdleConfirmationMs);
+    policy.Start(MonotonicMilliseconds());
+    bool published = false;
+    CurrentState publishedState = CurrentState::WaitingForSystem;
+
+    while (!gStopRequested) {
+        const ivrdroid::CallDisposition disposition = ReadLiveCallState();
+        const AudioModeState audioState = ReadAudioModeState();
+        const ivrdroid::SystemReadinessDecision decision = policy.Observe(
+            disposition,
+            ToAudioCallDisposition(audioState),
+            MonotonicMilliseconds());
+
+        const bool ready =
+            decision == ivrdroid::SystemReadinessDecision::Ready;
+
+        CurrentState state = CurrentState::WaitingForSystem;
+        if (decision == ivrdroid::SystemReadinessDecision::BlockedByCall) {
+            state = CurrentState::BlockedByCall;
+        } else if (ready) {
+            state = CurrentState::Ready;
+        }
+        if (!published || state != publishedState) {
+            WriteCurrentState(state);
+            publishedState = state;
+            published = true;
+            if (state == CurrentState::BlockedByCall) {
+                Log(
+                    ANDROID_LOG_INFO,
+                    "Helper is yielding while Android owns another call.");
+            }
+        }
+        if (ready) {
+            return true;
+        }
+        usleep(kSystemReadinessPollSleepUs);
+    }
+    return false;
 }
 
 bool WritePidFile() {
@@ -1990,7 +3150,11 @@ int Serve() {
         Log(ANDROID_LOG_ERROR, "Helper must run as root.");
         return 10;
     }
-    if (!EnsureStateDirectory() || !ValidateDevice()) return 11;
+    if (!EnsureStateDirectory() ||
+        !InitializeBootIdentity() ||
+        !ValidateDevice()) {
+        return 11;
+    }
     if (!ResolveAndValidateBridge()) {
         Log(ANDROID_LOG_ERROR, "App bridge is unavailable.");
         return 12;
@@ -2007,17 +3171,24 @@ int Serve() {
         close(lockFd);
         return 15;
     }
+    WriteCurrentState(CurrentState::WaitingForSystem);
+    DiscardRequestQueuedWhileBusy();
     if (!RecoverStaleSnapshot()) {
         unlink(kPidPath);
         close(lockFd);
         return 16;
+    }
+    if (!WaitForSystemReady()) {
+        unlink(kPidPath);
+        close(lockFd);
+        return 17;
     }
 
     const int inotifyFd = inotify_init1(IN_CLOEXEC);
     if (inotifyFd < 0) {
         unlink(kPidPath);
         close(lockFd);
-        return 17;
+        return 18;
     }
     const int watch = inotify_add_watch(
         inotifyFd,
@@ -2027,10 +3198,9 @@ int Serve() {
         close(inotifyFd);
         unlink(kPidPath);
         close(lockFd);
-        return 18;
+        return 19;
     }
 
-    WriteCurrentState(CurrentState::Ready);
     Log(
         ANDROID_LOG_INFO,
         "Privileged helper is ready for app UID %u with profile %s.",
@@ -2039,8 +3209,9 @@ int Serve() {
 
     alignas(inotify_event) char events[4096] = {};
     while (!gStopRequested) {
-        ProcessOneCommand();
+        const bool processed = ProcessOneCommand();
         if (gStopRequested) break;
+        if (processed && !WaitForSystemReady()) break;
 
         pollfd descriptor {inotifyFd, POLLIN, 0};
         const int pollResult = poll(&descriptor, 1, 1000);
@@ -2076,6 +3247,7 @@ int Serve() {
 int SelfTest() {
     if (geteuid() != 0 ||
         !EnsureStateDirectory() ||
+        !InitializeBootIdentity() ||
         !ValidateDevice() ||
         !ResolveAndValidateBridge() ||
         !ValidateAllPromptFiles()) {
@@ -2096,12 +3268,14 @@ int SelfTest() {
         return 22;
     }
 
+    const AudioModeState audioState = ReadAudioModeState();
     Log(
         ANDROID_LOG_INFO,
-        "Self-test passed without mutation: profile=%s mode=%s "
+        "Self-test passed without mutation: profile=%s boot=%.8s mode=%s "
         "dout=%d mixer=%d speaker=%d mic=%d appUid=%u.",
         gProfile->id,
-        IsAudioInCall() ? "IN_CALL" : "NORMAL",
+        gBootId.c_str(),
+        AudioModeName(audioState),
         current.dout,
         current.mixer,
         current.speaker,

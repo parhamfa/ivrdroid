@@ -17,25 +17,33 @@ The current build is a verified, single-call, three-option IVR foundation:
 - The helper accepts no paths, mixer values, transaction numbers, or shell text from the app.
 - The helper plays a main prompt, captures caller audio directly through TinyALSA, detects DTMF
   with a stereo Goertzel detector, and handles keys 1, 2, and 0.
+- Before answer, the helper snapshots the observed cold/normal route, mutes both physical
+  endpoints, normalizes the telephony route to audited `AIF4IN`, and obtains an independent
+  guardian acknowledgement. Android is not allowed to answer before that handshake completes.
 - The tablet microphone and speaker remain muted for the entire IVR session. A 5 ms independent
   guardian re-applies that mute when Samsung rewrites the call route, tolerates bounded mixer
   contention, and withholds prompt playback until privacy has remained stable for 500 ms.
-- One durable snapshot covers all four audited mixer controls for the whole session. Normal
-  completion restores it only after the call has ended.
+- One boot-scoped durable snapshot covers all four audited mixer controls, a random session ID,
+  and the current Telecom call identity. Normal completion restores the audited post-call route
+  only after the call has ended.
 - Failure recovery keeps the call private, attempts the pinned Telecom hangup, and preserves the
   snapshot for a supervisor retry if the first hangup does not complete.
+- Emergency, additional, replaced, or persistently unverified calls make the helper release audio
+  ownership without issuing a global Telecom hangup.
 - No captured call audio is written to storage.
 
-Helper v0.3.4 was verified on five consecutive complete key-2 calls using one uninterrupted
-helper process, followed by a forced worker-death call. Every normal call played both prompts,
-detected the digit, disconnected, and restored the exact normal mixer route. The failure test
-interrupted playback, kept both local audio paths muted, disconnected the caller, restored the
-normal route, restarted the helper, and reported `RECOVERED_AND_ENDED`.
+Helper v0.4.7 is installed on the audited tablet with boot startup enabled. Live validation now
+covers repeated normal calls, a cold `DMIX_OUT` first-call baseline, worker death, reboot during
+an unfinished session, forced cellular-radio loss during prompt playback, carrier
+re-registration, and a complete post-loss key-2 call. Every completed call returned to
+`SESSION_COMPLETE`, `MODE_NORMAL`, an idle Telecom state, and no durable snapshot. Emergency
+handling is validated with Telecom-dump fixtures and state-machine tests only; no real emergency
+number was called.
 
-The repeated-call test is a required regression check. Helper v0.3.3 could mistake one
-write/read race during Samsung's in-call route rewrite for permanent privacy loss and
-immediately terminate an otherwise healthy call. v0.3.4 requires a continuous stable-privacy
-window before playback and aborts only after privacy remains unverified for 250 ms.
+The repeated-call and first-call-after-boot tests remain mandatory. Earlier helpers could either
+treat one Samsung mixer race as fatal or carry a cold `DMIX_OUT` route through answer, producing
+an immediate hangup or an answered call with no prompt. v0.4.7 requires a continuously stable
+privacy window and normalizes the pre-answer route before the app receives permission to answer.
 
 This is not yet a general menu editor, PBX, concurrent-call system, or multi-device release. The
 verified runtime is a Samsung SM-T585 running LineageOS 19.1, Android 12 / API 32.
@@ -71,7 +79,8 @@ APK built with a private caller number.
 - `app/`: unprivileged call screening, exact caller gate, helper-claim handshake, and bounded
   request writer.
 - `helper/`: fixed native menu, device profile, TinyALSA prompt/capture path, DTMF detector,
-  session-wide mixer transaction, privacy guardian, Telecom guard, and disabled Magisk layout.
+  boot-scoped mixer transaction, privacy guardian, Telecom guard, and disabled-by-default Magisk
+  package layout.
 - `scripts/`: deterministic helper build, reproducibility, validation, and packaging tools.
 - `docs/ARCHITECTURE.md`: trust boundary and verified call/recovery sequence.
 - `docs/VERIFICATION.md`: current build and live-device evidence.
@@ -92,6 +101,8 @@ APK built with a private caller number.
 11. Confirm `SESSION_COMPLETE`, `MODE_NORMAL`, an empty Telecom call list, and no
     `/data/adb/ivrdroid/mixer.snapshot`.
 12. Call from another number and verify the stock dialer rings without IVRdroid answering.
+13. Before enabling boot startup on a new device profile, repeat worker-death, reboot-during-call,
+    and cellular-loss recovery tests.
 
 The caller-ID allowlist limits accidental interference; it is not authentication and caller ID
 can be spoofed.
@@ -113,8 +124,8 @@ fresh audio and Telecom audit.
 
 Before a public release, add a project license, replace the synthesized test prompts with
 publication-cleared recordings, replace the fixed menu with a validated configuration format,
-exercise reboot/SIM-loss/emergency-call failure cases, and add explicitly audited device
-profiles.
+automate the current fault-injection suite, validate physical-SIM removal if that deployment
+scenario matters, and add explicitly audited device profiles.
 
 Vendored TinyALSA retains its BSD license.
 

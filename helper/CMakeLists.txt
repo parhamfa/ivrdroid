@@ -57,10 +57,13 @@ target_compile_options(ivrdroid_dtmf PRIVATE
 )
 
 add_library(ivrdroid_core STATIC
+    src/call_safety_policy.cpp
     src/device_profile.cpp
     src/helper_protocol.cpp
     src/menu_policy.cpp
+    src/mixer_route_policy.cpp
     src/privacy_policy.cpp
+    src/session_snapshot.cpp
     src/telecom_guard.cpp
 )
 target_include_directories(ivrdroid_core PUBLIC

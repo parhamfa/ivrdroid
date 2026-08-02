@@ -5,7 +5,12 @@ set -eu
 REPO_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_DIR="$REPO_DIR/helper/build-android-arm64"
 DIST_DIR="$REPO_DIR/helper/dist"
-PACKAGE="$DIST_DIR/IVRdroid-helper-0.3.4-dev-disabled.zip"
+HELPER_VERSION=$(sed -n 's/^version=//p' "$REPO_DIR/helper/magisk/module.prop" | head -n 1)
+if [ -z "$HELPER_VERSION" ]; then
+    echo "Helper module version is missing." >&2
+    exit 1
+fi
+PACKAGE="$DIST_DIR/IVRdroid-helper-$HELPER_VERSION-disabled.zip"
 STRIPPED_BINARY="$DIST_DIR/ivrdroid-helper"
 NDK_VERSION=25.2.9519653
 

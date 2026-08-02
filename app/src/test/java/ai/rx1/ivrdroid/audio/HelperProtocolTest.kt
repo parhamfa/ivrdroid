@@ -19,6 +19,12 @@ class HelperProtocolTest {
         assertFalse(HelperBridgeState("PLAYING_MAIN", "NONE").isIdle)
         assertFalse(HelperBridgeState("UNAVAILABLE", "NONE").isIdle)
         assertTrue(
+            HelperBridgeState("ARMING_PRIVACY", "NONE").isArmingPrivacy,
+        )
+        assertFalse(
+            HelperBridgeState("READY", "NONE").isArmingPrivacy,
+        )
+        assertTrue(
             HelperBridgeState("WAITING_FOR_CALL", "NONE").hasClaimedSession,
         )
         assertFalse(HelperBridgeState("READY", "NONE").hasClaimedSession)
@@ -26,6 +32,7 @@ class HelperProtocolTest {
 
     @Test
     fun protocolUsesOneExplicitClaimState() {
+        assertEquals("ARMING_PRIVACY", HelperProtocol.ARMING_PRIVACY)
         assertEquals("WAITING_FOR_CALL", HelperProtocol.WAITING_FOR_CALL)
     }
 }

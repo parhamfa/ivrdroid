@@ -4,16 +4,16 @@ import android.content.Context
 
 object IvrPreferences {
     private const val FILE_NAME = "ivrdroid"
-    private const val KEY_AUTO_ANSWER = "auto_answer"
+    private const val KEY_LOCAL_IVR_ENABLED = "local_ivr_enabled"
 
-    fun isAutoAnswerEnabled(context: Context): Boolean =
+    fun isLocalIvrEnabled(context: Context): Boolean =
         context.getSharedPreferences(FILE_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_AUTO_ANSWER, true)
+            .getBoolean(KEY_LOCAL_IVR_ENABLED, true)
 
-    fun setAutoAnswerEnabled(context: Context, enabled: Boolean) {
+    fun setLocalIvrEnabled(context: Context, enabled: Boolean) {
         context.getSharedPreferences(FILE_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putBoolean(KEY_AUTO_ANSWER, enabled)
+            .putBoolean(KEY_LOCAL_IVR_ENABLED, enabled)
             .apply()
     }
 }

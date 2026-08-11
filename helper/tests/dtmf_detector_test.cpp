@@ -119,6 +119,29 @@ void RejectsNonDtmfAudio() {
     }
 }
 
+void DetectsDtmfMixedWithPromptLikeAudio() {
+    ivrdroid::StereoDtmfDetector detector(kSampleRate);
+    const auto indexes = Indexes('1');
+    bool detected = false;
+    for (int frame = 0; frame < 6; ++frame) {
+        std::vector<int16_t> samples(kFrameCount * 2);
+        for (size_t index = 0; index < kFrameCount; ++index) {
+            const double time =
+                static_cast<double>(frame * kFrameCount + index) /
+                static_cast<double>(kSampleRate);
+            const int16_t value = static_cast<int16_t>(std::lround(
+                5000.0 * std::sin(2.0 * kPi * kLow[indexes.first] * time) +
+                4800.0 * std::sin(2.0 * kPi * kHigh[indexes.second] * time) +
+                2600.0 * std::sin(2.0 * kPi * 440.0 * time) +
+                1100.0 * std::sin(2.0 * kPi * 880.0 * time)));
+            samples[index * 2] = value;
+            samples[index * 2 + 1] = value;
+        }
+        detected = detector.ProcessFrame(samples.data(), kFrameCount) == '1' || detected;
+    }
+    assert(detected);
+}
+
 }  // namespace
 
 int main() {
@@ -126,6 +149,7 @@ int main() {
     assert(DetectSequence("15920#", 6500.0, 1550.0) == "15920#");
     RejectsShortAndMismatchedTones();
     RejectsNonDtmfAudio();
+    DetectsDtmfMixedWithPromptLikeAudio();
     std::cout << "DTMF detector tests passed." << std::endl;
     return 0;
 }

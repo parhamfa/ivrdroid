@@ -35,6 +35,7 @@ def main() -> int:
     output = Path(sys.argv[3]).resolve()
     entries = (
         (repository / "helper/magisk/module.prop", "module.prop", 0o644),
+        (repository / "helper/magisk/customize.sh", "customize.sh", 0o755),
         (repository / "helper/magisk/service.sh", "service.sh", 0o755),
         (repository / "helper/magisk/disable", "disable", 0o644),
         (binary, "bin/ivrdroid-helper", 0o755),

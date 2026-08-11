@@ -1,0 +1,99 @@
+{
+  "caller_policy": {
+    "allowlist": [
+      {
+        "e164": "+989121234567",
+        "label": "Test caller"
+      }
+    ],
+    "blocklist": [],
+    "mode": "ALLOWLIST_ONLY",
+    "route_unknown_callers": false
+  },
+  "compiler_version": "4.0.0",
+  "flow": {
+    "root": {
+      "block_id": "00000000-0000-4000-8000-000000000201",
+      "next": {
+        "answer_timeout_seconds": 30,
+        "block_id": "00000000-0000-4000-8000-000000000202",
+        "next": {
+          "block_id": "00000000-0000-4000-8000-000000000203",
+          "type": "end_call"
+        },
+        "on_not_connected": {
+          "block_id": "00000000-0000-4000-8000-000000000204",
+          "type": "end_call"
+        },
+        "on_system_failure": {
+          "block_id": "00000000-0000-4000-8000-000000000205",
+          "type": "end_call"
+        },
+        "phone_number": "03136644636",
+        "type": "external_call"
+      },
+      "prompt_id": "00000000-0000-4000-8000-000000000066",
+      "type": "play_prompt"
+    }
+  },
+  "program": {
+    "entry_pc": 0,
+    "instructions": [
+      {
+        "block_id": "00000000-0000-4000-8000-000000000201",
+        "next_pc": 1,
+        "op": "play_prompt",
+        "pc": 0,
+        "prompt_id": "00000000-0000-4000-8000-000000000066"
+      },
+      {
+        "answer_timeout_ms": 30000,
+        "block_id": "00000000-0000-4000-8000-000000000202",
+        "next_pc": 2,
+        "on_not_connected_pc": 3,
+        "on_system_failure_pc": 4,
+        "op": "external_call",
+        "pc": 1,
+        "phone_number": "03136644636"
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000203",
+        "op": "end_call",
+        "pc": 2
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000204",
+        "op": "end_call",
+        "pc": 3
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000205",
+        "op": "end_call",
+        "pc": 4
+      }
+    ],
+    "maximum_automated_session_ms": 61000,
+    "version": 4
+  },
+  "program_sha256": "4dac380112c80705b7efe7ddc9c13f230b05f394b0b9a6bef73c72d83639cb3e",
+  "prompts": [
+    {
+      "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "duration_ms": 1000,
+      "format": "audio/wav;codec=pcm_s16le;rate=48000;channels=2",
+      "id": "00000000-0000-4000-8000-000000000066",
+      "name": "External call recording notice",
+      "size_bytes": 4096,
+      "version": 1
+    }
+  ],
+  "published_at": "2026-08-09T12:00:00+00:00",
+  "recording_behavior": {
+    "finish_key": "#",
+    "maximum_duration_seconds": 60
+  },
+  "revision_id": 86,
+  "schedules": [],
+  "schema_version": 4,
+  "source_sha256": "fae9c50a514c5474b8834495fcb3bdd71bb308825362ca0ea2bb14c1ea7750de"
+}

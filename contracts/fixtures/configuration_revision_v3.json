@@ -1,0 +1,87 @@
+{
+  "caller_policy": {
+    "allowlist": [
+      {
+        "e164": "+989121234567",
+        "label": "Test caller"
+      }
+    ],
+    "blocklist": [],
+    "mode": "ALLOWLIST_ONLY",
+    "route_unknown_callers": false
+  },
+  "compiler_version": "3.0.0",
+  "flow": {
+    "root": {
+      "block_id": "00000000-0000-4000-8000-000000000101",
+      "next": {
+        "block_id": "00000000-0000-4000-8000-000000000102",
+        "next": {
+          "block_id": "00000000-0000-4000-8000-000000000103",
+          "type": "end_call"
+        },
+        "on_unavailable": {
+          "block_id": "00000000-0000-4000-8000-000000000104",
+          "type": "end_call"
+        },
+        "type": "record_message"
+      },
+      "prompt_id": "00000000-0000-4000-8000-000000000065",
+      "type": "play_prompt"
+    }
+  },
+  "program": {
+    "entry_pc": 0,
+    "instructions": [
+      {
+        "block_id": "00000000-0000-4000-8000-000000000101",
+        "next_pc": 1,
+        "op": "play_prompt",
+        "pc": 0,
+        "prompt_id": "00000000-0000-4000-8000-000000000065"
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000102",
+        "finish_key": "#",
+        "maximum_duration_ms": 60000,
+        "next_pc": 2,
+        "on_unavailable_pc": 3,
+        "op": "record_message",
+        "pc": 1
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000103",
+        "op": "end_call",
+        "pc": 2
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000104",
+        "op": "end_call",
+        "pc": 3
+      }
+    ],
+    "maximum_session_ms": 61500,
+    "version": 3
+  },
+  "program_sha256": "e83d54c4f864b2b6e8a7acae50e6119438bd954a26ccd15267d56d9d8a4d6a65",
+  "prompts": [
+    {
+      "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "duration_ms": 1000,
+      "format": "audio/wav;codec=pcm_s16le;rate=48000;channels=2",
+      "id": "00000000-0000-4000-8000-000000000065",
+      "name": "Recording notice",
+      "size_bytes": 4096,
+      "version": 1
+    }
+  ],
+  "published_at": "2026-08-08T12:00:00+00:00",
+  "recording_behavior": {
+    "finish_key": "#",
+    "maximum_duration_seconds": 60
+  },
+  "revision_id": 85,
+  "schedules": [],
+  "schema_version": 3,
+  "source_sha256": "fbf8eecfeff3296e506d7921d15f50ab2526489d995dff1c3dfc50cc18ab8102"
+}

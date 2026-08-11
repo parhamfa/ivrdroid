@@ -1,14 +1,59 @@
 package ai.rx1.ivrdroid.telecom
 
-import ai.rx1.ivrdroid.BuildConfig
+import android.content.Context
+import ai.rx1.ivrdroid.IvrPreferences
+import ai.rx1.ivrdroid.control.SecureControlStore
 
-object TestCallGate {
-    val allowlistedCallerE164: String? =
-        canonicalize(BuildConfig.TEST_CALLER_E164)
+data class CallerPolicyDecision(
+    val shouldHandle: Boolean,
+    val reason: String,
+    val canonicalCaller: String?,
+)
 
-    fun matches(rawCaller: String?): Boolean {
-        val expected = allowlistedCallerE164 ?: return false
-        return canonicalize(rawCaller) == expected
+object CallerPolicyEngine {
+    fun decide(context: Context, rawCaller: String?): CallerPolicyDecision {
+        val caller = canonicalize(rawCaller)
+        if (!IvrPreferences.isLocalIvrEnabled(context)) {
+            return CallerPolicyDecision(false, "LOCAL_KILL_SWITCH", caller)
+        }
+        val manifest = SecureControlStore.activeManifest(context)
+            ?: return CallerPolicyDecision(false, "NO_ACTIVE_CONFIGURATION", caller)
+        return runCatching {
+            val policy = manifest.getJSONObject("caller_policy")
+            val routeUnknown = policy.getBoolean("route_unknown_callers")
+            val mode = policy.getString("mode")
+            if (caller == null) {
+                val enabledMode = mode in setOf(
+                    "ALLOWLIST_ONLY",
+                    "ACCEPT_ALL",
+                    "ACCEPT_ALL_EXCEPT_BLOCKLIST",
+                )
+                return@runCatching CallerPolicyDecision(
+                    routeUnknown && enabledMode,
+                    if (routeUnknown && enabledMode) "IVR_HANDLED" else "UNKNOWN_TO_STOCK_DIALER",
+                    null,
+                )
+            }
+            val allowlist = policy.getJSONArray("allowlist")
+            val blocklist = policy.getJSONArray("blocklist")
+            val allowed = when (mode) {
+                "IVR_DISABLED" -> false
+                "ALLOWLIST_ONLY" -> allowlist.containsPhone(caller)
+                "ACCEPT_ALL" -> true
+                "ACCEPT_ALL_EXCEPT_BLOCKLIST" -> !blocklist.containsPhone(caller)
+                else -> false
+            }
+            CallerPolicyDecision(
+                allowed,
+                if (allowed) "IVR_HANDLED" else when (mode) {
+                    "IVR_DISABLED" -> "IVR_DISABLED"
+                    "ALLOWLIST_ONLY" -> "NOT_ALLOWLISTED"
+                    "ACCEPT_ALL_EXCEPT_BLOCKLIST" -> "EXCLUDED_CALLER"
+                    else -> "INVALID_POLICY"
+                },
+                caller,
+            )
+        }.getOrElse { CallerPolicyDecision(false, "INVALID_POLICY", caller) }
     }
 
     internal fun canonicalize(rawCaller: String?): String? {
@@ -42,5 +87,12 @@ object TestCallGate {
                 "+98${asciiDigits.drop(1)}"
             else -> null
         }
+    }
+
+    private fun org.json.JSONArray.containsPhone(caller: String): Boolean {
+        for (index in 0 until length()) {
+            if (optJSONObject(index)?.optString("e164") == caller) return true
+        }
+        return false
     }
 }

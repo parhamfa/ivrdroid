@@ -1,0 +1,209 @@
+{
+  "caller_policy": {
+    "allowlist": [
+      {
+        "e164": "+989121234567",
+        "label": "Test caller"
+      }
+    ],
+    "blocklist": [],
+    "mode": "ALLOWLIST_ONLY",
+    "route_unknown_callers": false
+  },
+  "compiler_version": "2.0.0",
+  "flow": {
+    "root": {
+      "block_id": "00000000-0000-4000-8000-000000000001",
+      "on_closed": {
+        "block_id": "00000000-0000-4000-8000-00000000000a",
+        "type": "end_call"
+      },
+      "on_holiday": {
+        "block_id": "00000000-0000-4000-8000-00000000000b",
+        "type": "end_call"
+      },
+      "on_open": {
+        "block_id": "00000000-0000-4000-8000-000000000002",
+        "branches": [
+          {
+            "branch_id": "00000000-0000-4000-8000-0000000000c9",
+            "digit": "1",
+            "root": {
+              "block_id": "00000000-0000-4000-8000-000000000003",
+              "next": {
+                "block_id": "00000000-0000-4000-8000-000000000004",
+                "type": "return_to_menu"
+              },
+              "prompt_id": "00000000-0000-4000-8000-000000000065",
+              "type": "play_prompt"
+            }
+          },
+          {
+            "branch_id": "00000000-0000-4000-8000-0000000000ca",
+            "digit": "2",
+            "root": {
+              "block_id": "00000000-0000-4000-8000-000000000005",
+              "next": {
+                "block_id": "00000000-0000-4000-8000-000000000006",
+                "type": "end_call"
+              },
+              "prompt_id": "00000000-0000-4000-8000-000000000066",
+              "type": "play_prompt"
+            }
+          }
+        ],
+        "maximum_attempts": 3,
+        "maximum_menu_returns": 2,
+        "on_invalid": {
+          "block_id": "00000000-0000-4000-8000-000000000008",
+          "type": "end_call"
+        },
+        "on_return_limit": {
+          "block_id": "00000000-0000-4000-8000-000000000009",
+          "type": "end_call"
+        },
+        "on_timeout": {
+          "block_id": "00000000-0000-4000-8000-000000000007",
+          "type": "end_call"
+        },
+        "prompt_id": null,
+        "timeout_ms": 5000,
+        "type": "collect_digit"
+      },
+      "schedule_id": "business_hours",
+      "type": "schedule_branch"
+    }
+  },
+  "program": {
+    "entry_pc": 0,
+    "instructions": [
+      {
+        "block_id": "00000000-0000-4000-8000-000000000001",
+        "on_closed_pc": 9,
+        "on_holiday_pc": 10,
+        "on_open_pc": 1,
+        "op": "schedule_branch",
+        "pc": 0,
+        "schedule_id": "business_hours"
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000002",
+        "branches": [
+          {
+            "digit": "1",
+            "target_pc": 2
+          },
+          {
+            "digit": "2",
+            "target_pc": 4
+          }
+        ],
+        "maximum_attempts": 3,
+        "maximum_menu_returns": 2,
+        "on_invalid_pc": 7,
+        "on_return_limit_pc": 8,
+        "on_timeout_pc": 6,
+        "op": "collect_digit",
+        "pc": 1,
+        "prompt_id": null,
+        "timeout_ms": 5000
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000003",
+        "next_pc": 3,
+        "op": "play_prompt",
+        "pc": 2,
+        "prompt_id": "00000000-0000-4000-8000-000000000065"
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000004",
+        "menu_pc": 1,
+        "op": "return_to_menu",
+        "pc": 3
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000005",
+        "next_pc": 5,
+        "op": "play_prompt",
+        "pc": 4,
+        "prompt_id": "00000000-0000-4000-8000-000000000066"
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000006",
+        "op": "end_call",
+        "pc": 5
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000007",
+        "op": "end_call",
+        "pc": 6
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000008",
+        "op": "end_call",
+        "pc": 7
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000009",
+        "op": "end_call",
+        "pc": 8
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-00000000000a",
+        "op": "end_call",
+        "pc": 9
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-00000000000b",
+        "op": "end_call",
+        "pc": 10
+      }
+    ],
+    "version": 2
+  },
+  "program_sha256": "57dbe00ddb4e95525e137701d00435f96bb05133eead0ff96c1340d096e1da25",
+  "prompts": [
+    {
+      "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "duration_ms": 1000,
+      "format": "audio/wav;codec=pcm_s16le;rate=48000;channels=2",
+      "id": "00000000-0000-4000-8000-000000000065",
+      "name": "Sales",
+      "size_bytes": 4096,
+      "version": 1
+    },
+    {
+      "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "duration_ms": 2000,
+      "format": "audio/wav;codec=pcm_s16le;rate=48000;channels=2",
+      "id": "00000000-0000-4000-8000-000000000066",
+      "name": "Support",
+      "size_bytes": 8192,
+      "version": 1
+    }
+  ],
+  "published_at": "2026-08-07T12:00:00+00:00",
+  "revision_id": 84,
+  "schedules": [
+    {
+      "exceptions": [
+        {
+          "date": "2026-08-10",
+          "state": "holiday"
+        }
+      ],
+      "id": "business_hours",
+      "name": "Business hours",
+      "timezone": "Asia/Tehran",
+      "weekly": [
+        {
+          "end": "17:00",
+          "start": "09:00",
+          "weekday": 0
+        }
+      ]
+    }
+  ],
+  "schema_version": 2,
+  "source_sha256": "2e4e3be3f2d332c7d54d5d32170a4fc6d597163019771a46a7734fed5a8d4e45"
+}

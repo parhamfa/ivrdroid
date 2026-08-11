@@ -1,54 +1,88 @@
 # IVRdroid
 
-IVRdroid is an experimental cellular IVR appliance for dedicated rooted Android devices. It
-keeps Android's stock dialer in place while a call-screening app applies caller policy and a
-narrowly scoped native helper owns the audited cellular audio path.
+IVRdroid is a single-tablet cellular IVR appliance for a dedicated rooted Android device. It
+keeps Android's stock dialer in place, applies a signed dashboard-managed caller policy, and uses
+a narrowly scoped native helper for the audited cellular audio path.
 
 The Android application ID is `ai.rx1.ivrdroid`.
 
-## Current status
+## V4 external call scope
 
-The current build is a verified, single-call, three-option IVR foundation:
+V4 adds a signed `external_call` flow step that holds the owned caller, dials one configured
+operator, verifies and records the carrier conference, and resumes through Completed, Not
+connected, or System failure branches. Call control stays local to the tablet and physical carrier
+merge plus two-voice capture remain deployment acceptance gates. See
+[docs/EXTERNAL_CALL_V4.md](docs/EXTERNAL_CALL_V4.md) for the contract, safety model, rollout, and
+test matrix.
 
-- Every incoming call is allowed through call screening.
-- Only an exact E.164 caller configured in an ignored local build setting is auto-answered.
-- The app queues one fixed `START_MENU` request and waits for the helper to claim the session
-  before asking Telecom to answer.
-- The helper accepts no paths, mixer values, transaction numbers, or shell text from the app.
-- The helper plays a main prompt, captures caller audio directly through TinyALSA, detects DTMF
-  with a stereo Goertzel detector, and handles keys 1, 2, and 0.
-- Before answer, the helper snapshots the observed cold/normal route, mutes both physical
-  endpoints, normalizes the telephony route to audited `AIF4IN`, and obtains an independent
-  guardian acknowledgement. Android is not allowed to answer before that handshake completes.
-- The tablet microphone and speaker remain muted for the entire IVR session. A 5 ms independent
-  guardian re-applies that mute when Samsung rewrites the call route, tolerates bounded mixer
-  contention, and withholds prompt playback until privacy has remained stable for 500 ms.
-- One boot-scoped durable snapshot covers all four audited mixer controls, a random session ID,
-  and the current Telecom call identity. Normal completion restores the audited post-call route
-  only after the call has ended.
-- Failure recovery keeps the call private, attempts the pinned Telecom hangup, and preserves the
-  snapshot for a supervisor retry if the first hangup does not complete.
-- Emergency, additional, replaced, or persistently unverified calls make the helper release audio
-  ownership without issuing a global Telecom hangup.
-- No captured call audio is written to storage.
+## V3 voicemail foundation
 
-Helper v0.4.7 is installed on the audited tablet with boot startup enabled. Live validation now
-covers repeated normal calls, a cold `DMIX_OUT` first-call baseline, worker death, reboot during
-an unfinished session, forced cellular-radio loss during prompt playback, carrier
-re-registration, and a complete post-loss key-2 call. Every completed call returned to
-`SESSION_COMPLETE`, `MODE_NORMAL`, an idle Telecom state, and no durable snapshot. Emergency
-handling is validated with Telecom-dump fixtures and state-machine tests only; no real emergency
-number was called.
+V3 adds explicit voicemail to the web-controlled appliance without turning it into a general
+PBX or a whole-call recorder:
 
-The repeated-call and first-call-after-boot tests remain mandatory. Earlier helpers could either
-treat one Samsung mixer race as fatal or carry a cold `DMIX_OUT` route through answer, producing
-an immediate hangup or an answered call with no prompt. v0.4.7 requires a continuously stable
-privacy window and normalizes the pre-answer route before the app receives permission to answer.
+- Caller policy modes: IVR disabled, allowlist only, accept all, and accept all except a
+  blocklist. Hidden or unparseable callers are separately configurable and default to the stock
+  dialer.
+- A local tablet kill switch always wins over downloaded policy.
+- WAV, MP3, and OGG prompt upload, validation, preview, versioning, and conversion to 48 kHz
+  stereo PCM16 WAV.
+- An owned-tree Flow Studio for prompts, independent one-digit DTMF branches, schedules, bounded
+  return-to-menu actions, retries, timeouts, and end-call blocks. Author-facing target IDs and
+  shared graph nodes do not exist.
+- Immutable Ed25519-signed revisions, idle-only activation, acknowledgement, rollback, device
+  health, audit history, and non-audio call events.
+- A `record_message` block with explicit success and unavailable paths. Validation requires a
+  separate `play_prompt` greeting immediately before it; a built-in beep follows the greeting.
+- One signed global recording behavior shared by every recording block: 10-180 seconds (60 by
+  default) and an optional DTMF finish key (`#` by default). Hangup and the hard limit always stop
+  recording; there is deliberately no silence detector.
+- Deterministic server compilation from `FlowDocumentV3` into a bounded `RuntimeProgramV3` tape
+  that is independently verified by the Android app and native helper. V1 and V2 revisions and
+  executors remain immutable rollback targets.
+- Offline operation from the last-known-good revision, with the built-in fixed menu retained as
+  the final recovery fallback.
+- Post-call resumable upload from a 512 MiB Android Keystore-encrypted spool, server-side WAV
+  validation and MP3 normalization, a separately encrypted 5 GiB media volume, retention policy,
+  and a dashboard voicemail inbox.
 
-This is not yet a general menu editor, PBX, concurrent-call system, or multi-device release. The
-verified runtime is a Samsung SM-T585 running LineageOS 19.1, Android 12 / API 32.
+The control plane is a React/Vite dashboard and FastAPI/PostgreSQL service deployed as the
+separate `ivrdroid` Compose project. Only the web proxy is published, on
+`127.0.0.1:3200`; the API and database remain on internal Docker networks. The intended public
+origin is `https://ivrdroid.rx1.ai`. Production runs on `hetzner`; OpenLiteSpeed proxies the
+public vhost to the loopback-only web port. The retired old-mac tunnel is not part of this path.
 
-## Build
+This release supports one Samsung SM-T585. The identifiers and APIs are fleet-shaped, but the
+server deliberately rejects enrollment of a second active tablet.
+
+## Audio and privacy boundary
+
+The native helper keeps the previously audited privacy and recovery model:
+
+- Android must obtain a helper claim before answering a matching caller.
+- The tablet microphone and speaker remain muted throughout an IVR session.
+- Prompt injection and DTMF capture use the pinned SM-T585 TinyALSA route.
+- A V4.1 collector may opt in to continuous capture during its menu prompt. Only configured
+  digits stop playback; other keys are ignored until playback finishes, when the full timeout
+  begins.
+- Captured PCM is inspected in memory for DTMF and discarded except while an explicit signed
+  `record_message` instruction is active.
+- During that instruction only, the audited 48 kHz stereo PCM16 caller path is written to an
+  owner-restricted temporary WAV. The finish tone is trimmed, failed/partial captures are
+  deleted, and finalized files are atomically handed to the app.
+- The app encrypts finalized audio with an Android Keystore-backed AES-GCM key before it enters
+  the durable spool. It uploads only after the call and pauses immediately for a new call. Local
+  audio is deleted only after a matching verified server acknowledgement.
+- Emergency, additional, replaced, or unverified calls fail closed and are yielded back to
+  Android without an unsafe global hangup.
+
+A consented physical call proved the caller-only capture boundary, finish-key trimming, safe
+`MODE_NORMAL` restoration, acknowledged upload, and dashboard playback without ambient capture
+or prompt bleed. Its first server-normalized MP3 was unacceptably quiet; server 0.7.1 corrected
+the mono selection and loudness normalization, and the caller accepted the reprocessed dashboard
+playback. Production readiness remains blocked on one fresh consented call proving that a newly
+uploaded message automatically receives the corrected normalization end to end.
+
+## Build and validation
 
 Run the complete local validation:
 
@@ -56,56 +90,86 @@ Run the complete local validation:
 ./scripts/check.sh
 ```
 
-That runs Android unit tests, lint, APK assembly, native host tests, the pinned arm64 build, and a
-cross-directory reproducibility check. Package the disabled helper module with:
+It runs Android unit tests, lint, APK assembly, native host tests, the pinned arm64 helper build,
+and a cross-directory reproducibility check. Package the disabled helper module with:
 
 ```sh
 ./scripts/package-helper.sh
 ```
 
-The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
+The pinned tablet keeps Android restricted-networking mode enabled. Package the APK as the
+narrow system-app Magisk module that grants the restricted-network permission and the privileged
+non-UI in-call-control permission required by V4:
 
-For a private caller-gated test build, add this ignored local setting:
-
-```properties
-ivrdroid.testCallerE164=+15551234567
+```sh
+./scripts/package-system-app.sh
 ```
 
-If the setting is absent, the app has an empty allowlist and cannot auto-answer. Never publish an
-APK built with a private caller number.
+The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. The helper package is
+written under `helper/dist/`, and the system-app package is written under `app/dist/`.
+After installing the V4 package, open IVRdroid and grant its newly requested `CALL_PHONE` runtime
+permission before expecting the tablet to advertise external-call capability.
+
+Run the server tests with:
+
+```sh
+cd server
+python -m pytest
+```
+
+Run the dashboard checks with:
+
+```sh
+cd dashboard
+npm test
+npm run build
+```
 
 ## Components
 
-- `app/`: unprivileged call screening, exact caller gate, helper-claim handshake, and bounded
-  request writer.
-- `helper/`: fixed native menu, device profile, TinyALSA prompt/capture path, DTMF detector,
-  boot-scoped mixer transaction, privacy guardian, Telecom guard, and disabled-by-default Magisk
-  package layout.
-- `scripts/`: deterministic helper build, reproducibility, validation, and packaging tools.
-- `docs/ARCHITECTURE.md`: trust boundary and verified call/recovery sequence.
-- `docs/VERIFICATION.md`: current build and live-device evidence.
+- `app/`: call screening, local safety switch, encrypted enrollment state, V1/V2/V3/V4
+  signed-revision verification, encrypted recording spool, resumable uploads, synchronization,
+  and bounded helper requests.
+- `helper/`: bounded V4/V3/V2 instruction-tape engines, the legacy V1 rollback engine, device
+  profile, TinyALSA prompt/DTMF/explicit-recording path, durable mixer transaction, privacy
+  guardian, Telecom guard, and last-known-good revision storage.
+- `server/`: FastAPI admin/device APIs, validation, encryption, revision signing, prompt
+  conversion, resumable recording ingestion, encrypted MP3 storage, retention, and Alembic
+  migrations.
+- `dashboard/`: the operator dashboard for policy, flows, prompts, calls, recordings, devices,
+  revisions, and retention.
+- `contracts/`: cross-language canonical configuration fixtures.
+- `deploy/`: the loopback-only production Compose definition. Runtime `.env` and secrets are
+  intentionally ignored.
+- `docs/ARCHITECTURE.md`: trust boundaries and control/data flow.
+- `docs/EXTERNAL_CALL_V4.md`: the V4 conference contract, safety model, and rollout gate.
+- `docs/DEPLOYMENT.md`: Hetzner, OpenLiteSpeed, tablet, backup, and scoped rollback runbook.
+- `docs/VERIFICATION.md`: dated build and live-device evidence; it does not treat unrun live-call
+  scenarios as passed.
 
-## Safe device test
+## Safe tablet rollout
 
-1. Install a private caller-gated debug APK.
-2. Open IVRdroid, grant Answer calls and Contacts access, enable gated testing, and approve the
-   call-screening role.
-3. Confirm `com.android.dialer` remains the default dialer.
-4. Install the disabled helper, run its non-mutating self-test, and start it manually.
-5. Confirm IVRdroid reports `Audio bridge: READY`.
-6. Call from the exact configured number.
-7. Verify the tablet microphone and speaker are silent from answer onward.
-8. Wait for the full main prompt, then press 1, 2, or 0 once.
-9. Verify the terminal prompt plays and IVRdroid disconnects the call.
-10. Repeat the complete path at least five times without restarting the helper.
-11. Confirm `SESSION_COMPLETE`, `MODE_NORMAL`, an empty Telecom call list, and no
-    `/data/adb/ivrdroid/mixer.snapshot`.
-12. Call from another number and verify the stock dialer rings without IVRdroid answering.
-13. Before enabling boot startup on a new device profile, repeat worker-death, reboot-during-call,
-    and cellular-loss recovery tests.
+1. Preserve the installed APK/helper, current helper hashes, Hetzner deployment configuration,
+   database, OpenLiteSpeed vhost/proxy state, and neighboring service health.
+2. Deploy and verify the loopback-only control plane behind the existing OpenLiteSpeed proxy.
+3. Install the APK and its narrowly scoped system-app module, reboot, then open the app so it
+   creates the expanded owner-only bridge. Keep restricted-networking mode enabled.
+4. Install the disabled helper module, run its non-mutating self-test, then enable it only on the
+   audited SM-T585 profile.
+5. Create a ten-minute pairing code in the dashboard and enter it on the tablet.
+6. Preserve the currently active signed V2 revision. Run migration `0003_voicemail_recordings`,
+   install V3-capable app/helper artifacts, and verify the tablet reports runtime V3 plus
+   recording capability before publishing any V3 revision. Activation must still occur only
+   while idle and be acknowledged by the real tablet.
+7. Exercise every caller-policy mode, unknown-number behavior, open/closed schedules, every DTMF
+   branch, invalid input, timeout, local kill switch, server outage, tamper rejection, and
+   recovery to `MODE_NORMAL`.
+8. Confirm a nonmatching caller remains with the stock dialer, ordinary flow steps create no
+   audio files, and only a consented explicit recording segment produces a message. Treat caller
+   speech quality as unverified until the physical-call gate above passes.
 
-The caller-ID allowlist limits accidental interference; it is not authentication and caller ID
-can be spoofed.
+Caller-ID policy reduces accidental interference; it is not authentication and caller ID can be
+spoofed.
 
 ## Compatibility
 
@@ -130,17 +194,9 @@ documentation are licensed under the GNU Affero General Public License version 3
 interact with a modified version over a network must be offered its Corresponding Source as
 required by section 13. See [LICENSE](LICENSE).
 
-Third-party components retain their own licenses. In particular, vendored TinyALSA remains under
-the BSD terms in `helper/third_party/tinyalsa/NOTICE`. The synthesized WAV files under
-`helper/prompts/` are temporary test fixtures and are not granted under the project AGPL license.
+Third-party components retain their own licenses. Vendored TinyALSA remains under the BSD terms
+in `helper/third_party/tinyalsa/NOTICE`. The synthesized WAV files under `helper/prompts/` are
+temporary test fixtures and are not granted under the project AGPL license.
 
-## Publication note
-
-Before a public release, replace the synthesized test prompts with publication-cleared
-recordings, replace the fixed menu with a validated configuration format, automate the current
-fault-injection suite, validate physical-SIM removal if that deployment scenario matters, and
-add explicitly audited device profiles.
-
-Vendored TinyALSA retains its BSD license.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current system boundary.
+Before a public release, replace synthesized test prompts with publication-cleared recordings,
+automate the remaining device fault suite, and add explicitly audited device profiles.

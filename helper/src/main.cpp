@@ -1,11 +1,19 @@
+#include "call_control_protocol.h"
 #include "call_safety_policy.h"
+#include "child_process.h"
+#include "conversation_handoff_protocol.h"
 #include "device_profile.h"
 #include "dtmf_detector.h"
+#include "external_call_policy.h"
 #include "helper_protocol.h"
 #include "menu_policy.h"
 #include "mixer_route_policy.h"
 #include "privacy_policy.h"
+#include "prompt_barge_in_policy.h"
+#include "recording_policy.h"
+#include "revision_config.h"
 #include "session_snapshot.h"
+#include "sha256.h"
 #include "telecom_guard.h"
 
 #include <android/log.h>
@@ -17,6 +25,7 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/system_properties.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -24,15 +33,21 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <deque>
+#include <dirent.h>
 #include <fcntl.h>
+#include <limits>
 #include <signal.h>
 #include <string>
 #include <time.h>
+#include <unordered_map>
 #include <unistd.h>
 #include <vector>
 
@@ -42,6 +57,7 @@ using ivrdroid::protocol::CurrentState;
 using ivrdroid::protocol::LastResult;
 
 constexpr char kLogTag[] = "IVRdroidHelper";
+constexpr char kHelperVersion[] = "0.8.3-dev";
 
 constexpr char kBridgeDir[] =
     "/data/user/0/ai.rx1.ivrdroid/files/bridge";
@@ -57,13 +73,54 @@ constexpr char kLastResultPath[] =
     "/data/user/0/ai.rx1.ivrdroid/files/bridge/last_result";
 constexpr char kLastResultTempPath[] =
     "/data/user/0/ai.rx1.ivrdroid/files/bridge/.last_result.tmp";
+constexpr char kActiveRevisionBridgePath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/active_revision";
+constexpr char kActiveRevisionBridgeTempPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/.active_revision.tmp";
+constexpr char kStagedRevisionBridgePath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/staged_revision";
+constexpr char kStagedRevisionBridgeTempPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/.staged_revision.tmp";
+constexpr char kSessionPathBridgePath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/session_path";
+constexpr char kSessionPathBridgeTempPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/.session_path.tmp";
+constexpr char kHelperVersionBridgePath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/helper_version";
+constexpr char kHelperVersionBridgeTempPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/.helper_version.tmp";
+constexpr char kCapabilitiesBridgePath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/capabilities";
+constexpr char kCapabilitiesBridgeTempPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/.capabilities.tmp";
+constexpr char kRecordingCapacityPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/recording_capacity";
+constexpr char kCallControlRequestPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/call_control.request";
+constexpr char kCallControlRequestTempPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/.call_control.request.tmp";
+constexpr char kCallControlStatusPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/call_control.status";
+constexpr char kConversationHandoffAcknowledgementPath[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/call_control.recording_ack";
+constexpr char kRecordingInboxDir[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/bridge/recordings";
+constexpr char kAppRevisionDir[] =
+    "/data/user/0/ai.rx1.ivrdroid/files/revisions";
 
 constexpr char kStateDir[] = "/data/adb/ivrdroid";
+constexpr char kRevisionDir[] = "/data/adb/ivrdroid/revisions";
 constexpr char kLockPath[] = "/data/adb/ivrdroid/helper.lock";
 constexpr char kPidPath[] = "/data/adb/ivrdroid/helper.pid";
 constexpr char kSnapshotPath[] = "/data/adb/ivrdroid/mixer.snapshot";
 constexpr char kSnapshotTempPath[] = "/data/adb/ivrdroid/.mixer.snapshot.tmp";
 constexpr char kBootIdPath[] = "/proc/sys/kernel/random/boot_id";
+constexpr char kActiveRevisionPath[] = "/data/adb/ivrdroid/active_revision";
+constexpr char kActiveRevisionTempPath[] = "/data/adb/ivrdroid/.active_revision.tmp";
+constexpr char kPreviousRevisionPath[] = "/data/adb/ivrdroid/previous_revision";
+constexpr char kPreviousRevisionTempPath[] = "/data/adb/ivrdroid/.previous_revision.tmp";
+constexpr char kStagedRevisionPath[] = "/data/adb/ivrdroid/staged_revision";
+constexpr char kStagedRevisionTempPath[] = "/data/adb/ivrdroid/.staged_revision.tmp";
 
 constexpr char kMainPromptPath[] =
     "/data/adb/modules/ivrdroid_helper/prompts/main-menu.wav";
@@ -100,28 +157,50 @@ constexpr unsigned int kRecoveryMaximumHangupAttempts = 2;
 constexpr useconds_t kRecoveryPollSleepUs = 100'000;
 constexpr int64_t kSystemIdleConfirmationMs = 500;
 constexpr useconds_t kSystemReadinessPollSleepUs = 250'000;
-constexpr off_t kMaximumPromptBytes = 4 * 1024 * 1024;
-constexpr off_t kMaximumCommandBytes = 64;
+constexpr off_t kMaximumPromptBytes = 64 * 1024 * 1024;
+constexpr off_t kMaximumCommandBytes = 128;
+constexpr off_t kMaximumConfigBytes = 8 * 1024 * 1024;
+constexpr off_t kMaximumSessionPathBytes = 8192;
+constexpr off_t kMaximumCallControlBytes =
+    static_cast<off_t>(ivrdroid::call_control::kMaximumWireBytes);
+constexpr off_t kMaximumRecordingCapacityBytes = 256;
 constexpr size_t kMaximumTelecomDumpBytes = 512 * 1024;
 constexpr size_t kMaximumAudioDumpBytes = 1024 * 1024;
 constexpr int64_t kDumpsysTimeoutMs = 1'000;
 constexpr int64_t kTelecomEndCallTimeoutMs = 2'000;
 constexpr unsigned int kDtmfFrameCount = 1'200;
 constexpr unsigned int kDtmfPeriodCount = 4;
-constexpr unsigned int kDtmfTimeoutFrames = 8 * 40;
 constexpr unsigned int kDtmfCallCheckFrames = 20;
+constexpr uint64_t kRecordingSpoolLimitBytes = 512ULL * 1024ULL * 1024ULL;
+constexpr uint64_t kMaximumRecordingBytes = 40ULL * 1024ULL * 1024ULL;
+constexpr unsigned int kRecordingTrimFrames = 4;
+constexpr unsigned int kRecordingCallCheckFrames = 4;
+constexpr unsigned int kRecordingHeartbeatFrames = 20;
+constexpr int64_t kExternalCleanupMaximumMs = 12'000;
+constexpr int64_t kExternalCallerSafeStableMs = 1'000;
+constexpr int64_t kExternalCallerSafeMaximumMs = 2'500;
+constexpr useconds_t kExternalCallerSafePollUs = 100'000;
 
 constexpr int kGuardianWaitForCallMs = 12'000;
-constexpr int kGuardianPromptMs = 15'000;
+constexpr int kGuardianPromptMs = 330'000;
 constexpr int kGuardianIdleMs = 12'000;
-constexpr int kGuardianDtmfMs = 12'000;
+constexpr int kGuardianDtmfMs = 20'000;
+constexpr int kGuardianRecordingHeartbeatMs =
+    ivrdroid::kRecordingHeartbeatTimeoutMilliseconds;
+constexpr int kGuardianRecordingFinalizeMs =
+    ivrdroid::kRecordingFinalizationTimeoutMilliseconds;
 constexpr int kGuardianEndCallMs = 6'000;
-constexpr int64_t kGuardianTotalMs = 75'000;
+constexpr int64_t kGuardianTotalMs = 20 * 60'000;
 
 constexpr char kGuardianPrompt = 'P';
 constexpr char kGuardianArmPrivacy = 'B';
 constexpr char kGuardianIdle = 'I';
 constexpr char kGuardianDtmf = 'L';
+constexpr char kGuardianRecording = 'V';
+constexpr char kGuardianRecordingFinalize = 'F';
+constexpr char kGuardianRecordingHangup = 'J';
+constexpr char kGuardianOwnedDialing = 'O';
+constexpr char kGuardianOwnedConference = 'K';
 constexpr char kGuardianEndCall = 'E';
 constexpr char kGuardianDone = 'D';
 constexpr char kGuardianRemoteHangup = 'H';
@@ -282,17 +361,29 @@ bool EnsureStateDirectory() {
         Log(ANDROID_LOG_ERROR, "Cannot secure state directory: %s", std::strerror(errno));
         return false;
     }
+    if (mkdir(kRevisionDir, 0700) != 0 && errno != EEXIST) {
+        Log(ANDROID_LOG_ERROR, "Cannot create revision directory: %s", std::strerror(errno));
+        return false;
+    }
+    struct stat revisionState {};
+    if (lstat(kRevisionDir, &revisionState) != 0 ||
+        !S_ISDIR(revisionState.st_mode) ||
+        revisionState.st_uid != 0 ||
+        chmod(kRevisionDir, 0700) != 0) {
+        Log(ANDROID_LOG_ERROR, "Revision directory ownership or type is unsafe.");
+        return false;
+    }
     return true;
 }
 
-bool IsSafeAppOwnedFile(const char* path) {
+bool IsSafeAppOwnedFile(const char* path, off_t maximumBytes = kMaximumCommandBytes) {
     struct stat state {};
     return lstat(path, &state) == 0 &&
         S_ISREG(state.st_mode) &&
         state.st_uid == gAppUid &&
         (state.st_mode & 0022) == 0 &&
         state.st_size >= 0 &&
-        state.st_size <= kMaximumCommandBytes;
+        state.st_size <= maximumBytes;
 }
 
 bool ResolveAndValidateBridge() {
@@ -306,21 +397,100 @@ bool ResolveAndValidateBridge() {
     }
     gAppUid = state.st_uid;
     if (!IsSafeAppOwnedFile(kStatusPath) ||
-        !IsSafeAppOwnedFile(kLastResultPath)) {
+        !IsSafeAppOwnedFile(kLastResultPath) ||
+        !IsSafeAppOwnedFile(kActiveRevisionBridgePath) ||
+        !IsSafeAppOwnedFile(kStagedRevisionBridgePath) ||
+        !IsSafeAppOwnedFile(kHelperVersionBridgePath) ||
+        !IsSafeAppOwnedFile(kCapabilitiesBridgePath) ||
+        !IsSafeAppOwnedFile(
+            kRecordingCapacityPath,
+            kMaximumRecordingCapacityBytes) ||
+        !IsSafeAppOwnedFile(kCallControlRequestPath, kMaximumCallControlBytes) ||
+        !IsSafeAppOwnedFile(kCallControlStatusPath, kMaximumCallControlBytes) ||
+        !IsSafeAppOwnedFile(kSessionPathBridgePath, kMaximumSessionPathBytes)) {
         Log(ANDROID_LOG_ERROR, "Bridge status files are missing or unsafe.");
+        return false;
+    }
+    struct stat recordingDirectory {};
+    if (lstat(kRecordingInboxDir, &recordingDirectory) != 0 ||
+        !S_ISDIR(recordingDirectory.st_mode) ||
+        recordingDirectory.st_uid != gAppUid ||
+        (recordingDirectory.st_mode & 0077) != 0) {
+        Log(ANDROID_LOG_ERROR, "Recording bridge directory is missing or unsafe.");
         return false;
     }
     return true;
 }
 
+void CleanupPartialRecordings() {
+    DIR* directory = opendir(kRecordingInboxDir);
+    if (directory == nullptr) return;
+    while (dirent* entry = readdir(directory)) {
+        const std::string name(entry->d_name);
+        const std::string path = std::string(kRecordingInboxDir) + "/" + name;
+        struct stat state {};
+        if (lstat(path.c_str(), &state) == 0 &&
+            ivrdroid::ShouldRemovePartialRecording(
+                name,
+                S_ISREG(state.st_mode),
+                state.st_uid,
+                0,
+                gAppUid)) {
+            unlink(path.c_str());
+            continue;
+        }
+        if (lstat(path.c_str(), &state) != 0 ||
+            !S_ISREG(state.st_mode) ||
+            (state.st_uid != 0 && state.st_uid != gAppUid)) {
+            continue;
+        }
+        const bool legacyWave = name.size() == 40 && name.substr(36) == ".wav";
+        const bool legacyReceipt = name.size() == 41 && name.substr(36) == ".json";
+        bool conversationWave = name.size() == 46 && name.substr(42) == ".wav";
+        bool conversationReceipt = name.size() == 47 && name.substr(42) == ".json";
+        if (conversationWave || conversationReceipt) {
+            uint32_t segmentIndex = 0;
+            const std::string index = name.substr(37, 5);
+            const auto parsed = std::from_chars(
+                index.data(),
+                index.data() + index.size(),
+                segmentIndex);
+            const std::string expectedStem = ivrdroid::ConversationSegmentStem(
+                name.substr(0, 36),
+                segmentIndex);
+            if (parsed.ec != std::errc() ||
+                parsed.ptr != index.data() + index.size() ||
+                expectedStem != name.substr(0, 42)) {
+                conversationWave = false;
+                conversationReceipt = false;
+            }
+        }
+        const bool wave = legacyWave || conversationWave;
+        const bool receipt = legacyReceipt || conversationReceipt;
+        if (wave || receipt) {
+            const size_t stemBytes =
+                conversationWave || conversationReceipt ? 42 : 36;
+            const std::string counterpart =
+                std::string(kRecordingInboxDir) + "/" + name.substr(0, stemBytes) +
+                (wave ? ".json" : ".wav");
+            if (access(counterpart.c_str(), F_OK) != 0 && errno == ENOENT) {
+                unlink(path.c_str());
+            }
+        }
+    }
+    closedir(directory);
+    SyncDirectory(kRecordingInboxDir);
+}
+
 bool WriteBridgeValue(
     const char* path,
     const char* temporaryPath,
-    const char* value) {
-    if (gAppUid == 0 || !IsSafeAppOwnedFile(path)) return false;
+    const char* value,
+    off_t maximumBytes = kMaximumCommandBytes) {
+    if (gAppUid == 0 || !IsSafeAppOwnedFile(path, maximumBytes)) return false;
     const size_t valueLength = std::strlen(value);
     if (valueLength == 0 ||
-        valueLength + 1 > static_cast<size_t>(kMaximumCommandBytes)) {
+        valueLength + 1 > static_cast<size_t>(maximumBytes)) {
         return false;
     }
 
@@ -345,6 +515,109 @@ bool WriteBridgeValue(
     return SyncDirectory(kBridgeDir);
 }
 
+bool WriteBridgeWire(
+    const char* path,
+    const char* temporaryPath,
+    const std::string& wire) {
+    if (gAppUid == 0 ||
+        !IsSafeAppOwnedFile(path, kMaximumCallControlBytes) ||
+        wire.empty() || wire.size() > ivrdroid::call_control::kMaximumWireBytes ||
+        wire.back() != '\n' || wire.find('\n') != wire.size() - 1 ||
+        wire.find('\r') != std::string::npos) {
+        return false;
+    }
+    unlink(temporaryPath);
+    const int fd = open(
+        temporaryPath,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    if (fd < 0) return false;
+    const bool written =
+        fchown(fd, gAppUid, gAppUid) == 0 &&
+        fchmod(fd, 0600) == 0 &&
+        WriteAll(fd, wire.data(), wire.size()) &&
+        fsync(fd) == 0;
+    close(fd);
+    if (!written || rename(temporaryPath, path) != 0) {
+        unlink(temporaryPath);
+        return false;
+    }
+    return SyncDirectory(kBridgeDir);
+}
+
+bool ReadBridgeWire(
+    const char* path,
+    size_t maximumBytes,
+    std::string* wire) {
+    if (wire == nullptr || gAppUid == 0 || maximumBytes == 0) return false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        struct stat pathState {};
+        if (lstat(path, &pathState) != 0 ||
+            !S_ISREG(pathState.st_mode) || pathState.st_uid != gAppUid ||
+            (pathState.st_mode & 0077) != 0 || pathState.st_size <= 0 ||
+            static_cast<uint64_t>(pathState.st_size) > maximumBytes) {
+            return false;
+        }
+        const int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) continue;
+        struct stat openedState {};
+        const bool same = fstat(fd, &openedState) == 0 &&
+            openedState.st_dev == pathState.st_dev &&
+            openedState.st_ino == pathState.st_ino &&
+            openedState.st_uid == gAppUid &&
+            (openedState.st_mode & 0077) == 0 &&
+            openedState.st_size == pathState.st_size;
+        if (!same) {
+            close(fd);
+            continue;
+        }
+        std::string content(static_cast<size_t>(openedState.st_size), '\0');
+        const bool read = ReadAll(fd, content.data(), content.size());
+        close(fd);
+        if (!read) continue;
+        *wire = std::move(content);
+        return true;
+    }
+    return false;
+}
+
+bool PublishCallControlRequest(const ivrdroid::call_control::Request& request) {
+    const std::string wire = ivrdroid::call_control::EncodeRequest(request);
+    return !wire.empty() && WriteBridgeWire(
+        kCallControlRequestPath,
+        kCallControlRequestTempPath,
+        wire);
+}
+
+bool ReadCallControlStatus(ivrdroid::call_control::Status* status) {
+    if (status == nullptr) return false;
+    std::string wire;
+    if (!ReadBridgeWire(
+            kCallControlStatusPath,
+            ivrdroid::call_control::kMaximumWireBytes,
+            &wire)) {
+        return false;
+    }
+    *status = ivrdroid::call_control::ParseStatus(wire);
+    return status->kind != ivrdroid::call_control::StatusKind::Invalid;
+}
+
+bool ReadConversationHandoffAcknowledgement(
+    ivrdroid::conversation_handoff::Acknowledgement* acknowledgement) {
+    if (acknowledgement == nullptr) return false;
+    std::string wire;
+    if (!ReadBridgeWire(
+            kConversationHandoffAcknowledgementPath,
+            ivrdroid::conversation_handoff::kMaximumWireBytes,
+            &wire)) {
+        return false;
+    }
+    *acknowledgement =
+        ivrdroid::conversation_handoff::ParseAcknowledgement(wire);
+    return acknowledgement->result !=
+        ivrdroid::conversation_handoff::Result::Invalid;
+}
+
 void WriteCurrentState(CurrentState state) {
     if (!WriteBridgeValue(
             kStatusPath,
@@ -360,6 +633,31 @@ void WriteLastResult(LastResult result) {
             kLastResultTempPath,
             ivrdroid::protocol::ToString(result))) {
         Log(ANDROID_LOG_ERROR, "Could not publish helper session result.");
+    }
+}
+
+void WriteSessionPath(const std::string& path) {
+    if (!WriteBridgeValue(
+            kSessionPathBridgePath,
+            kSessionPathBridgeTempPath,
+            path.c_str(),
+            kMaximumSessionPathBytes)) {
+        Log(ANDROID_LOG_ERROR, "Could not publish helper session path.");
+    }
+}
+
+void WriteBridgeRevision(
+    const char* path,
+    const char* temporaryPath,
+    uint64_t revisionId) {
+    char value[32] = {};
+    std::snprintf(
+        value,
+        sizeof(value),
+        "%llu",
+        static_cast<unsigned long long>(revisionId));
+    if (!WriteBridgeValue(path, temporaryPath, value)) {
+        Log(ANDROID_LOG_ERROR, "Could not publish helper revision state.");
     }
 }
 
@@ -1222,6 +1520,416 @@ bool ParseWave(FILE* file, uint32_t* dataSize) {
     return false;
 }
 
+bool ValidateWaveFile(const char* path) {
+    if (!ValidatePromptFile(path)) return false;
+    FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) return false;
+    uint32_t dataSize = 0;
+    const bool valid = ParseWave(file, &dataSize) && dataSize > 0;
+    std::fclose(file);
+    return valid;
+}
+
+bool WriteRootRevisionValue(
+    const char* path,
+    const char* temporaryPath,
+    uint64_t revisionId) {
+    char value[32] = {};
+    const int length = std::snprintf(
+        value,
+        sizeof(value),
+        "%llu\n",
+        static_cast<unsigned long long>(revisionId));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(value)) return false;
+    unlink(temporaryPath);
+    const int descriptor = open(
+        temporaryPath,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    if (descriptor < 0) return false;
+    const bool written =
+        WriteAll(descriptor, value, static_cast<size_t>(length)) &&
+        fsync(descriptor) == 0;
+    close(descriptor);
+    if (!written || rename(temporaryPath, path) != 0) {
+        unlink(temporaryPath);
+        return false;
+    }
+    return SyncDirectory(kStateDir);
+}
+
+bool ReadRootRevisionValue(const char* path, uint64_t* revisionId) {
+    const int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) return false;
+    struct stat state {};
+    std::array<char, 32> content {};
+    bool valid =
+        fstat(descriptor, &state) == 0 &&
+        S_ISREG(state.st_mode) &&
+        state.st_uid == 0 &&
+        (state.st_mode & 0022) == 0 &&
+        state.st_size > 0 &&
+        state.st_size < static_cast<off_t>(content.size());
+    if (valid) valid = ReadAll(descriptor, content.data(), static_cast<size_t>(state.st_size));
+    close(descriptor);
+    if (!valid) return false;
+    std::string_view value(content.data(), static_cast<size_t>(state.st_size));
+    if (!value.empty() && value.back() == '\n') value.remove_suffix(1);
+    if (value.empty()) return false;
+    uint64_t parsed = 0;
+    const auto result = std::from_chars(
+        value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size()) return false;
+    *revisionId = parsed;
+    return true;
+}
+
+bool InitializeRevisionState() {
+    uint64_t ignored = 0;
+    if (!ReadRootRevisionValue(kActiveRevisionPath, &ignored) &&
+        !WriteRootRevisionValue(kActiveRevisionPath, kActiveRevisionTempPath, 0)) {
+        return false;
+    }
+    if (!ReadRootRevisionValue(kStagedRevisionPath, &ignored) &&
+        !WriteRootRevisionValue(kStagedRevisionPath, kStagedRevisionTempPath, 0)) {
+        return false;
+    }
+    uint64_t active = 0;
+    uint64_t staged = 0;
+    if (!ReadRootRevisionValue(kActiveRevisionPath, &active) ||
+        !ReadRootRevisionValue(kStagedRevisionPath, &staged)) {
+        return false;
+    }
+    WriteBridgeRevision(
+        kActiveRevisionBridgePath,
+        kActiveRevisionBridgeTempPath,
+        active);
+    WriteBridgeRevision(
+        kStagedRevisionBridgePath,
+        kStagedRevisionBridgeTempPath,
+        staged);
+    if (!WriteBridgeValue(
+            kHelperVersionBridgePath,
+            kHelperVersionBridgeTempPath,
+            kHelperVersion)) {
+        return false;
+    }
+    return true;
+}
+
+bool BuildRevisionPath(
+    char* output,
+    size_t outputSize,
+    const char* base,
+    uint64_t revisionId,
+    const char* suffix = "") {
+    const int length = std::snprintf(
+        output,
+        outputSize,
+        "%s/%llu%s",
+        base,
+        static_cast<unsigned long long>(revisionId),
+        suffix);
+    return length > 0 && static_cast<size_t>(length) < outputSize;
+}
+
+bool ReadOwnedBoundedFile(
+    const char* path,
+    uid_t owner,
+    off_t maximumBytes,
+    std::string* output) {
+    const int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) return false;
+    struct stat state {};
+    bool valid =
+        fstat(descriptor, &state) == 0 &&
+        S_ISREG(state.st_mode) &&
+        state.st_uid == owner &&
+        (state.st_mode & 0022) == 0 &&
+        state.st_size > 0 &&
+        state.st_size <= maximumBytes;
+    if (valid) {
+        output->resize(static_cast<size_t>(state.st_size));
+        valid = ReadAll(descriptor, output->data(), output->size());
+    }
+    close(descriptor);
+    if (!valid) output->clear();
+    return valid;
+}
+
+bool CopyOwnedFile(
+    const char* source,
+    const char* destination,
+    uid_t sourceOwner,
+    off_t expectedSize,
+    off_t maximumBytes,
+    const std::string& expectedSha256) {
+    const int input = open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (input < 0) return false;
+    struct stat state {};
+    bool valid =
+        fstat(input, &state) == 0 &&
+        S_ISREG(state.st_mode) &&
+        state.st_uid == sourceOwner &&
+        (state.st_mode & 0022) == 0 &&
+        state.st_size > 0 &&
+        state.st_size <= maximumBytes &&
+        (expectedSize < 0 || state.st_size == expectedSize);
+    const int output = valid
+        ? open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)
+        : -1;
+    if (output < 0) valid = false;
+    ivrdroid::Sha256 hash;
+    off_t total = 0;
+    std::array<uint8_t, 16 * 1024> buffer {};
+    while (valid) {
+        ssize_t count = read(input, buffer.data(), buffer.size());
+        if (count == 0) break;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            valid = false;
+            break;
+        }
+        total += count;
+        if (total > maximumBytes ||
+            !WriteAll(output, buffer.data(), static_cast<size_t>(count))) {
+            valid = false;
+            break;
+        }
+        hash.Update(buffer.data(), static_cast<size_t>(count));
+    }
+    valid = valid && total == state.st_size && fsync(output) == 0;
+    close(input);
+    if (output >= 0) close(output);
+    if (valid && !expectedSha256.empty()) {
+        const auto digest = hash.Finish();
+        constexpr char alphabet[] = "0123456789abcdef";
+        std::string actual;
+        actual.reserve(64);
+        for (const uint8_t byte : digest) {
+            actual.push_back(alphabet[byte >> 4U]);
+            actual.push_back(alphabet[byte & 0x0fU]);
+        }
+        valid = actual == expectedSha256;
+    }
+    if (!valid) unlink(destination);
+    return valid;
+}
+
+bool RemoveTemporaryRevision(const char* path) {
+    struct stat state {};
+    if (lstat(path, &state) != 0) return errno == ENOENT;
+    if (!S_ISDIR(state.st_mode) || state.st_uid != 0) return false;
+    char promptDir[512] = {};
+    if (std::snprintf(promptDir, sizeof(promptDir), "%s/prompts", path) <= 0) return false;
+    DIR* directory = opendir(promptDir);
+    if (directory != nullptr) {
+        while (dirent* entry = readdir(directory)) {
+            const std::string name(entry->d_name);
+            if (name == "." || name == "..") continue;
+            if (name.size() != 68 || name.substr(64) != ".wav" ||
+                !ivrdroid::IsLowerHexSha256(name.substr(0, 64))) {
+                closedir(directory);
+                return false;
+            }
+            char promptPath[640] = {};
+            if (std::snprintf(promptPath, sizeof(promptPath), "%s/%s", promptDir, name.c_str()) <= 0 ||
+                unlink(promptPath) != 0) {
+                closedir(directory);
+                return false;
+            }
+        }
+        closedir(directory);
+        if (rmdir(promptDir) != 0) return false;
+    } else if (errno != ENOENT) {
+        return false;
+    }
+    char configPath[512] = {};
+    if (std::snprintf(configPath, sizeof(configPath), "%s/config.txt", path) <= 0) return false;
+    if (unlink(configPath) != 0 && errno != ENOENT) return false;
+    return rmdir(path) == 0;
+}
+
+bool ValidateRevisionAssets(
+    const char* revisionPath,
+    const ivrdroid::RevisionConfig& config) {
+    for (const ivrdroid::PromptAsset& prompt : config.prompts) {
+        char promptPath[640] = {};
+        const int length = std::snprintf(
+            promptPath,
+            sizeof(promptPath),
+            "%s/prompts/%s.wav",
+            revisionPath,
+            prompt.sha256.c_str());
+        if (length <= 0 || static_cast<size_t>(length) >= sizeof(promptPath)) return false;
+        struct stat state {};
+        std::string digest;
+        if (lstat(promptPath, &state) != 0 ||
+            !S_ISREG(state.st_mode) ||
+            state.st_uid != 0 ||
+            (state.st_mode & 0022) != 0 ||
+            state.st_size != static_cast<off_t>(prompt.sizeBytes) ||
+            !ivrdroid::Sha256File(promptPath, kMaximumPromptBytes, &digest) ||
+            digest != prompt.sha256 ||
+            !ValidateWaveFile(promptPath)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool LoadRootRevision(
+    uint64_t revisionId,
+    const std::string& expectedManifest,
+    bool validateAssets,
+    ivrdroid::RevisionConfig* config) {
+    if (revisionId == 0) return false;
+    char revisionPath[384] = {};
+    char configPath[448] = {};
+    if (!BuildRevisionPath(revisionPath, sizeof(revisionPath), kRevisionDir, revisionId) ||
+        std::snprintf(configPath, sizeof(configPath), "%s/config.txt", revisionPath) <= 0) {
+        return false;
+    }
+    struct stat directoryState {};
+    if (lstat(revisionPath, &directoryState) != 0 ||
+        !S_ISDIR(directoryState.st_mode) || directoryState.st_uid != 0 ||
+        (directoryState.st_mode & 0022) != 0) {
+        return false;
+    }
+    std::string document;
+    std::string error;
+    if (!ReadOwnedBoundedFile(configPath, 0, kMaximumConfigBytes, &document) ||
+        !ivrdroid::ParseRevisionConfig(document, config, &error) ||
+        config->revisionId != revisionId ||
+        (!expectedManifest.empty() && config->manifestSha256 != expectedManifest)) {
+        Log(ANDROID_LOG_ERROR, "Revision %llu configuration rejected: %s.",
+            static_cast<unsigned long long>(revisionId), error.c_str());
+        return false;
+    }
+    return !validateAssets || ValidateRevisionAssets(revisionPath, *config);
+}
+
+bool StageRevision(uint64_t revisionId, const std::string& manifestSha256) {
+    WriteCurrentState(CurrentState::StagingRevision);
+    char sourcePath[384] = {};
+    char sourceConfigPath[448] = {};
+    char finalPath[384] = {};
+    char temporaryPath[400] = {};
+    if (!BuildRevisionPath(sourcePath, sizeof(sourcePath), kAppRevisionDir, revisionId) ||
+        !BuildRevisionPath(finalPath, sizeof(finalPath), kRevisionDir, revisionId) ||
+        !BuildRevisionPath(temporaryPath, sizeof(temporaryPath), kRevisionDir, revisionId, ".tmp") ||
+        std::snprintf(sourceConfigPath, sizeof(sourceConfigPath), "%s/config.txt", sourcePath) <= 0) {
+        return false;
+    }
+
+    ivrdroid::RevisionConfig existing;
+    if (LoadRootRevision(revisionId, manifestSha256, true, &existing)) {
+        const bool selected =
+            WriteRootRevisionValue(kStagedRevisionPath, kStagedRevisionTempPath, revisionId);
+        if (selected) WriteBridgeRevision(kStagedRevisionBridgePath, kStagedRevisionBridgeTempPath, revisionId);
+        return selected;
+    }
+    struct stat finalState {};
+    if (lstat(finalPath, &finalState) == 0 || errno != ENOENT) {
+        Log(ANDROID_LOG_ERROR, "Immutable revision ID already exists with different content.");
+        return false;
+    }
+
+    std::string document;
+    std::string parseError;
+    ivrdroid::RevisionConfig config;
+    if (!ReadOwnedBoundedFile(sourceConfigPath, gAppUid, kMaximumConfigBytes, &document) ||
+        !ivrdroid::ParseRevisionConfig(document, &config, &parseError) ||
+        config.revisionId != revisionId || config.manifestSha256 != manifestSha256) {
+        Log(ANDROID_LOG_ERROR, "App-staged revision rejected: %s.", parseError.c_str());
+        return false;
+    }
+    if (!RemoveTemporaryRevision(temporaryPath) || mkdir(temporaryPath, 0700) != 0) return false;
+    char temporaryPromptDir[480] = {};
+    char temporaryConfigPath[480] = {};
+    if (std::snprintf(temporaryPromptDir, sizeof(temporaryPromptDir), "%s/prompts", temporaryPath) <= 0 ||
+        std::snprintf(temporaryConfigPath, sizeof(temporaryConfigPath), "%s/config.txt", temporaryPath) <= 0 ||
+        mkdir(temporaryPromptDir, 0700) != 0 ||
+        !CopyOwnedFile(sourceConfigPath, temporaryConfigPath, gAppUid, -1, kMaximumConfigBytes, "")) {
+        RemoveTemporaryRevision(temporaryPath);
+        return false;
+    }
+    bool valid = true;
+    for (const ivrdroid::PromptAsset& prompt : config.prompts) {
+        char sourcePrompt[640] = {};
+        char targetPrompt[640] = {};
+        const int sourceLength = std::snprintf(
+            sourcePrompt, sizeof(sourcePrompt), "%s/prompts/%s.wav", sourcePath, prompt.sha256.c_str());
+        const int targetLength = std::snprintf(
+            targetPrompt, sizeof(targetPrompt), "%s/%s.wav", temporaryPromptDir, prompt.sha256.c_str());
+        if (sourceLength <= 0 || targetLength <= 0 ||
+            static_cast<size_t>(sourceLength) >= sizeof(sourcePrompt) ||
+            static_cast<size_t>(targetLength) >= sizeof(targetPrompt) ||
+            !CopyOwnedFile(
+                sourcePrompt,
+                targetPrompt,
+                gAppUid,
+                static_cast<off_t>(prompt.sizeBytes),
+                kMaximumPromptBytes,
+                prompt.sha256) ||
+            !ValidateWaveFile(targetPrompt)) {
+            valid = false;
+            break;
+        }
+    }
+    valid = valid && SyncDirectory(temporaryPromptDir) && SyncDirectory(temporaryPath);
+    if (!valid || rename(temporaryPath, finalPath) != 0 || !SyncDirectory(kRevisionDir)) {
+        RemoveTemporaryRevision(temporaryPath);
+        return false;
+    }
+    ivrdroid::RevisionConfig staged;
+    if (!LoadRootRevision(revisionId, manifestSha256, true, &staged) ||
+        !WriteRootRevisionValue(kStagedRevisionPath, kStagedRevisionTempPath, revisionId)) {
+        return false;
+    }
+    WriteBridgeRevision(kStagedRevisionBridgePath, kStagedRevisionBridgeTempPath, revisionId);
+    return true;
+}
+
+bool ActivateStagedRevision(uint64_t revisionId) {
+    WriteCurrentState(CurrentState::ActivatingRevision);
+    uint64_t staged = 0;
+    if (!ReadRootRevisionValue(kStagedRevisionPath, &staged) || staged != revisionId) return false;
+    ivrdroid::RevisionConfig config;
+    if (!LoadRootRevision(revisionId, "", true, &config)) return false;
+    uint64_t active = 0;
+    if (!ReadRootRevisionValue(kActiveRevisionPath, &active)) return false;
+    if (active != 0 && active != revisionId &&
+        !WriteRootRevisionValue(kPreviousRevisionPath, kPreviousRevisionTempPath, active)) {
+        return false;
+    }
+    if (!WriteRootRevisionValue(kActiveRevisionPath, kActiveRevisionTempPath, revisionId) ||
+        !WriteRootRevisionValue(kStagedRevisionPath, kStagedRevisionTempPath, 0)) {
+        return false;
+    }
+    WriteBridgeRevision(kActiveRevisionBridgePath, kActiveRevisionBridgeTempPath, revisionId);
+    WriteBridgeRevision(kStagedRevisionBridgePath, kStagedRevisionBridgeTempPath, 0);
+    return true;
+}
+
+bool LoadRuntimeRevision(ivrdroid::RevisionConfig* config, uint64_t* revisionId) {
+    uint64_t active = 0;
+    if (ReadRootRevisionValue(kActiveRevisionPath, &active) && active != 0 &&
+        LoadRootRevision(active, "", false, config)) {
+        *revisionId = active;
+        return true;
+    }
+    uint64_t previous = 0;
+    if (ReadRootRevisionValue(kPreviousRevisionPath, &previous) && previous != 0 &&
+        LoadRootRevision(previous, "", true, config)) {
+        Log(ANDROID_LOG_WARN, "Active revision is unusable; using previous revision %llu.",
+            static_cast<unsigned long long>(previous));
+        *revisionId = previous;
+        return true;
+    }
+    return false;
+}
+
 bool PlayPrompt(const char* path) {
     if (gProfile == nullptr) return false;
     FILE* file = std::fopen(path, "rb");
@@ -1599,7 +2307,7 @@ struct DtmfResult {
     char digit;
 };
 
-DtmfResult CaptureDtmfDigit(int guardianFd) {
+DtmfResult CaptureDtmfDigit(int guardianFd, uint32_t timeoutMilliseconds = 8000) {
     if (gProfile == nullptr) return {DtmfResultKind::CaptureError, 0};
     if (!IsAudioInCall()) {
         const ivrdroid::CallDisposition disposition =
@@ -1653,8 +2361,13 @@ DtmfResult CaptureDtmfDigit(int guardianFd) {
         gProfile->card,
         gProfile->captureDevice);
 
-    for (unsigned int frame = 0;
-         frame < kDtmfTimeoutFrames && !gStopRequested;
+    const uint64_t timeoutFrames = std::max<uint64_t>(
+        1,
+        (static_cast<uint64_t>(timeoutMilliseconds) * gProfile->sampleRate +
+         static_cast<uint64_t>(kDtmfFrameCount) * 1000U - 1U) /
+            (static_cast<uint64_t>(kDtmfFrameCount) * 1000U));
+    for (uint64_t frame = 0;
+         frame < timeoutFrames && !gStopRequested;
          ++frame) {
         const int framesRead =
             pcm_readi(input, samples.data(), kDtmfFrameCount);
@@ -1711,6 +2424,1886 @@ DtmfResult CaptureDtmfDigit(int guardianFd) {
     if (gStopRequested) return {DtmfResultKind::Stopped, 0};
     Log(ANDROID_LOG_INFO, "Caller DTMF wait timed out.");
     return {DtmfResultKind::Timeout, 0};
+}
+
+DtmfResult CaptureDtmfDigitWithPrompt(
+    const char* promptPath,
+    const std::unordered_map<char, uint32_t>& configuredDigits,
+    int guardianFd,
+    uint32_t timeoutMilliseconds) {
+    if (gProfile == nullptr || !ValidatePromptFile(promptPath)) {
+        return {DtmfResultKind::CaptureError, 0};
+    }
+    if (!IsAudioInCall()) {
+        const ivrdroid::CallDisposition disposition = ReadLiveCallState();
+        if (disposition == ivrdroid::CallDisposition::Idle) {
+            return {DtmfResultKind::CallEnded, 0};
+        }
+        if (disposition == ivrdroid::CallDisposition::Emergency) {
+            return {DtmfResultKind::EmergencyPreempt, 0};
+        }
+        if (disposition == ivrdroid::CallDisposition::Multiple) {
+            return {DtmfResultKind::ExternalPreempt, 0};
+        }
+        return {DtmfResultKind::CaptureError, 0};
+    }
+    if (!NotifyGuardian(guardianFd, kGuardianPrompt)) {
+        return {DtmfResultKind::CaptureError, 0};
+    }
+
+    MixerRoute route {};
+    if (!OpenMixerRoute(&route)) {
+        NotifyGuardian(guardianFd, kGuardianIdle);
+        return {DtmfResultKind::CaptureError, 0};
+    }
+    const RouteValues privacy = PrivacyRoute(route);
+    const bool privateRoute = SameRoute(ReadRoute(route), privacy);
+    CloseMixerRoute(&route);
+    if (!privateRoute) {
+        Log(
+            ANDROID_LOG_ERROR,
+            "Session privacy route changed before interruptible prompt capture.");
+        NotifyGuardian(guardianFd, kGuardianIdle);
+        return {DtmfResultKind::CaptureError, 0};
+    }
+
+    int startPipe[2] = {-1, -1};
+    if (socketpair(
+            AF_UNIX,
+            SOCK_SEQPACKET | SOCK_CLOEXEC,
+            0,
+            startPipe) != 0) {
+        NotifyGuardian(guardianFd, kGuardianIdle);
+        return {DtmfResultKind::CaptureError, 0};
+    }
+    const pid_t parentPid = getpid();
+    pid_t playbackChild = fork();
+    if (playbackChild < 0) {
+        close(startPipe[0]);
+        close(startPipe[1]);
+        NotifyGuardian(guardianFd, kGuardianIdle);
+        return {DtmfResultKind::CaptureError, 0};
+    }
+    if (playbackChild == 0) {
+        close(startPipe[1]);
+        close(guardianFd);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+            getppid() != parentPid) {
+            close(startPipe[0]);
+            _exit(126);
+        }
+        char start = 0;
+        ssize_t count = -1;
+        do {
+            count = read(startPipe[0], &start, 1);
+        } while (count < 0 && errno == EINTR);
+        close(startPipe[0]);
+        if (count != 1 || start != 'P') _exit(126);
+        _exit(PlayPrompt(promptPath) ? 0 : 1);
+    }
+    close(startPipe[0]);
+
+    pcm_config captureConfig {};
+    captureConfig.channels = gProfile->channels;
+    captureConfig.rate = gProfile->sampleRate;
+    captureConfig.period_size = kDtmfFrameCount;
+    captureConfig.period_count = kDtmfPeriodCount;
+    captureConfig.format = PCM_FORMAT_S16_LE;
+    pcm* input = pcm_open(
+        gProfile->card,
+        gProfile->captureDevice,
+        PCM_IN,
+        &captureConfig);
+    bool routeApplied = false;
+
+    const auto cleanup = [&](bool terminatePlayback) {
+        close(startPipe[1]);
+        startPipe[1] = -1;
+        bool childClean = true;
+        if (playbackChild > 0) {
+            childClean = terminatePlayback
+                ? ivrdroid::TerminateAndReapChildProcess(&playbackChild)
+                : false;
+        }
+        if (input != nullptr) {
+            pcm_close(input);
+            input = nullptr;
+        }
+        const bool restored = !routeApplied ||
+            (RestoreRoute(privacy, true) && HasPrivateSessionRoute());
+        routeApplied = false;
+        const bool guardianIdle = NotifyGuardian(guardianFd, kGuardianIdle);
+        return childClean && restored && guardianIdle;
+    };
+
+    if (input == nullptr || !pcm_is_ready(input) || pcm_start(input) != 0) {
+        Log(
+            ANDROID_LOG_ERROR,
+            "Cannot start interruptible DTMF capture PCM: %s",
+            input == nullptr ? "null handle" : pcm_get_error(input));
+        cleanup(true);
+        return {DtmfResultKind::CaptureError, 0};
+    }
+
+    if (!OpenMixerRoute(&route)) {
+        cleanup(true);
+        return {DtmfResultKind::CaptureError, 0};
+    }
+    const bool baselinePrivate = SameRoute(ReadRoute(route), privacy);
+    routeApplied = baselinePrivate;
+    const bool applied = baselinePrivate && ApplyInjectionRoute(&route);
+    CloseMixerRoute(&route);
+    if (!applied) {
+        Log(
+            ANDROID_LOG_ERROR,
+            "Interruptible prompt injection failed before playback.");
+        cleanup(true);
+        return {DtmfResultKind::CaptureError, 0};
+    }
+    const char start = 'P';
+    if (send(startPipe[1], &start, 1, MSG_NOSIGNAL) != 1) {
+        cleanup(true);
+        return {DtmfResultKind::CaptureError, 0};
+    }
+    close(startPipe[1]);
+    startPipe[1] = -1;
+    WriteCurrentState(CurrentState::PlayingMain);
+    Log(
+        ANDROID_LOG_INFO,
+        "Capturing caller DTMF while the audited menu prompt plays.");
+
+    std::vector<int16_t> samples(kDtmfFrameCount * gProfile->channels);
+    ivrdroid::StereoDtmfDetector detector(gProfile->sampleRate);
+    const uint64_t timeoutFrames = std::max<uint64_t>(
+        1,
+        (static_cast<uint64_t>(timeoutMilliseconds) * gProfile->sampleRate +
+         static_cast<uint64_t>(kDtmfFrameCount) * 1000U - 1U) /
+            (static_cast<uint64_t>(kDtmfFrameCount) * 1000U));
+    std::string configuredDigitList;
+    for (const auto& branch : configuredDigits) {
+        configuredDigitList.push_back(branch.first);
+    }
+    ivrdroid::PromptBargeInAttemptPolicy attemptPolicy(
+        configuredDigitList,
+        timeoutFrames);
+    uint64_t totalFrames = 0;
+
+    while (!gStopRequested) {
+        const int framesRead =
+            pcm_readi(input, samples.data(), kDtmfFrameCount);
+        if (framesRead != static_cast<int>(kDtmfFrameCount)) {
+            Log(
+                ANDROID_LOG_ERROR,
+                "Interruptible DTMF PCM read failed or returned %d frames: %s",
+                framesRead,
+                pcm_get_error(input));
+            cleanup(true);
+            return {DtmfResultKind::CaptureError, 0};
+        }
+        ++totalFrames;
+
+        ivrdroid::DtmfFrameAnalysis left {};
+        ivrdroid::DtmfFrameAnalysis right {};
+        const char digit = detector.ProcessFrame(
+            samples.data(),
+            kDtmfFrameCount,
+            &left,
+            &right);
+        if (digit != 0) {
+            Log(
+                ANDROID_LOG_INFO,
+                "Detected caller DTMF digit %c during %s "
+                "(left=%.2f right=%.2f dominance=%.2f/%.2f).",
+                digit,
+                attemptPolicy.promptPlaying()
+                    ? "prompt playback"
+                    : "post-prompt timeout",
+                left.confidence,
+                right.confidence,
+                left.dominance,
+                right.dominance);
+            if (attemptPolicy.ObserveDigit(digit) ==
+                ivrdroid::PromptDigitDecision::Accept) {
+                if (!cleanup(attemptPolicy.promptPlaying())) {
+                    return {DtmfResultKind::CaptureError, 0};
+                }
+                return {DtmfResultKind::Digit, digit};
+            }
+            Log(
+                ANDROID_LOG_INFO,
+                "Ignoring unconfigured digit %c while the prompt continues.",
+                digit);
+        }
+
+        if (totalFrames % kDtmfCallCheckFrames == 0 && !IsAudioInCall()) {
+            const ivrdroid::CallDisposition disposition = ReadLiveCallState();
+            if (!cleanup(true)) {
+                return {DtmfResultKind::CaptureError, 0};
+            }
+            if (disposition == ivrdroid::CallDisposition::Idle) {
+                return {DtmfResultKind::CallEnded, 0};
+            }
+            if (disposition == ivrdroid::CallDisposition::Emergency) {
+                return {DtmfResultKind::EmergencyPreempt, 0};
+            }
+            if (disposition == ivrdroid::CallDisposition::Multiple) {
+                return {DtmfResultKind::ExternalPreempt, 0};
+            }
+            return {DtmfResultKind::CaptureError, 0};
+        }
+
+        if (attemptPolicy.promptPlaying()) {
+            const ivrdroid::ChildProcessState childState =
+                ivrdroid::PollChildProcess(&playbackChild);
+            if (childState == ivrdroid::ChildProcessState::ExitedSuccessfully) {
+                const bool restored =
+                    RestoreRoute(privacy, true) && HasPrivateSessionRoute();
+                if (restored) routeApplied = false;
+                if (!restored || !NotifyGuardian(guardianFd, kGuardianDtmf)) {
+                    cleanup(false);
+                    return {DtmfResultKind::CaptureError, 0};
+                }
+                attemptPolicy.PromptCompleted();
+                WriteCurrentState(CurrentState::ListeningDtmf);
+                Log(
+                    ANDROID_LOG_INFO,
+                    "Prompt completed; starting the full post-prompt DTMF timeout.");
+            } else if (childState != ivrdroid::ChildProcessState::Running) {
+                cleanup(false);
+                return {DtmfResultKind::CaptureError, 0};
+            }
+        } else if (attemptPolicy.AdvancePostPromptFrame()) {
+            if (!cleanup(false)) {
+                return {DtmfResultKind::CaptureError, 0};
+            }
+            Log(ANDROID_LOG_INFO, "Caller DTMF wait timed out after prompt playback.");
+            return {DtmfResultKind::Timeout, 0};
+        }
+    }
+
+    if (!cleanup(true)) return {DtmfResultKind::CaptureError, 0};
+    return {DtmfResultKind::Stopped, 0};
+}
+
+bool ReadRecordingCapacity(ivrdroid::RecordingCapacity* capacity) {
+    if (capacity == nullptr) return false;
+    std::string wire;
+    return ReadBridgeWire(
+               kRecordingCapacityPath,
+               kMaximumRecordingCapacityBytes,
+               &wire) &&
+        ivrdroid::ParseRecordingCapacity(wire, capacity);
+}
+
+enum class RecordingInboxKind {
+    Voicemail,
+    Conversation,
+    Unknown,
+};
+
+RecordingInboxKind ClassifyRecordingInboxName(const std::string& name) {
+    const bool temporary = !name.empty() && name.front() == '.';
+    const size_t start = temporary ? 1 : 0;
+    if (name.size() < start + 36 ||
+        !ivrdroid::call_control::IsCanonicalUuid(
+            std::string_view(name).substr(start, 36))) {
+        return RecordingInboxKind::Unknown;
+    }
+    const std::string suffix = name.substr(start + 36);
+    if ((!temporary && (suffix == ".wav" || suffix == ".json")) ||
+        (temporary &&
+         (suffix == ".wav.partial" || suffix == ".json.tmp"))) {
+        return RecordingInboxKind::Voicemail;
+    }
+    if (suffix.size() < 6 || suffix.front() != '.') {
+        return RecordingInboxKind::Unknown;
+    }
+    uint32_t segmentIndex = 0;
+    const std::string digits = suffix.substr(1, 5);
+    const auto parsed = std::from_chars(
+        digits.data(),
+        digits.data() + digits.size(),
+        segmentIndex);
+    if (parsed.ec != std::errc() ||
+        parsed.ptr != digits.data() + digits.size() ||
+        ivrdroid::ConversationSegmentStem(
+            std::string_view(name).substr(start, 36),
+            segmentIndex) != name.substr(start, 42)) {
+        return RecordingInboxKind::Unknown;
+    }
+    const std::string conversationSuffix = name.substr(start + 42);
+    if ((!temporary &&
+         (conversationSuffix == ".wav" || conversationSuffix == ".json")) ||
+        (temporary &&
+         (conversationSuffix == ".wav.partial" ||
+          conversationSuffix == ".json.tmp"))) {
+        return RecordingInboxKind::Conversation;
+    }
+    return RecordingInboxKind::Unknown;
+}
+
+bool MeasureRecordingInbox(
+    RecordingInboxKind requestedKind,
+    uint64_t* inboxBytes) {
+    if (inboxBytes == nullptr) return false;
+    *inboxBytes = 0;
+    DIR* directory = opendir(kRecordingInboxDir);
+    if (directory == nullptr) return false;
+    bool safe = true;
+    while (dirent* entry = readdir(directory)) {
+        if (entry->d_name[0] == '.' &&
+            (entry->d_name[1] == '\0' ||
+             (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
+            continue;
+        }
+        const std::string name(entry->d_name);
+        const RecordingInboxKind kind = ClassifyRecordingInboxName(name);
+        const std::string path = std::string(kRecordingInboxDir) + "/" + name;
+        struct stat state {};
+        if (kind == RecordingInboxKind::Unknown ||
+            lstat(path.c_str(), &state) != 0 ||
+            !S_ISREG(state.st_mode) ||
+            (state.st_uid != gAppUid && state.st_uid != 0) ||
+            (state.st_mode & 0077) != 0 || state.st_size < 0) {
+            safe = false;
+            break;
+        }
+        if (kind == requestedKind) {
+            const uint64_t size = static_cast<uint64_t>(state.st_size);
+            if (*inboxBytes > UINT64_MAX - size) {
+                safe = false;
+                break;
+            }
+            *inboxBytes += size;
+        }
+    }
+    closedir(directory);
+    return safe;
+}
+
+bool RecordingStorageAvailable(uint32_t maximumDurationMilliseconds) {
+    ivrdroid::RecordingCapacity capacity;
+    if (!ReadRecordingCapacity(&capacity) ||
+        capacity.voicemailBytes > kRecordingSpoolLimitBytes ||
+        capacity.voicemailCount >= 64) {
+        return false;
+    }
+    uint64_t inboxBytes = 0;
+    if (!MeasureRecordingInbox(RecordingInboxKind::Voicemail, &inboxBytes) ||
+        inboxBytes > kRecordingSpoolLimitBytes) return false;
+
+    const uint64_t required =
+        44ULL +
+        (static_cast<uint64_t>(maximumDurationMilliseconds) * 48'000ULL * 4ULL) /
+            1000ULL;
+    struct statvfs filesystem {};
+    return required <= kMaximumRecordingBytes &&
+        statvfs(kRecordingInboxDir, &filesystem) == 0 &&
+        ivrdroid::RecordingStorageFits(
+            capacity.voicemailBytes,
+            inboxBytes,
+            required,
+            static_cast<uint64_t>(filesystem.f_bavail) * filesystem.f_frsize,
+            kRecordingSpoolLimitBytes);
+}
+
+bool ConversationStorageAvailable() {
+    ivrdroid::RecordingCapacity capacity;
+    if (!ReadRecordingCapacity(&capacity) || capacity.version != 2 ||
+        capacity.conversationBytes > ivrdroid::kConversationSpoolLimitBytes) {
+        return false;
+    }
+    uint64_t inboxBytes = 0;
+    if (!MeasureRecordingInbox(RecordingInboxKind::Conversation, &inboxBytes) ||
+        inboxBytes > ivrdroid::kConversationSpoolLimitBytes) {
+        return false;
+    }
+    constexpr uint64_t required = 44ULL +
+        ivrdroid::kConversationSegmentMaximumFrames * 4ULL;
+    struct statvfs filesystem {};
+    return required <= kMaximumRecordingBytes &&
+        statvfs(kRecordingInboxDir, &filesystem) == 0 &&
+        ivrdroid::ConversationStorageFits(
+            capacity.conversationBytes,
+            inboxBytes,
+            required,
+            static_cast<uint64_t>(filesystem.f_bavail) * filesystem.f_frsize,
+            capacity.filesystemFreeBytes);
+}
+
+bool GenerateRecordingUuid(std::string* output) {
+    if (output == nullptr) return false;
+    std::array<uint8_t, 16> bytes {};
+    const int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    const bool read = ReadAll(fd, bytes.data(), bytes.size());
+    close(fd);
+    if (!read) return false;
+    bytes[6] = static_cast<uint8_t>((bytes[6] & 0x0fU) | 0x40U);
+    bytes[8] = static_cast<uint8_t>((bytes[8] & 0x3fU) | 0x80U);
+    char value[37] = {};
+    const int length = std::snprintf(
+        value,
+        sizeof(value),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+        "%02x%02x%02x%02x%02x%02x",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11],
+        bytes[12], bytes[13], bytes[14], bytes[15]);
+    if (length != 36) return false;
+    *output = value;
+    return true;
+}
+
+bool WriteWaveHeader(int fd, uint32_t dataBytes) {
+    const RiffHeader riff {kRiffId, 36U + dataBytes, kWaveId};
+    const ChunkHeader format {kFormatId, static_cast<uint32_t>(sizeof(WaveFormat))};
+    const WaveFormat wave {
+        1,
+        2,
+        48'000,
+        192'000,
+        4,
+        16,
+    };
+    const ChunkHeader data {kDataId, dataBytes};
+    if (lseek(fd, 0, SEEK_SET) != 0 ||
+        !WriteAll(fd, &riff, sizeof(riff)) ||
+        !WriteAll(fd, &format, sizeof(format)) ||
+        !WriteAll(fd, &wave, sizeof(wave)) ||
+        !WriteAll(fd, &data, sizeof(data))) {
+        return false;
+    }
+    return lseek(fd, 0, SEEK_END) >= 0;
+}
+
+bool PlayBuiltInRecordingBeep() {
+    if (gProfile == nullptr || gProfile->channels != 2 || gProfile->sampleRate != 48'000) {
+        return false;
+    }
+    pcm_config config {};
+    config.channels = 2;
+    config.rate = 48'000;
+    config.period_size = 1024;
+    config.period_count = 2;
+    config.format = PCM_FORMAT_S16_LE;
+    config.start_threshold = config.period_size;
+    config.stop_threshold = config.period_size * config.period_count;
+    pcm* output = pcm_open(gProfile->card, gProfile->playbackDevice, PCM_OUT, &config);
+    if (output == nullptr || !pcm_is_ready(output)) {
+        if (output != nullptr) pcm_close(output);
+        return false;
+    }
+    constexpr uint32_t totalFrames = 24'000;
+    constexpr double pi = 3.14159265358979323846;
+    std::vector<int16_t> samples(config.period_size * 2);
+    uint32_t written = 0;
+    bool success = true;
+    while (written < totalFrames && !gStopRequested) {
+        const uint32_t frames = std::min<uint32_t>(config.period_size, totalFrames - written);
+        for (uint32_t index = 0; index < frames; ++index) {
+            const double position = static_cast<double>(written + index) / 48'000.0;
+            const int16_t value = static_cast<int16_t>(
+                std::lround(6000.0 * std::sin(2.0 * pi * 1000.0 * position)));
+            samples[index * 2] = value;
+            samples[index * 2 + 1] = value;
+        }
+        if (pcm_writei(output, samples.data(), frames) != static_cast<int>(frames)) {
+            success = false;
+            break;
+        }
+        written += frames;
+    }
+    if (success && !gStopRequested) pcm_wait(output, 1000);
+    pcm_close(output);
+    return success && written == totalFrames && !gStopRequested;
+}
+
+PromptResult ProcessRecordingBeep(int guardianFd) {
+    if (!IsAudioInCall() || !NotifyGuardian(guardianFd, kGuardianPrompt)) {
+        return PromptResultForCallDisposition(ReadLiveCallState());
+    }
+    MixerRoute route {};
+    if (!OpenMixerRoute(&route)) return PromptResult::Failed;
+    const RouteValues privacy = PrivacyRoute(route);
+    const bool safe = SameRoute(ReadRoute(route), privacy) && ApplyInjectionRoute(&route);
+    CloseMixerRoute(&route);
+    if (!safe) return PromptResult::Failed;
+    const bool played = PlayBuiltInRecordingBeep();
+    const bool restored = RestoreRoute(privacy, true);
+    if (!restored || !NotifyGuardian(guardianFd, kGuardianIdle)) {
+        return PromptResult::Failed;
+    }
+    return played ? PromptResult::Completed : PromptResultForCallDisposition(ReadLiveCallState());
+}
+
+enum class RecordingCaptureKind {
+    Completed,
+    HangupFinalized,
+    Unavailable,
+    EmergencyPreempt,
+    ExternalPreempt,
+    UnverifiedPreempt,
+    Failed,
+};
+
+struct RecordingCaptureResult {
+    RecordingCaptureKind kind = RecordingCaptureKind::Failed;
+    const char* stopReason = nullptr;
+};
+
+bool IsRecordingStorageError(int error) {
+    return error == ENOSPC || error == EDQUOT || error == EFBIG ||
+        error == EROFS || error == EMFILE || error == ENFILE;
+}
+
+bool CurrentUtcTimestamp(char* output, size_t outputBytes) {
+    if (output == nullptr || outputBytes < 25) return false;
+    timespec now {};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0) return false;
+    std::string timestamp;
+    if (!ivrdroid::FormatUtcTimestamp(
+            static_cast<int64_t>(now.tv_sec),
+            static_cast<int32_t>(now.tv_nsec / 1'000'000),
+            &timestamp) || timestamp.size() + 1 > outputBytes) {
+        return false;
+    }
+    std::memcpy(output, timestamp.c_str(), timestamp.size() + 1);
+    return true;
+}
+
+bool WriteRecordingReceipt(
+    const std::string& recordingUuid,
+    const std::string& callUuid,
+    uint64_t revisionId,
+    const std::string& blockId,
+    uint32_t sequence,
+    const char* capturedAt,
+    uint32_t durationMilliseconds,
+    const char* stopReason,
+    uint64_t sizeBytes,
+    const std::string& sha256) {
+    if (capturedAt == nullptr || capturedAt[0] == '\0') return false;
+    char receipt[2048] = {};
+    const int length = std::snprintf(
+        receipt,
+        sizeof(receipt),
+        "{\"version\":1,\"recording_id\":\"%s\",\"call_id\":\"%s\","
+        "\"revision_id\":%llu,\"block_id\":\"%s\",\"sequence\":%u,"
+        "\"captured_at\":\"%s\",\"duration_ms\":%u,\"stop_reason\":\"%s\","
+        "\"size_bytes\":%llu,\"sha256\":\"%s\"}\n",
+        recordingUuid.c_str(),
+        callUuid.c_str(),
+        static_cast<unsigned long long>(revisionId),
+        blockId.c_str(),
+        sequence,
+        capturedAt,
+        durationMilliseconds,
+        stopReason,
+        static_cast<unsigned long long>(sizeBytes),
+        sha256.c_str());
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(receipt)) return false;
+    const std::string temporary =
+        std::string(kRecordingInboxDir) + "/." + recordingUuid + ".json.tmp";
+    const std::string final =
+        std::string(kRecordingInboxDir) + "/" + recordingUuid + ".json";
+    unlink(temporary.c_str());
+    const int fd = open(
+        temporary.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    if (fd < 0) return false;
+    const bool written =
+        WriteAll(fd, receipt, static_cast<size_t>(length)) &&
+        fsync(fd) == 0 &&
+        fchown(fd, gAppUid, gAppUid) == 0 &&
+        fchmod(fd, 0600) == 0;
+    close(fd);
+    if (!written || rename(temporary.c_str(), final.c_str()) != 0) {
+        unlink(temporary.c_str());
+        return false;
+    }
+    return SyncDirectory(kRecordingInboxDir);
+}
+
+bool WriteConversationReceipt(
+    const std::string& recordingUuid,
+    const std::string& callUuid,
+    uint64_t revisionId,
+    const std::string& blockId,
+    uint32_t segmentIndex,
+    const char* capturedAt,
+    uint32_t durationMilliseconds,
+    const char* stopReason,
+    uint64_t sizeBytes,
+    const std::string& sha256,
+    bool partial) {
+    const std::string stem = ivrdroid::ConversationSegmentStem(
+        recordingUuid,
+        segmentIndex);
+    if (stem.empty() || capturedAt == nullptr || capturedAt[0] == '\0' ||
+        durationMilliseconds == 0 ||
+        durationMilliseconds > ivrdroid::kConversationSegmentMaximumMilliseconds ||
+        stopReason == nullptr ||
+        !ivrdroid::IsConversationStopReason(stopReason, partial) ||
+        !ivrdroid::call_control::IsCanonicalUuid(callUuid) ||
+        !ivrdroid::call_control::IsCanonicalUuid(blockId) ||
+        sha256.size() != 64) {
+        return false;
+    }
+    char receipt[2304] = {};
+    const int length = std::snprintf(
+        receipt,
+        sizeof(receipt),
+        "{\"version\":2,\"kind\":\"conversation\","
+        "\"recording_id\":\"%s\",\"call_id\":\"%s\","
+        "\"revision_id\":%llu,\"block_id\":\"%s\","
+        "\"sequence\":%u,\"segment_index\":%u,"
+        "\"captured_at\":\"%s\",\"duration_ms\":%u,"
+        "\"stop_reason\":\"%s\",\"size_bytes\":%llu,"
+        "\"sha256\":\"%s\",\"partial\":%s}\n",
+        recordingUuid.c_str(),
+        callUuid.c_str(),
+        static_cast<unsigned long long>(revisionId),
+        blockId.c_str(),
+        segmentIndex,
+        segmentIndex,
+        capturedAt,
+        durationMilliseconds,
+        stopReason,
+        static_cast<unsigned long long>(sizeBytes),
+        sha256.c_str(),
+        partial ? "true" : "false");
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(receipt)) return false;
+    const std::string temporary =
+        std::string(kRecordingInboxDir) + "/." + stem + ".json.tmp";
+    const std::string final =
+        std::string(kRecordingInboxDir) + "/" + stem + ".json";
+    const int fd = open(
+        temporary.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    if (fd < 0) return false;
+    const bool written =
+        WriteAll(fd, receipt, static_cast<size_t>(length)) &&
+        fsync(fd) == 0 &&
+        fchown(fd, gAppUid, gAppUid) == 0 &&
+        fchmod(fd, 0600) == 0;
+    close(fd);
+    if (!written || rename(temporary.c_str(), final.c_str()) != 0) {
+        unlink(temporary.c_str());
+        return false;
+    }
+    return SyncDirectory(kRecordingInboxDir);
+}
+
+struct ConversationSegment {
+    uint32_t index = 0;
+    int fd = -1;
+    uint64_t frames = 0;
+    std::string stem;
+    std::string temporaryPath;
+    std::string finalPath;
+    std::array<char, 32> capturedAt {};
+};
+
+void RemoveConversationSegment(ConversationSegment* segment) {
+    if (segment == nullptr) return;
+    if (segment->fd >= 0) {
+        close(segment->fd);
+        segment->fd = -1;
+    }
+    if (!segment->temporaryPath.empty()) unlink(segment->temporaryPath.c_str());
+}
+
+bool OpenConversationSegment(
+    const std::string& recordingUuid,
+    uint32_t segmentIndex,
+    ConversationSegment* segment) {
+    if (segment == nullptr || !ConversationStorageAvailable()) {
+        return false;
+    }
+    ConversationSegment opened;
+    opened.index = segmentIndex;
+    opened.stem = ivrdroid::ConversationSegmentStem(recordingUuid, segmentIndex);
+    if (opened.stem.empty()) return false;
+    opened.temporaryPath =
+        std::string(kRecordingInboxDir) + "/." + opened.stem + ".wav.partial";
+    opened.finalPath =
+        std::string(kRecordingInboxDir) + "/" + opened.stem + ".wav";
+    if (access(opened.finalPath.c_str(), F_OK) == 0 || errno != ENOENT) {
+        return false;
+    }
+    opened.fd = open(
+        opened.temporaryPath.c_str(),
+        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    if (opened.fd < 0 || !WriteWaveHeader(opened.fd, 0) ||
+        !CurrentUtcTimestamp(opened.capturedAt.data(), opened.capturedAt.size())) {
+        RemoveConversationSegment(&opened);
+        return false;
+    }
+    *segment = std::move(opened);
+    return true;
+}
+
+bool WriteConversationFrames(
+    ConversationSegment* segment,
+    const int16_t* samples,
+    uint32_t frames) {
+    if (segment == nullptr || segment->fd < 0 || samples == nullptr ||
+        frames == 0 ||
+        segment->frames > ivrdroid::kConversationSegmentMaximumFrames - frames ||
+        !WriteAll(
+            segment->fd,
+            samples,
+            static_cast<size_t>(frames) * 2 * sizeof(int16_t))) {
+        return false;
+    }
+    segment->frames += frames;
+    return true;
+}
+
+bool FinalizeConversationSegment(
+    ConversationSegment* segment,
+    const std::string& recordingUuid,
+    const std::string& callUuid,
+    uint64_t revisionId,
+    const std::string& blockId,
+    const char* stopReason,
+    bool partial) {
+    if (segment == nullptr || segment->fd < 0 || segment->frames == 0 ||
+        segment->frames > ivrdroid::kConversationSegmentMaximumFrames ||
+        !ivrdroid::IsConversationStopReason(stopReason, partial)) {
+        RemoveConversationSegment(segment);
+        return false;
+    }
+    const uint64_t dataBytes = segment->frames * 4ULL;
+    bool finalized = dataBytes <= UINT32_MAX &&
+        WriteWaveHeader(segment->fd, static_cast<uint32_t>(dataBytes)) &&
+        fsync(segment->fd) == 0 &&
+        fchmod(segment->fd, 0600) == 0 &&
+        fchown(segment->fd, gAppUid, gAppUid) == 0;
+    close(segment->fd);
+    segment->fd = -1;
+    if (!finalized ||
+        rename(segment->temporaryPath.c_str(), segment->finalPath.c_str()) != 0 ||
+        !SyncDirectory(kRecordingInboxDir)) {
+        unlink(segment->temporaryPath.c_str());
+        unlink(segment->finalPath.c_str());
+        SyncDirectory(kRecordingInboxDir);
+        return false;
+    }
+
+    struct stat state {};
+    std::string sha256;
+    const uint32_t durationMilliseconds = static_cast<uint32_t>(
+        segment->frames / 48ULL);
+    if (durationMilliseconds == 0 ||
+        lstat(segment->finalPath.c_str(), &state) != 0 ||
+        !S_ISREG(state.st_mode) || state.st_uid != gAppUid ||
+        state.st_size <= 44 ||
+        !ivrdroid::Sha256File(
+            segment->finalPath.c_str(),
+            kMaximumRecordingBytes,
+            &sha256) ||
+        !WriteConversationReceipt(
+            recordingUuid,
+            callUuid,
+            revisionId,
+            blockId,
+            segment->index,
+            segment->capturedAt.data(),
+            durationMilliseconds,
+            stopReason,
+            static_cast<uint64_t>(state.st_size),
+            sha256,
+            partial)) {
+        unlink(segment->finalPath.c_str());
+        const std::string receipt =
+            std::string(kRecordingInboxDir) + "/" + segment->stem + ".json";
+        const std::string receiptTemporary =
+            std::string(kRecordingInboxDir) + "/." + segment->stem + ".json.tmp";
+        unlink(receipt.c_str());
+        unlink(receiptTemporary.c_str());
+        SyncDirectory(kRecordingInboxDir);
+        return false;
+    }
+    return true;
+}
+
+struct ConversationFinalizer {
+    pid_t pid = -1;
+    uint32_t segmentIndex = 0;
+};
+
+bool StartConversationFinalizer(
+    ConversationSegment* segment,
+    const std::string& recordingUuid,
+    const std::string& callUuid,
+    uint64_t revisionId,
+    const std::string& blockId,
+    const char* stopReason,
+    bool partial,
+    int guardianFd,
+    int inheritedSegmentFd,
+    std::vector<ConversationFinalizer>* finalizers) {
+    if (segment == nullptr || segment->fd < 0 || finalizers == nullptr) return false;
+    const pid_t parentPid = getpid();
+    const pid_t child = fork();
+    if (child < 0) return false;
+    if (child == 0) {
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parentPid) {
+            _exit(2);
+        }
+        close(guardianFd);
+        if (inheritedSegmentFd >= 0) close(inheritedSegmentFd);
+        const bool finalized = FinalizeConversationSegment(
+            segment,
+            recordingUuid,
+            callUuid,
+            revisionId,
+            blockId,
+            stopReason,
+            partial);
+        _exit(finalized ? 0 : 1);
+    }
+    close(segment->fd);
+    segment->fd = -1;
+    finalizers->push_back({child, segment->index});
+    return true;
+}
+
+bool CollectConversationFinalizers(
+    std::vector<ConversationFinalizer>* finalizers,
+    bool waitForAll,
+    std::vector<uint32_t>* finalizedSegmentIndexes) {
+    if (finalizers == nullptr || finalizedSegmentIndexes == nullptr) return false;
+    bool success = true;
+    size_t index = 0;
+    while (index < finalizers->size()) {
+        int status = 0;
+        pid_t result = -1;
+        do {
+            result = waitpid(
+                (*finalizers)[index].pid,
+                &status,
+                waitForAll ? 0 : WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result == 0) {
+            ++index;
+            continue;
+        }
+        if (result < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            success = false;
+        } else {
+            finalizedSegmentIndexes->push_back(
+                (*finalizers)[index].segmentIndex);
+        }
+        finalizers->erase(finalizers->begin() + static_cast<ptrdiff_t>(index));
+    }
+    return success;
+}
+
+enum class ConversationHandoffProgress {
+    Ready,
+    Waiting,
+    Failed,
+};
+
+ConversationHandoffProgress PollConversationHandoff(
+    std::vector<ConversationFinalizer>* finalizers,
+    ivrdroid::conversation_handoff::Policy* policy,
+    int64_t nowMilliseconds) {
+    if (finalizers == nullptr || policy == nullptr || !policy->valid()) {
+        return ConversationHandoffProgress::Failed;
+    }
+    std::vector<uint32_t> finalizedSegmentIndexes;
+    if (!CollectConversationFinalizers(
+            finalizers,
+            false,
+            &finalizedSegmentIndexes)) {
+        return ConversationHandoffProgress::Failed;
+    }
+    for (const uint32_t segmentIndex : finalizedSegmentIndexes) {
+        if (!policy->MarkSegmentFinalized(segmentIndex, nowMilliseconds)) {
+            return ConversationHandoffProgress::Failed;
+        }
+    }
+
+    if (policy->pending()) {
+        ivrdroid::conversation_handoff::Acknowledgement acknowledgement;
+        if (ReadConversationHandoffAcknowledgement(&acknowledgement)) {
+            using ivrdroid::conversation_handoff::Decision;
+            const Decision decision = policy->Observe(
+                acknowledgement,
+                nowMilliseconds);
+            if (decision == Decision::Failed ||
+                decision == Decision::TimedOut ||
+                decision == Decision::ProtocolFailure) {
+                return ConversationHandoffProgress::Failed;
+            }
+        }
+        if (policy->CheckDeadline(nowMilliseconds) ==
+            ivrdroid::conversation_handoff::Decision::TimedOut) {
+            return ConversationHandoffProgress::Failed;
+        }
+    }
+    return finalizers->empty() && !policy->pending()
+        ? ConversationHandoffProgress::Ready
+        : ConversationHandoffProgress::Waiting;
+}
+
+enum class GuardianCallNotice {
+    None,
+    Hangup,
+    Failed,
+};
+
+GuardianCallNotice ReadGuardianCallNotice(int guardianFd) {
+    pollfd descriptor {guardianFd, POLLIN | POLLHUP | POLLERR, 0};
+    const int result = poll(&descriptor, 1, 0);
+    if (result < 0) return errno == EINTR
+        ? GuardianCallNotice::None
+        : GuardianCallNotice::Failed;
+    if (result == 0) return GuardianCallNotice::None;
+    if ((descriptor.revents & POLLIN) != 0) {
+        char message = 0;
+        const ssize_t count = recv(guardianFd, &message, 1, MSG_DONTWAIT);
+        if (count == 1 && message == kGuardianRecordingHangup) {
+            return GuardianCallNotice::Hangup;
+        }
+        return GuardianCallNotice::Failed;
+    }
+    return (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0
+        ? GuardianCallNotice::Failed
+        : GuardianCallNotice::None;
+}
+
+bool AwaitConversationHandoff(
+    std::vector<ConversationFinalizer>* finalizers,
+    ivrdroid::conversation_handoff::Policy* policy,
+    int guardianFd) {
+    const int64_t deadline = MonotonicMilliseconds() +
+        ivrdroid::kRecordingFinalizationTimeoutMilliseconds;
+    while (!gStopRequested && MonotonicMilliseconds() <= deadline) {
+        const GuardianCallNotice guardianNotice =
+            ReadGuardianCallNotice(guardianFd);
+        if (guardianNotice == GuardianCallNotice::Failed) return false;
+        const ConversationHandoffProgress progress = PollConversationHandoff(
+            finalizers,
+            policy,
+            MonotonicMilliseconds());
+        if (progress == ConversationHandoffProgress::Ready) return true;
+        if (progress == ConversationHandoffProgress::Failed) return false;
+        usleep(50'000);
+    }
+    return false;
+}
+
+void RemoveConversationPlaintext(
+    const std::string& recordingUuid,
+    uint32_t segmentIndex) {
+    const std::string stem = ivrdroid::ConversationSegmentStem(
+        recordingUuid,
+        segmentIndex);
+    if (stem.empty()) return;
+    const std::string wave =
+        std::string(kRecordingInboxDir) + "/" + stem + ".wav";
+    const std::string receipt =
+        std::string(kRecordingInboxDir) + "/" + stem + ".json";
+    const std::string temporaryWave =
+        std::string(kRecordingInboxDir) + "/." + stem + ".wav.partial";
+    const std::string temporaryReceipt =
+        std::string(kRecordingInboxDir) + "/." + stem + ".json.tmp";
+    unlink(wave.c_str());
+    unlink(receipt.c_str());
+    unlink(temporaryWave.c_str());
+    unlink(temporaryReceipt.c_str());
+    SyncDirectory(kRecordingInboxDir);
+}
+
+void RemovePendingConversationPlaintext(
+    const std::string& recordingUuid,
+    const ivrdroid::conversation_handoff::Policy& policy) {
+    if (policy.pending()) {
+        RemoveConversationPlaintext(
+            recordingUuid,
+            policy.pendingSegmentIndex());
+    }
+}
+
+void AbortConversationFinalizers(
+    std::vector<ConversationFinalizer>* finalizers,
+    const std::string& recordingUuid) {
+    if (finalizers == nullptr) return;
+    for (const ConversationFinalizer& finalizer : *finalizers) {
+        if (finalizer.pid > 0) kill(finalizer.pid, SIGKILL);
+    }
+    for (const ConversationFinalizer& finalizer : *finalizers) {
+        if (finalizer.pid <= 0) continue;
+        int status = 0;
+        while (waitpid(finalizer.pid, &status, 0) < 0 && errno == EINTR) {}
+        RemoveConversationPlaintext(recordingUuid, finalizer.segmentIndex);
+    }
+    finalizers->clear();
+}
+
+bool CorrelatesCallControlStatus(
+    const ivrdroid::call_control::Status& status,
+    const ivrdroid::call_control::Request& request) {
+    return status.kind != ivrdroid::call_control::StatusKind::Invalid &&
+        status.sessionUuid == request.sessionUuid &&
+        status.revisionId == request.revisionId &&
+        status.blockUuid == request.blockUuid &&
+        status.bootUuid == request.bootUuid;
+}
+
+enum class ExternalTeardownResult {
+    Safe,
+    CleanupTimeout,
+    Failed,
+};
+
+ExternalTeardownResult AwaitExternalCallTeardown(
+    const ivrdroid::call_control::Request& identity,
+    uint64_t lastSequence,
+    uint64_t lastElapsedMilliseconds,
+    ivrdroid::call_control::StatusKind lastKind,
+    const std::string& lastReason,
+    const ivrdroid::ExternalCallTerminalExpectation& expectation,
+    int guardianFd) {
+    ivrdroid::ExternalCallTeardownPolicy policy(
+        identity.sessionUuid,
+        identity.revisionId,
+        identity.blockUuid,
+        identity.bootUuid,
+        lastSequence,
+        lastElapsedMilliseconds,
+        lastKind,
+        lastReason,
+        expectation);
+    const int64_t deadline =
+        MonotonicMilliseconds() + kExternalCleanupMaximumMs;
+    while (!gStopRequested && MonotonicMilliseconds() < deadline) {
+        if (ReadGuardianCallNotice(guardianFd) == GuardianCallNotice::Failed) {
+            return ExternalTeardownResult::Failed;
+        }
+        ivrdroid::call_control::Status status;
+        if (ReadCallControlStatus(&status) &&
+            CorrelatesCallControlStatus(status, identity)) {
+            using ivrdroid::ExternalCallTeardownDecision;
+            const ExternalCallTeardownDecision decision = policy.Observe(status);
+            if (decision == ExternalCallTeardownDecision::Heartbeat ||
+                decision == ExternalCallTeardownDecision::MatchedTerminal ||
+                decision == ExternalCallTeardownDecision::CleanupTimeout) {
+                if (!NotifyGuardian(guardianFd, kGuardianOwnedDialing)) {
+                    return ExternalTeardownResult::Failed;
+                }
+            }
+            if (decision == ExternalCallTeardownDecision::MatchedTerminal) {
+                return ExternalTeardownResult::Safe;
+            }
+            if (decision == ExternalCallTeardownDecision::CleanupTimeout) {
+                return ExternalTeardownResult::CleanupTimeout;
+            }
+            if (decision == ExternalCallTeardownDecision::MismatchedTerminal ||
+                decision == ExternalCallTeardownDecision::ProtocolFailure) {
+                return ExternalTeardownResult::Failed;
+            }
+        }
+        usleep(50'000);
+    }
+    return ExternalTeardownResult::Failed;
+}
+
+bool ConfirmOriginalCallerSafe(int guardianFd) {
+    ivrdroid::PersistentSessionSnapshot snapshot {};
+    if (!LoadSnapshot(&snapshot) ||
+        ivrdroid::ClassifySnapshotBoot(snapshot, gBootId) !=
+            ivrdroid::SnapshotBootRelation::SameBoot ||
+        snapshot.callIdentityHash == 0) {
+        return false;
+    }
+    const int64_t startedAt = MonotonicMilliseconds();
+    ivrdroid::ExternalCallerSafePolicy policy(
+        snapshot.callIdentityHash,
+        startedAt,
+        kExternalCallerSafeStableMs,
+        kExternalCallerSafeMaximumMs);
+    while (!gStopRequested) {
+        if (ReadGuardianCallNotice(guardianFd) != GuardianCallNotice::None) {
+            return false;
+        }
+        if (!NotifyGuardian(guardianFd, kGuardianOwnedDialing)) {
+            return false;
+        }
+        const LiveCallObservation observation = ReadLiveCallObservation();
+        const ivrdroid::ExternalCallerSafeDecision decision = policy.Observe(
+            observation.disposition,
+            observation.identityHash,
+            MonotonicMilliseconds());
+        if (decision == ivrdroid::ExternalCallerSafeDecision::Stable) {
+            return true;
+        }
+        if (decision != ivrdroid::ExternalCallerSafeDecision::Waiting) {
+            return false;
+        }
+        usleep(kExternalCallerSafePollUs);
+    }
+    return false;
+}
+
+using ExternalCallExecutionKind = ivrdroid::ExternalCallRuntimeResult;
+
+struct ExternalCallExecutionResult {
+    ExternalCallExecutionKind kind = ExternalCallExecutionKind::Failed;
+    int64_t conferenceMilliseconds = 0;
+};
+
+ExternalCallExecutionResult ExecuteExternalCall(
+    const std::string& callUuid,
+    uint64_t revisionId,
+    const ivrdroid::RevisionInstruction& instruction,
+    int guardianFd) {
+    if (!ivrdroid::call_control::IsCanonicalUuid(callUuid) ||
+        !ivrdroid::call_control::IsCanonicalUuid(instruction.blockId) ||
+        !ivrdroid::call_control::IsCanonicalUuid(gBootId)) {
+        return {ExternalCallExecutionKind::SystemFailure};
+    }
+
+    std::string recordingUuid;
+    if (!GenerateRecordingUuid(&recordingUuid)) {
+        return {ExternalCallExecutionKind::SystemFailure};
+    }
+    const int64_t startedAt = MonotonicMilliseconds();
+    if (startedAt < 0) {
+        return {ExternalCallExecutionKind::SystemFailure};
+    }
+    const ivrdroid::call_control::Request request =
+        ivrdroid::BuildExternalCallDialRequest(
+            callUuid,
+            revisionId,
+            instruction.blockId,
+            instruction.externalNumber,
+            instruction.answerTimeoutMilliseconds,
+            gBootId,
+            1,
+            static_cast<uint64_t>(startedAt));
+    if (request.kind == ivrdroid::call_control::RequestKind::Invalid) {
+        return {ExternalCallExecutionKind::SystemFailure};
+    }
+
+    ivrdroid::ExternalCallPolicy policy(
+        request.sessionUuid,
+        request.revisionId,
+        request.blockUuid,
+        request.bootUuid,
+        request.answerTimeoutMilliseconds,
+        startedAt);
+    ivrdroid::conversation_handoff::Policy handoffPolicy(
+        callUuid,
+        revisionId,
+        instruction.blockId,
+        recordingUuid,
+        gBootId);
+    if (!handoffPolicy.valid()) {
+        return {ExternalCallExecutionKind::SystemFailure};
+    }
+    uint64_t nextRequestSequence = 2;
+    uint64_t lastRequestElapsedMilliseconds =
+        static_cast<uint64_t>(startedAt);
+    const auto stampRequest = [&](ivrdroid::call_control::Request* message) {
+        if (message == nullptr || nextRequestSequence == UINT64_MAX) return false;
+        const int64_t now = MonotonicMilliseconds();
+        if (now < 0) return false;
+        message->sequence = nextRequestSequence++;
+        message->elapsedMilliseconds = std::max<uint64_t>(
+            lastRequestElapsedMilliseconds,
+            static_cast<uint64_t>(now));
+        lastRequestElapsedMilliseconds = message->elapsedMilliseconds;
+        return true;
+    };
+    WriteCurrentState(CurrentState::CallingOperator);
+    if (!NotifyGuardian(guardianFd, kGuardianOwnedDialing) ||
+        !PublishCallControlRequest(request)) {
+        return {ExternalCallExecutionKind::Failed};
+    }
+
+    pcm_config captureConfig {};
+    captureConfig.channels = 2;
+    captureConfig.rate = 48'000;
+    captureConfig.period_size = kDtmfFrameCount;
+    captureConfig.period_count = kDtmfPeriodCount;
+    captureConfig.format = PCM_FORMAT_S16_LE;
+    pcm* input = nullptr;
+    ConversationSegment segment;
+    std::vector<ConversationFinalizer> finalizers;
+    std::vector<int16_t> samples(kDtmfFrameCount * 2);
+    bool recorderReady = false;
+    bool conferenced = false;
+    bool cancellationNeeded = false;
+    bool teardownNeeded = false;
+    bool handoffFailed = false;
+    const char* cancellationReason = "HELPER_CANCELLED";
+    ExternalCallExecutionKind terminal = ExternalCallExecutionKind::Failed;
+    const char* finalStopReason = nullptr;
+    bool finalPartial = false;
+    int64_t conferenceStartedAt = 0;
+    int64_t conferenceMilliseconds = 0;
+
+    const auto startRecorder = [&]() {
+        if (input != nullptr) return true;
+        if (!ConversationStorageAvailable()) return false;
+        input = pcm_open(
+            gProfile->card,
+            gProfile->captureDevice,
+            PCM_IN,
+            &captureConfig);
+        if (input == nullptr || !pcm_is_ready(input)) {
+            if (input != nullptr) pcm_close(input);
+            input = nullptr;
+            RemoveConversationSegment(&segment);
+            return false;
+        }
+        const int framesRead = pcm_readi(
+            input,
+            samples.data(),
+            kDtmfFrameCount);
+        if (framesRead != static_cast<int>(kDtmfFrameCount) ||
+            !policy.MarkRecorderReady(MonotonicMilliseconds())) {
+            pcm_close(input);
+            input = nullptr;
+            return false;
+        }
+        ivrdroid::call_control::Request ready = request;
+        ready.kind = ivrdroid::call_control::RequestKind::RecorderReady;
+        ready.phoneNumber.clear();
+        ready.answerTimeoutMilliseconds = 0;
+        recorderReady = stampRequest(&ready) && PublishCallControlRequest(ready);
+        return recorderReady;
+    };
+
+    while (!gStopRequested) {
+        const GuardianCallNotice guardianNotice =
+            ReadGuardianCallNotice(guardianFd);
+        if (guardianNotice == GuardianCallNotice::Failed) {
+            terminal = ExternalCallExecutionKind::Failed;
+            break;
+        }
+        if (guardianNotice == GuardianCallNotice::Hangup) {
+            terminal = ExternalCallExecutionKind::CallerHangup;
+            finalStopReason = conferenced ? "caller_hangup" : nullptr;
+            teardownNeeded = true;
+            break;
+        }
+
+        ivrdroid::call_control::Status status;
+        ivrdroid::ExternalCallDecision decision =
+            ivrdroid::ExternalCallDecision::Duplicate;
+        if (ReadCallControlStatus(&status)) {
+            decision = policy.Observe(status, MonotonicMilliseconds());
+        }
+        if (decision != ivrdroid::ExternalCallDecision::Duplicate &&
+            decision != ivrdroid::ExternalCallDecision::IgnoredForeign) {
+            const char phase = policy.stage() == ivrdroid::ExternalCallStage::Conferenced
+                ? kGuardianOwnedConference
+                : kGuardianOwnedDialing;
+            if (decision != ivrdroid::ExternalCallDecision::ControlTimeout &&
+                decision != ivrdroid::ExternalCallDecision::ProtocolFailure &&
+                !NotifyGuardian(guardianFd, phase)) {
+                terminal = ExternalCallExecutionKind::Failed;
+                break;
+            }
+        }
+
+        if (decision == ivrdroid::ExternalCallDecision::StartRecorder &&
+            !startRecorder()) {
+            cancellationNeeded = true;
+            terminal = ExternalCallExecutionKind::SystemFailure;
+            break;
+        }
+        if (decision == ivrdroid::ExternalCallDecision::Merging &&
+            (!recorderReady || input == nullptr)) {
+            cancellationNeeded = true;
+            terminal = ExternalCallExecutionKind::SystemFailure;
+            break;
+        }
+        if (decision == ivrdroid::ExternalCallDecision::Conferenced &&
+            !conferenced) {
+            if (!recorderReady || input == nullptr ||
+                !ivrdroid::AllowsConversationPersistenceStart(policy.stage()) ||
+                !OpenConversationSegment(recordingUuid, 0, &segment) ||
+                pcm_readi(input, samples.data(), kDtmfFrameCount) !=
+                    static_cast<int>(kDtmfFrameCount) ||
+                !WriteConversationFrames(
+                    &segment,
+                    samples.data(),
+                    kDtmfFrameCount) ||
+                !NotifyGuardian(guardianFd, kGuardianOwnedConference)) {
+                cancellationNeeded = true;
+                terminal = ExternalCallExecutionKind::SystemFailure;
+                break;
+            }
+            conferenced = true;
+            conferenceStartedAt = MonotonicMilliseconds();
+            WriteCurrentState(CurrentState::RecordingConversation);
+        }
+        if (decision == ivrdroid::ExternalCallDecision::Completed) {
+            terminal = ExternalCallExecutionKind::Completed;
+            finalStopReason = "operator_hangup";
+            break;
+        }
+        if (decision == ivrdroid::ExternalCallDecision::CallerHangup) {
+            terminal = ExternalCallExecutionKind::CallerHangup;
+            finalStopReason = conferenced ? "caller_hangup" : nullptr;
+            break;
+        }
+        if (decision == ivrdroid::ExternalCallDecision::NotConnected) {
+            terminal = ExternalCallExecutionKind::NotConnected;
+            break;
+        }
+        if (decision == ivrdroid::ExternalCallDecision::SystemFailure) {
+            terminal = ExternalCallExecutionKind::SystemFailure;
+            if (conferenced) {
+                finalStopReason = "recording_failure";
+                finalPartial = true;
+            }
+            break;
+        }
+        if (decision == ivrdroid::ExternalCallDecision::CleanupTimeout) {
+            terminal = ExternalCallExecutionKind::CleanupTimeout;
+            if (conferenced) {
+                finalStopReason = "recording_failure";
+                finalPartial = true;
+            }
+            break;
+        }
+        if (decision == ivrdroid::ExternalCallDecision::ProtocolFailure ||
+            decision == ivrdroid::ExternalCallDecision::ControlTimeout ||
+            decision == ivrdroid::ExternalCallDecision::SetupTimeout ||
+            decision == ivrdroid::ExternalCallDecision::MergeTimeout) {
+            cancellationNeeded = true;
+            terminal = ExternalCallExecutionKind::SystemFailure;
+            if (conferenced) {
+                finalStopReason = "recording_failure";
+                finalPartial = true;
+            }
+            break;
+        }
+        if (decision == ivrdroid::ExternalCallDecision::AnswerTimeout) {
+            cancellationNeeded = true;
+            terminal = ExternalCallExecutionKind::NotConnected;
+            cancellationReason = "ANSWER_TIMEOUT";
+            break;
+        }
+
+        const ivrdroid::ExternalCallDecision deadline =
+            policy.CheckDeadline(MonotonicMilliseconds());
+        if (deadline == ivrdroid::ExternalCallDecision::ControlTimeout ||
+            deadline == ivrdroid::ExternalCallDecision::SetupTimeout ||
+            deadline == ivrdroid::ExternalCallDecision::MergeTimeout) {
+            cancellationNeeded = true;
+            terminal = ExternalCallExecutionKind::SystemFailure;
+            if (conferenced) {
+                finalStopReason = "recording_failure";
+                finalPartial = true;
+            }
+            break;
+        }
+        if (deadline == ivrdroid::ExternalCallDecision::AnswerTimeout) {
+            cancellationNeeded = true;
+            terminal = ExternalCallExecutionKind::NotConnected;
+            cancellationReason = "ANSWER_TIMEOUT";
+            break;
+        }
+
+        if (input == nullptr) {
+            usleep(50'000);
+            continue;
+        }
+        const int framesRead = pcm_readi(
+            input,
+            samples.data(),
+            kDtmfFrameCount);
+        if (framesRead != static_cast<int>(kDtmfFrameCount)) {
+            cancellationNeeded = true;
+            terminal = ExternalCallExecutionKind::SystemFailure;
+            if (conferenced) {
+                finalStopReason = "recording_failure";
+                finalPartial = true;
+            }
+            break;
+        }
+        if (!conferenced) {
+            continue;
+        }
+        if (!WriteConversationFrames(
+                &segment,
+                samples.data(),
+                kDtmfFrameCount)) {
+            cancellationNeeded = true;
+            terminal = ExternalCallExecutionKind::SystemFailure;
+            finalStopReason = "recording_failure";
+            finalPartial = true;
+            break;
+        }
+        const ConversationHandoffProgress handoff = PollConversationHandoff(
+            &finalizers,
+            &handoffPolicy,
+            MonotonicMilliseconds());
+        if (handoff == ConversationHandoffProgress::Failed) {
+            cancellationNeeded = true;
+            terminal = ExternalCallExecutionKind::SystemFailure;
+            finalStopReason = conferenced ? "recording_failure" : nullptr;
+            finalPartial = conferenced;
+            handoffFailed = true;
+            break;
+        }
+        if (conferenced &&
+            segment.frames == ivrdroid::kConversationSegmentMaximumFrames) {
+            if (!finalizers.empty() || handoffPolicy.pending() ||
+                segment.index >= ivrdroid::kConversationMaximumSegmentIndex) {
+                cancellationNeeded = true;
+                terminal = ExternalCallExecutionKind::SystemFailure;
+                finalStopReason = "recording_failure";
+                finalPartial = true;
+                break;
+            }
+            ConversationSegment next;
+            if (!OpenConversationSegment(
+                    recordingUuid,
+                    segment.index + 1,
+                    &next)) {
+                cancellationNeeded = true;
+                terminal = ExternalCallExecutionKind::SystemFailure;
+                finalStopReason = "recording_failure";
+                finalPartial = true;
+                break;
+            }
+            const int primeFrames = pcm_readi(
+                input,
+                samples.data(),
+                kDtmfFrameCount);
+            if (primeFrames != static_cast<int>(kDtmfFrameCount) ||
+                !WriteConversationFrames(
+                    &next,
+                    samples.data(),
+                    kDtmfFrameCount) ||
+                ivrdroid::DecideConversationRotation(
+                    segment.frames,
+                    true,
+                    next.frames) !=
+                    ivrdroid::ConversationRotationDecision::FinalizeBoundary) {
+                RemoveConversationSegment(&next);
+                cancellationNeeded = true;
+                terminal = ExternalCallExecutionKind::SystemFailure;
+                finalStopReason = "recording_failure";
+                finalPartial = true;
+                break;
+            }
+            if (!StartConversationFinalizer(
+                    &segment,
+                    recordingUuid,
+                    callUuid,
+                    revisionId,
+                    instruction.blockId,
+                    "segment_boundary",
+                    false,
+                    guardianFd,
+                    next.fd,
+                    &finalizers)) {
+                RemoveConversationSegment(&next);
+                cancellationNeeded = true;
+                terminal = ExternalCallExecutionKind::SystemFailure;
+                finalStopReason = "recording_failure";
+                finalPartial = true;
+                break;
+            }
+            segment = std::move(next);
+        }
+    }
+
+    if (input != nullptr) {
+        pcm_close(input);
+        input = nullptr;
+    }
+    if (conferenceStartedAt > 0) {
+        conferenceMilliseconds = std::max<int64_t>(
+            0,
+            MonotonicMilliseconds() - conferenceStartedAt);
+    }
+    if (cancellationNeeded) {
+        ivrdroid::call_control::Request cancel = request;
+        cancel.kind = ivrdroid::call_control::RequestKind::Cancel;
+        cancel.phoneNumber.clear();
+        cancel.answerTimeoutMilliseconds = 0;
+        cancel.reason = cancellationReason;
+        if (!NotifyGuardian(guardianFd, kGuardianOwnedDialing) ||
+            !stampRequest(&cancel) ||
+            !PublishCallControlRequest(cancel)) {
+            terminal = ExternalCallExecutionKind::Failed;
+        } else {
+            teardownNeeded = true;
+        }
+    }
+    if (teardownNeeded && terminal != ExternalCallExecutionKind::Failed) {
+        ivrdroid::ExternalCallTerminalExpectation expectation;
+        if (terminal == ExternalCallExecutionKind::NotConnected &&
+            std::strcmp(cancellationReason, "ANSWER_TIMEOUT") == 0) {
+            expectation = {
+                ivrdroid::call_control::StatusKind::NotConnected,
+                "ANSWER_TIMEOUT"};
+        } else if (terminal == ExternalCallExecutionKind::SystemFailure) {
+            expectation = {
+                ivrdroid::call_control::StatusKind::SystemFailure,
+                "HELPER_CANCELLED"};
+        } else if (terminal == ExternalCallExecutionKind::CallerHangup) {
+            expectation = {
+                ivrdroid::call_control::StatusKind::Completed,
+                "CALLER_HANGUP"};
+        } else {
+            terminal = ExternalCallExecutionKind::Failed;
+        }
+        if (terminal != ExternalCallExecutionKind::Failed) {
+            const ExternalTeardownResult teardown = AwaitExternalCallTeardown(
+                request,
+                policy.lastSequence(),
+                policy.lastElapsedMilliseconds(),
+                policy.lastKind(),
+                policy.lastReason(),
+                expectation,
+                guardianFd);
+            if (teardown == ExternalTeardownResult::CleanupTimeout) {
+                terminal = ExternalCallExecutionKind::CleanupTimeout;
+            } else if (teardown != ExternalTeardownResult::Safe) {
+                terminal = ExternalCallExecutionKind::Failed;
+            }
+        }
+    }
+
+    if (ivrdroid::RequiresOriginalCallerSafeConfirmation(terminal) &&
+        !ConfirmOriginalCallerSafe(guardianFd)) {
+        terminal = ExternalCallExecutionKind::Failed;
+    }
+
+    if (terminal == ExternalCallExecutionKind::CleanupTimeout ||
+        terminal == ExternalCallExecutionKind::Failed) {
+        RemoveConversationSegment(&segment);
+        RemovePendingConversationPlaintext(recordingUuid, handoffPolicy);
+        AbortConversationFinalizers(&finalizers, recordingUuid);
+        RemoveConversationPlaintext(recordingUuid, segment.index);
+        return {terminal, conferenceMilliseconds};
+    }
+
+    const bool hasDurableAudio = conferenced && segment.frames > 0 &&
+        finalStopReason != nullptr && !handoffFailed;
+    bool finalized = true;
+    if (hasDurableAudio) {
+        finalized = NotifyGuardian(guardianFd, kGuardianRecordingFinalize) &&
+            AwaitConversationHandoff(
+                &finalizers,
+                &handoffPolicy,
+                guardianFd) &&
+            StartConversationFinalizer(
+                &segment,
+                recordingUuid,
+                callUuid,
+                revisionId,
+                instruction.blockId,
+                finalStopReason,
+                finalPartial,
+                guardianFd,
+                -1,
+                &finalizers) &&
+            AwaitConversationHandoff(
+                &finalizers,
+                &handoffPolicy,
+                guardianFd);
+    } else {
+        RemoveConversationSegment(&segment);
+        RemovePendingConversationPlaintext(recordingUuid, handoffPolicy);
+        AbortConversationFinalizers(&finalizers, recordingUuid);
+        RemoveConversationPlaintext(recordingUuid, segment.index);
+        finalized = true;
+    }
+    if (!finalized) {
+        RemovePendingConversationPlaintext(recordingUuid, handoffPolicy);
+        AbortConversationFinalizers(&finalizers, recordingUuid);
+        RemoveConversationSegment(&segment);
+        RemoveConversationPlaintext(recordingUuid, segment.index);
+        return {
+            terminal == ExternalCallExecutionKind::CallerHangup
+                ? ExternalCallExecutionKind::CallerHangup
+                : ExternalCallExecutionKind::SystemFailure,
+            conferenceMilliseconds};
+    }
+    if (terminal == ExternalCallExecutionKind::CallerHangup) {
+        return {terminal, conferenceMilliseconds};
+    }
+    if (!NotifyGuardian(guardianFd, kGuardianIdle)) {
+        return {ExternalCallExecutionKind::Failed, conferenceMilliseconds};
+    }
+    return {terminal, conferenceMilliseconds};
+}
+
+RecordingCaptureResult CaptureRecordingMessage(
+    const std::string& callUuid,
+    uint64_t revisionId,
+    const ivrdroid::RevisionInstruction& instruction,
+    uint32_t sequence,
+    int guardianFd) {
+    if (callUuid.empty() ||
+        !RecordingStorageAvailable(instruction.maximumDurationMilliseconds)) {
+        return {RecordingCaptureKind::Unavailable, nullptr};
+    }
+    const PromptResult beep = ProcessRecordingBeep(guardianFd);
+    if (beep == PromptResult::RemoteHangup) {
+        return {RecordingCaptureKind::HangupFinalized, "caller_hangup"};
+    }
+    if (beep == PromptResult::EmergencyPreempt) {
+        return {RecordingCaptureKind::EmergencyPreempt, nullptr};
+    }
+    if (beep == PromptResult::ExternalPreempt) {
+        return {RecordingCaptureKind::ExternalPreempt, nullptr};
+    }
+    if (beep != PromptResult::Completed || !HasPrivateSessionRoute()) {
+        return {RecordingCaptureKind::Failed, nullptr};
+    }
+
+    std::string recordingUuid;
+    if (!GenerateRecordingUuid(&recordingUuid)) {
+        return {RecordingCaptureKind::Failed, nullptr};
+    }
+    const std::string temporary =
+        std::string(kRecordingInboxDir) + "/." + recordingUuid + ".wav.partial";
+    const std::string final =
+        std::string(kRecordingInboxDir) + "/" + recordingUuid + ".wav";
+    unlink(temporary.c_str());
+    const int fd = open(
+        temporary.c_str(),
+        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    if (fd < 0) {
+        const int failure = errno;
+        unlink(temporary.c_str());
+        return {IsRecordingStorageError(failure)
+            ? RecordingCaptureKind::Unavailable
+            : RecordingCaptureKind::Failed, nullptr};
+    }
+    if (!WriteWaveHeader(fd, 0)) {
+        const int failure = errno;
+        if (fd >= 0) close(fd);
+        unlink(temporary.c_str());
+        return {IsRecordingStorageError(failure)
+            ? RecordingCaptureKind::Unavailable
+            : RecordingCaptureKind::Failed, nullptr};
+    }
+
+    pcm_config config {};
+    config.channels = 2;
+    config.rate = 48'000;
+    config.period_size = kDtmfFrameCount;
+    config.period_count = kDtmfPeriodCount;
+    config.format = PCM_FORMAT_S16_LE;
+    pcm* input = pcm_open(gProfile->card, gProfile->captureDevice, PCM_IN, &config);
+    if (input == nullptr || !pcm_is_ready(input) ||
+        !NotifyGuardian(guardianFd, kGuardianRecording)) {
+        if (input != nullptr) pcm_close(input);
+        close(fd);
+        unlink(temporary.c_str());
+        return {RecordingCaptureKind::Failed, nullptr};
+    }
+
+    char capturedAt[32] = {};
+    if (!CurrentUtcTimestamp(capturedAt, sizeof(capturedAt))) {
+        pcm_close(input);
+        close(fd);
+        unlink(temporary.c_str());
+        return {RecordingCaptureKind::Failed, nullptr};
+    }
+
+    WriteCurrentState(CurrentState::RecordingMessage);
+    const uint64_t maximumFrames =
+        static_cast<uint64_t>(instruction.maximumDurationMilliseconds) * 48ULL;
+    std::vector<int16_t> samples(kDtmfFrameCount * 2);
+    std::deque<std::vector<int16_t>> pending;
+    ivrdroid::StereoDtmfDetector detector(48'000);
+    uint64_t capturedFrames = 0;
+    uint64_t writtenFrames = 0;
+    RecordingCaptureKind result = RecordingCaptureKind::Completed;
+    const char* stopReason = "maximum_duration";
+    bool writeOk = true;
+    bool storageUnavailable = false;
+
+    const auto writeSamples = [&](const std::vector<int16_t>& frame) {
+        if (!WriteAll(fd, frame.data(), frame.size() * sizeof(int16_t))) {
+            storageUnavailable = IsRecordingStorageError(errno);
+            return false;
+        }
+        writtenFrames += frame.size() / 2;
+        return true;
+    };
+    while (capturedFrames < maximumFrames && !gStopRequested) {
+        const int framesRead = pcm_readi(input, samples.data(), kDtmfFrameCount);
+        if (framesRead != static_cast<int>(kDtmfFrameCount)) {
+            writeOk = false;
+            break;
+        }
+        capturedFrames += kDtmfFrameCount;
+        pollfd guardianNotice {guardianFd, POLLIN, 0};
+        if (poll(&guardianNotice, 1, 0) > 0 &&
+            (guardianNotice.revents & POLLIN) != 0) {
+            char message = 0;
+            if (recv(guardianFd, &message, 1, MSG_DONTWAIT) == 1 &&
+                message == kGuardianRecordingHangup) {
+                pending.push_back(samples);
+                result = RecordingCaptureKind::HangupFinalized;
+                stopReason = "caller_hangup";
+                break;
+            }
+        }
+        char digit = 0;
+        if (instruction.finishKey != 0) {
+            digit = detector.ProcessFrame(samples.data(), kDtmfFrameCount);
+            pending.push_back(samples);
+            if (ivrdroid::DecideRecordingStop(
+                    instruction.finishKey,
+                    digit,
+                    capturedFrames,
+                    maximumFrames,
+                    ivrdroid::RecordingCallEvent::Active) ==
+                ivrdroid::RecordingStopDecision::FinishKey) {
+                pending.clear();
+                stopReason = "finish_key";
+                break;
+            }
+            if (pending.size() > kRecordingTrimFrames) {
+                writeOk = writeSamples(pending.front());
+                pending.pop_front();
+            }
+        } else {
+            writeOk = writeSamples(samples);
+        }
+        if (!writeOk) break;
+
+        const uint64_t frameIndex = capturedFrames / kDtmfFrameCount;
+        if (frameIndex % kRecordingHeartbeatFrames == 0 &&
+            (!HasPrivateSessionRoute() ||
+             !NotifyGuardian(guardianFd, kGuardianRecording))) {
+            writeOk = false;
+            break;
+        }
+        if (frameIndex % kRecordingCallCheckFrames == 0 && !IsAudioInCall()) {
+            const ivrdroid::CallDisposition disposition = ReadLiveCallState();
+            if (disposition == ivrdroid::CallDisposition::Idle) {
+                result = RecordingCaptureKind::HangupFinalized;
+                stopReason = "caller_hangup";
+            } else if (disposition == ivrdroid::CallDisposition::Emergency) {
+                result = RecordingCaptureKind::EmergencyPreempt;
+            } else if (disposition == ivrdroid::CallDisposition::Multiple) {
+                result = RecordingCaptureKind::ExternalPreempt;
+            } else {
+                result = RecordingCaptureKind::UnverifiedPreempt;
+            }
+            break;
+        }
+    }
+    pcm_close(input);
+
+    if (result == RecordingCaptureKind::Completed ||
+        result == RecordingCaptureKind::HangupFinalized) {
+        if (!NotifyGuardian(guardianFd, kGuardianRecordingFinalize)) {
+            writeOk = false;
+        }
+        while (writeOk && !pending.empty()) {
+            writeOk = writeSamples(pending.front());
+            pending.pop_front();
+        }
+    }
+    const uint64_t dataBytes = writtenFrames * 4ULL;
+    bool finalized = !gStopRequested && writeOk && dataBytes > 0 &&
+        dataBytes <= UINT32_MAX &&
+        (result == RecordingCaptureKind::Completed ||
+         result == RecordingCaptureKind::HangupFinalized);
+    if (finalized && !WriteWaveHeader(fd, static_cast<uint32_t>(dataBytes))) {
+        storageUnavailable = IsRecordingStorageError(errno);
+        finalized = false;
+    }
+    if (finalized && fsync(fd) != 0) {
+        storageUnavailable = IsRecordingStorageError(errno);
+        finalized = false;
+    }
+    if (finalized && (fchmod(fd, 0600) != 0 || fchown(fd, gAppUid, gAppUid) != 0)) {
+        finalized = false;
+    }
+    if (!finalized) {
+        close(fd);
+        unlink(temporary.c_str());
+        if (result == RecordingCaptureKind::Completed && storageUnavailable) {
+            return {RecordingCaptureKind::Unavailable, nullptr};
+        }
+        return {result == RecordingCaptureKind::Completed
+            ? RecordingCaptureKind::Failed
+            : (result == RecordingCaptureKind::HangupFinalized
+                ? RecordingCaptureKind::Failed
+                : result), nullptr};
+    }
+    close(fd);
+    if (rename(temporary.c_str(), final.c_str()) != 0) {
+        const int failure = errno;
+        unlink(temporary.c_str());
+        unlink(final.c_str());
+        return {result == RecordingCaptureKind::Completed && IsRecordingStorageError(failure)
+            ? RecordingCaptureKind::Unavailable
+            : RecordingCaptureKind::Failed, nullptr};
+    }
+    if (!SyncDirectory(kRecordingInboxDir)) {
+        const int failure = errno;
+        unlink(final.c_str());
+        SyncDirectory(kRecordingInboxDir);
+        return {result == RecordingCaptureKind::Completed && IsRecordingStorageError(failure)
+            ? RecordingCaptureKind::Unavailable
+            : RecordingCaptureKind::Failed, nullptr};
+    }
+
+    std::string sha256;
+    struct stat state {};
+    const uint32_t durationMilliseconds = static_cast<uint32_t>(writtenFrames / 48ULL);
+    errno = 0;
+    if (lstat(final.c_str(), &state) != 0 ||
+        !S_ISREG(state.st_mode) || state.st_uid != gAppUid ||
+        state.st_size <= 44 ||
+        !ivrdroid::Sha256File(final.c_str(), kMaximumRecordingBytes, &sha256) ||
+        !WriteRecordingReceipt(
+            recordingUuid,
+            callUuid,
+            revisionId,
+            instruction.blockId,
+            sequence,
+            capturedAt,
+            durationMilliseconds,
+            stopReason,
+            static_cast<uint64_t>(state.st_size),
+            sha256)) {
+        const int failure = errno;
+        unlink(final.c_str());
+        const std::string receipt =
+            std::string(kRecordingInboxDir) + "/" + recordingUuid + ".json";
+        const std::string receiptTemporary =
+            std::string(kRecordingInboxDir) + "/." + recordingUuid + ".json.tmp";
+        unlink(receipt.c_str());
+        unlink(receiptTemporary.c_str());
+        SyncDirectory(kRecordingInboxDir);
+        return {result == RecordingCaptureKind::Completed && IsRecordingStorageError(failure)
+            ? RecordingCaptureKind::Unavailable
+            : RecordingCaptureKind::Failed, nullptr};
+    }
+    return {result, stopReason};
 }
 
 bool ReadTelecomDump(std::string* dump) {
@@ -1950,6 +4543,14 @@ int GuardianPhaseTimeout(char phase) {
             return kGuardianPromptMs;
         case kGuardianDtmf:
             return kGuardianDtmfMs;
+        case kGuardianRecording:
+            return kGuardianRecordingHeartbeatMs;
+        case kGuardianOwnedDialing:
+        case kGuardianOwnedConference:
+            return static_cast<int>(
+                ivrdroid::call_control::kHeartbeatMaximumAgeMilliseconds);
+        case kGuardianRecordingFinalize:
+            return kGuardianRecordingFinalizeMs;
         case kGuardianEndCall:
             return kGuardianEndCallMs;
         case kGuardianIdle:
@@ -2161,6 +4762,7 @@ void StopCallMonitor(CallMonitor* monitor) {
     LastResult result,
     bool stopWorker) {
     if (stopWorker) kill(workerPid, SIGKILL);
+    CleanupPartialRecordings();
     StopCallMonitor(callMonitor);
     CloseMixerRoute(privacyRoute);
     const bool released = ReleaseSessionForPreemption(result);
@@ -2176,6 +4778,7 @@ void StopCallMonitor(CallMonitor* monitor) {
     LastResult failureResult,
     bool stopWorker) {
     if (stopWorker) kill(workerPid, SIGKILL);
+    CleanupPartialRecordings();
     StopCallMonitor(callMonitor);
     CloseMixerRoute(privacyRoute);
     const bool recovered = RecoverAndEndFailedSession(failureResult);
@@ -2188,13 +4791,16 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
     signal(SIGTERM, SIG_IGN);
     signal(SIGHUP, SIG_IGN);
 
-    const int64_t totalDeadline = MonotonicMilliseconds() + kGuardianTotalMs;
+    ivrdroid::ExternalCallGuardianBudget totalBudget(
+        MonotonicMilliseconds(),
+        kGuardianTotalMs);
     int64_t phaseDeadline =
         MonotonicMilliseconds() + kGuardianWaitForCallMs;
     MixerRoute privacyRoute {};
     bool privacyEnforcementActive = false;
     bool privacyArmedSent = false;
     bool privacyReadySent = false;
+    bool recordingHangupRequested = false;
     unsigned int correctionCount = 0;
     unsigned int consecutiveContendedSamples = 0;
     char currentPhase = 0;
@@ -2295,7 +4901,19 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
 
     while (true) {
         const int64_t now = MonotonicMilliseconds();
-        const int64_t nextDeadline = std::min(totalDeadline, phaseDeadline);
+        const int64_t nextDeadline = std::min(
+            totalBudget.deadlineMilliseconds(),
+            phaseDeadline);
+        if (now >= nextDeadline) {
+            Log(ANDROID_LOG_ERROR, "Session guardian deadline expired.");
+            RecoverAndExitGuardian(
+                controlFd,
+                workerPid,
+                &privacyRoute,
+                &callMonitor,
+                LastResult::RecoveredAndEnded,
+                true);
+        }
         const int64_t nextWake = privacyEnforcementActive
             ? std::min(
                 nextDeadline,
@@ -2355,7 +4973,17 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
         if ((descriptors[0].revents & POLLIN) != 0) {
             const ssize_t count = recv(controlFd, &phase, 1, 0);
             if (count == 1) {
+                const char previousPhase = currentPhase;
                 currentPhase = phase;
+                const int64_t phaseNow = MonotonicMilliseconds();
+                phaseDeadline = phaseNow + GuardianPhaseTimeout(phase);
+                if (phase == kGuardianOwnedConference &&
+                    previousPhase != kGuardianOwnedConference) {
+                    totalBudget.EnterConference(phaseNow);
+                } else if (previousPhase == kGuardianOwnedConference &&
+                           phase != kGuardianOwnedConference) {
+                    totalBudget.LeaveConference(phaseNow);
+                }
             } else if (count == 0) {
                 controlClosed = true;
             } else if (errno != EINTR) {
@@ -2397,7 +5025,10 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
             const auto disposition =
                 static_cast<ivrdroid::CallDisposition>(
                     event.disposition);
-            if (disposition ==
+            const bool ownedCallControl =
+                currentPhase == kGuardianOwnedDialing ||
+                currentPhase == kGuardianOwnedConference;
+            if (!ownedCallControl && disposition ==
                     ivrdroid::CallDisposition::SingleSafe &&
                 (event.identityHash == 0 ||
                  event.identityHash != expectedCallIdentityHash)) {
@@ -2415,11 +5046,18 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
             const bool endingCall =
                 currentPhase == kGuardianEndCall ||
                 currentPhase == kGuardianDone;
-            const ivrdroid::SessionCallDecision callDecision =
-                callPolicy.Observe(
+            ivrdroid::SessionCallDecision callDecision =
+                ivrdroid::SessionCallDecision::Continue;
+            if (ownedCallControl &&
+                (disposition == ivrdroid::CallDisposition::Multiple ||
+                 disposition == ivrdroid::CallDisposition::SingleSafe)) {
+                callPolicy.Start(MonotonicMilliseconds());
+            } else {
+                callDecision = callPolicy.Observe(
                     disposition,
                     endingCall,
                     MonotonicMilliseconds());
+            }
             if (callDecision ==
                 ivrdroid::SessionCallDecision::EmergencyPreempt) {
                 Log(
@@ -2451,13 +5089,36 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                 Log(
                     ANDROID_LOG_INFO,
                     "Call monitor confirmed that the remote call ended.");
-                RecoverAndExitGuardian(
-                    controlFd,
-                    workerPid,
-                    &privacyRoute,
-                    &callMonitor,
-                    LastResult::RemoteHangup,
-                    true);
+                if (phase == kGuardianRemoteHangup) {
+                    // The worker finalized the recording and its terminal message wins.
+                } else if (currentPhase == kGuardianRecording ||
+                           currentPhase == kGuardianOwnedDialing ||
+                           currentPhase == kGuardianOwnedConference) {
+                    if (!recordingHangupRequested) {
+                        if (!NotifyGuardian(controlFd, kGuardianRecordingHangup)) {
+                            RecoverAndExitGuardian(
+                                controlFd,
+                                workerPid,
+                                &privacyRoute,
+                                &callMonitor,
+                                LastResult::RemoteHangup,
+                                true);
+                        }
+                        recordingHangupRequested = true;
+                        phaseDeadline = MonotonicMilliseconds() + 5'000;
+                    }
+                } else if (currentPhase == kGuardianRecordingFinalize) {
+                    // Finalization has its own fixed deadline. Keep enforcing
+                    // privacy while the worker makes the receipt durable.
+                } else {
+                    RecoverAndExitGuardian(
+                        controlFd,
+                        workerPid,
+                        &privacyRoute,
+                        &callMonitor,
+                        LastResult::RemoteHangup,
+                        true);
+                }
             }
             if (callDecision ==
                 ivrdroid::SessionCallDecision::UnverifiedPreempt) {
@@ -2645,8 +5306,6 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                 LastResult::FailedAudio,
                 true);
         }
-        phaseDeadline =
-            MonotonicMilliseconds() + GuardianPhaseTimeout(phase);
         if (privacyEnforcementActive && !enforcePrivacy()) {
             Log(
                 ANDROID_LOG_ERROR,
@@ -2861,6 +5520,475 @@ SessionOutcome RunFixedMenu(int guardianFd) {
     return RunFixedMenuBody(guardianFd);
 }
 
+SessionOutcome PromptOutcome(PromptResult result) {
+    if (result == PromptResult::RemoteHangup) return SessionOutcome::RemoteHangup;
+    if (result == PromptResult::EmergencyPreempt) return SessionOutcome::EmergencyPreempt;
+    if (result == PromptResult::ExternalPreempt) return SessionOutcome::ExternalPreempt;
+    return SessionOutcome::AudioFailure;
+}
+
+bool ResolveConfiguredPromptPath(
+    const ivrdroid::RevisionConfig& config,
+    uint64_t revisionId,
+    const std::string& promptId,
+    std::string* path) {
+    if (path == nullptr) return false;
+    const ivrdroid::PromptAsset* prompt = config.FindPrompt(promptId);
+    if (prompt == nullptr) return false;
+    char value[640] = {};
+    const int length = std::snprintf(
+        value,
+        sizeof(value),
+        "%s/%llu/prompts/%s.wav",
+        kRevisionDir,
+        static_cast<unsigned long long>(revisionId),
+        prompt->sha256.c_str());
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(value)) return false;
+    *path = value;
+    return true;
+}
+
+PromptResult ProcessConfiguredPrompt(
+    const ivrdroid::RevisionConfig& config,
+    uint64_t revisionId,
+    const std::string& promptId,
+    int guardianFd) {
+    std::string path;
+    if (!ResolveConfiguredPromptPath(config, revisionId, promptId, &path)) {
+        return PromptResult::Failed;
+    }
+    return ProcessPrompt(path.c_str(), CurrentState::PlayingMain, guardianFd);
+}
+
+DtmfResult CaptureConfiguredDtmfWithPrompt(
+    const ivrdroid::RevisionConfig& config,
+    uint64_t revisionId,
+    const ivrdroid::RevisionInstruction& instruction,
+    int guardianFd) {
+    std::string path;
+    if (!ResolveConfiguredPromptPath(
+            config,
+            revisionId,
+            instruction.promptId,
+            &path)) {
+        return {DtmfResultKind::CaptureError, 0};
+    }
+    return CaptureDtmfDigitWithPrompt(
+        path.c_str(),
+        instruction.digitBranches,
+        guardianFd,
+        instruction.timeoutMilliseconds);
+}
+
+const char* RuntimeInstructionLabel(ivrdroid::RevisionInstructionType type) {
+    switch (type) {
+        case ivrdroid::RevisionInstructionType::PlayPrompt:
+            return "Play prompt";
+        case ivrdroid::RevisionInstructionType::CollectDigit:
+            return "Collect one digit";
+        case ivrdroid::RevisionInstructionType::ScheduleBranch:
+            return "Check schedule";
+        case ivrdroid::RevisionInstructionType::ReturnToMenu:
+            return "Return to menu";
+        case ivrdroid::RevisionInstructionType::RecordMessage:
+            return "Record message";
+        case ivrdroid::RevisionInstructionType::ExternalCall:
+            return "External call";
+        case ivrdroid::RevisionInstructionType::EndCall:
+            return "End call";
+    }
+    return "Unknown";
+}
+
+void AppendRuntimeTrace(
+    std::string* sessionPath,
+    unsigned int* traceCount,
+    const ivrdroid::RevisionInstruction& instruction,
+    const std::string& event = "") {
+    constexpr unsigned int kMaximumTraceSteps = 64;
+    if (*traceCount >= kMaximumTraceSteps) return;
+    std::string token = instruction.blockId;
+    token.push_back('|');
+    token.append(RuntimeInstructionLabel(instruction.type));
+    if (!event.empty()) {
+        token.push_back('|');
+        token.append(event);
+    }
+    const size_t separator = sessionPath->empty() ? 0 : 1;
+    if (sessionPath->size() + separator + token.size() + 1 >
+        static_cast<size_t>(kMaximumSessionPathBytes)) {
+        return;
+    }
+    if (!sessionPath->empty()) sessionPath->push_back('>');
+    sessionPath->append(token);
+    ++*traceCount;
+    WriteSessionPath(*sessionPath);
+}
+
+SessionOutcome RunConfiguredProgramV2(
+    const ivrdroid::RevisionConfig& config,
+    uint64_t revisionId,
+    const std::string& callUuid,
+    int guardianFd) {
+    uint32_t current = config.entryPc;
+    std::string sessionPath;
+    unsigned int traceCount = 0;
+    std::unordered_map<uint32_t, uint32_t> menuReturns;
+    uint32_t recordingSequence = 0;
+    const int64_t automatedStartedAt = MonotonicMilliseconds();
+    int64_t excludedConferenceMilliseconds = 0;
+    const auto automatedSessionExpired = [&]() {
+        if (config.schemaVersion < 3 ||
+            config.maximumSessionMilliseconds == 0) {
+            return false;
+        }
+        const int64_t now = MonotonicMilliseconds();
+        const int64_t elapsed = std::max<int64_t>(
+            0,
+            now - automatedStartedAt - excludedConferenceMilliseconds);
+        return elapsed >= config.maximumSessionMilliseconds;
+    };
+    constexpr unsigned int kMaximumTransitions = 512;
+    for (unsigned int transition = 0;
+         transition < kMaximumTransitions && !gStopRequested;
+         ++transition) {
+        if (automatedSessionExpired()) return SessionOutcome::AudioFailure;
+        const ivrdroid::RevisionInstruction* instruction =
+            config.FindInstruction(current);
+        if (instruction == nullptr) return SessionOutcome::AudioFailure;
+
+        switch (instruction->type) {
+            case ivrdroid::RevisionInstructionType::PlayPrompt: {
+                AppendRuntimeTrace(&sessionPath, &traceCount, *instruction);
+                const PromptResult result = ProcessConfiguredPrompt(
+                    config, revisionId, instruction->promptId, guardianFd);
+                if (result != PromptResult::Completed) return PromptOutcome(result);
+                current = instruction->nextPc;
+                break;
+            }
+            case ivrdroid::RevisionInstructionType::CollectDigit: {
+                bool routed = false;
+                for (uint32_t attempt = 0;
+                     attempt < instruction->maximumAttempts && !gStopRequested;
+                     ++attempt) {
+                    if (!instruction->promptId.empty() &&
+                        !instruction->allowPromptBargeIn) {
+                        const PromptResult prompt = ProcessConfiguredPrompt(
+                            config, revisionId, instruction->promptId, guardianFd);
+                        if (prompt != PromptResult::Completed) return PromptOutcome(prompt);
+                    }
+                    const DtmfResult input = instruction->allowPromptBargeIn
+                        ? CaptureConfiguredDtmfWithPrompt(
+                            config,
+                            revisionId,
+                            *instruction,
+                            guardianFd)
+                        : CaptureDtmfDigit(
+                            guardianFd,
+                            instruction->timeoutMilliseconds);
+                    if (input.kind == DtmfResultKind::CallEnded) return SessionOutcome::RemoteHangup;
+                    if (input.kind == DtmfResultKind::EmergencyPreempt) return SessionOutcome::EmergencyPreempt;
+                    if (input.kind == DtmfResultKind::ExternalPreempt) return SessionOutcome::ExternalPreempt;
+                    if (input.kind == DtmfResultKind::CaptureError ||
+                        input.kind == DtmfResultKind::Stopped) {
+                        return SessionOutcome::CaptureFailure;
+                    }
+                    if (input.kind == DtmfResultKind::Digit) {
+                        const auto branch = instruction->digitBranches.find(input.digit);
+                        if (branch != instruction->digitBranches.end()) {
+                            AppendRuntimeTrace(
+                                &sessionPath,
+                                &traceCount,
+                                *instruction,
+                                std::string("digit:") + input.digit);
+                            current = branch->second;
+                            routed = true;
+                            break;
+                        }
+                        AppendRuntimeTrace(&sessionPath, &traceCount, *instruction, "invalid");
+                        if (attempt + 1 == instruction->maximumAttempts) {
+                            current = instruction->onInvalidPc;
+                            routed = true;
+                        }
+                    } else {
+                        AppendRuntimeTrace(&sessionPath, &traceCount, *instruction, "timeout");
+                        if (attempt + 1 == instruction->maximumAttempts) {
+                            current = instruction->onTimeoutPc;
+                            routed = true;
+                        }
+                    }
+                    if (!routed) WriteCurrentState(CurrentState::RetryingMenu);
+                }
+                if (!routed) return SessionOutcome::CaptureFailure;
+                break;
+            }
+            case ivrdroid::RevisionInstructionType::ScheduleBranch: {
+                bool holiday = false;
+                const time_t now = time(nullptr);
+                const bool open = now > 0 && config.IsScheduleOpen(
+                    instruction->scheduleId,
+                    static_cast<int64_t>(now),
+                    &holiday);
+                AppendRuntimeTrace(
+                    &sessionPath,
+                    &traceCount,
+                    *instruction,
+                    holiday ? "holiday" : (open ? "open" : "closed"));
+                current = holiday
+                    ? instruction->onHolidayPc
+                    : (open ? instruction->onOpenPc : instruction->onClosedPc);
+                break;
+            }
+            case ivrdroid::RevisionInstructionType::ReturnToMenu: {
+                const ivrdroid::RevisionInstruction* menu =
+                    config.FindInstruction(instruction->menuPc);
+                if (menu == nullptr ||
+                    menu->type != ivrdroid::RevisionInstructionType::CollectDigit) {
+                    return SessionOutcome::AudioFailure;
+                }
+                uint32_t& count = menuReturns[instruction->menuPc];
+                if (count < menu->maximumMenuReturns) {
+                    ++count;
+                    AppendRuntimeTrace(
+                        &sessionPath,
+                        &traceCount,
+                        *instruction,
+                        "return:" + std::to_string(count) + "/" +
+                            std::to_string(menu->maximumMenuReturns));
+                    current = instruction->menuPc;
+                } else {
+                    AppendRuntimeTrace(
+                        &sessionPath,
+                        &traceCount,
+                        *instruction,
+                        "return-limit");
+                    current = menu->onReturnLimitPc;
+                }
+                break;
+            }
+            case ivrdroid::RevisionInstructionType::RecordMessage: {
+                const RecordingCaptureResult recording = CaptureRecordingMessage(
+                    callUuid,
+                    revisionId,
+                    *instruction,
+                    recordingSequence++,
+                    guardianFd);
+                if (recording.kind == RecordingCaptureKind::Unavailable) {
+                    AppendRuntimeTrace(
+                        &sessionPath, &traceCount, *instruction, "unavailable");
+                    if (!NotifyGuardian(guardianFd, kGuardianIdle)) {
+                        return SessionOutcome::CaptureFailure;
+                    }
+                    current = instruction->onUnavailablePc;
+                    break;
+                }
+                if (recording.kind == RecordingCaptureKind::Completed) {
+                    const std::string event =
+                        std::strcmp(recording.stopReason, "finish_key") == 0
+                        ? "finish-key"
+                        : "maximum";
+                    AppendRuntimeTrace(&sessionPath, &traceCount, *instruction, event);
+                    if (!NotifyGuardian(guardianFd, kGuardianIdle)) {
+                        return SessionOutcome::CaptureFailure;
+                    }
+                    current = instruction->nextPc;
+                    break;
+                }
+                if (recording.kind == RecordingCaptureKind::HangupFinalized) {
+                    AppendRuntimeTrace(&sessionPath, &traceCount, *instruction, "hangup");
+                    return SessionOutcome::RemoteHangup;
+                }
+                if (recording.kind == RecordingCaptureKind::EmergencyPreempt) {
+                    return SessionOutcome::EmergencyPreempt;
+                }
+                if (recording.kind == RecordingCaptureKind::ExternalPreempt) {
+                    return SessionOutcome::ExternalPreempt;
+                }
+                if (recording.kind == RecordingCaptureKind::UnverifiedPreempt) {
+                    return SessionOutcome::UnverifiedPreempt;
+                }
+                return SessionOutcome::CaptureFailure;
+            }
+            case ivrdroid::RevisionInstructionType::ExternalCall: {
+                const ExternalCallExecutionResult external = ExecuteExternalCall(
+                    callUuid,
+                    revisionId,
+                    *instruction,
+                    guardianFd);
+                if (external.conferenceMilliseconds > 0) {
+                    excludedConferenceMilliseconds = std::min<int64_t>(
+                        std::numeric_limits<int64_t>::max(),
+                        excludedConferenceMilliseconds >
+                                std::numeric_limits<int64_t>::max() -
+                                    external.conferenceMilliseconds
+                            ? std::numeric_limits<int64_t>::max()
+                            : excludedConferenceMilliseconds +
+                                external.conferenceMilliseconds);
+                }
+                if (automatedSessionExpired()) {
+                    return SessionOutcome::AudioFailure;
+                }
+                const ivrdroid::ExternalCallRuntimeRoute route =
+                    ivrdroid::RouteExternalCallResult(
+                        external.kind,
+                        instruction->onCompletedPc,
+                        instruction->onNotConnectedPc,
+                        instruction->onSystemFailurePc);
+                if (route.action ==
+                    ivrdroid::ExternalCallRuntimeAction::Branch) {
+                    const char* event =
+                        external.kind == ExternalCallExecutionKind::Completed
+                        ? "operator-hangup"
+                        : external.kind == ExternalCallExecutionKind::NotConnected
+                            ? "not-connected"
+                            : "system-failure";
+                    AppendRuntimeTrace(
+                        &sessionPath,
+                        &traceCount,
+                        *instruction,
+                        event);
+                    current = route.programCounter;
+                    break;
+                }
+                if (route.action ==
+                    ivrdroid::ExternalCallRuntimeAction::CallerHangup) {
+                    AppendRuntimeTrace(
+                        &sessionPath,
+                        &traceCount,
+                        *instruction,
+                        "caller-hangup");
+                    return SessionOutcome::RemoteHangup;
+                }
+                return SessionOutcome::CaptureFailure;
+            }
+            case ivrdroid::RevisionInstructionType::EndCall:
+                AppendRuntimeTrace(&sessionPath, &traceCount, *instruction);
+                return FinishSuccessfulMenu(guardianFd);
+        }
+    }
+    return SessionOutcome::AudioFailure;
+}
+
+SessionOutcome RunConfiguredMenuBody(
+    const ivrdroid::RevisionConfig& config,
+    uint64_t revisionId,
+    int guardianFd) {
+    std::string current = config.rootNode;
+    std::string sessionPath;
+    std::unordered_map<std::string, uint32_t> repeats;
+    constexpr unsigned int maximumTransitions = 512;
+    for (unsigned int transition = 0;
+         transition < maximumTransitions && !gStopRequested;
+         ++transition) {
+        const ivrdroid::RevisionNode* node = config.FindNode(current);
+        if (node == nullptr) return SessionOutcome::AudioFailure;
+        if (!sessionPath.empty()) sessionPath.push_back('>');
+        if (sessionPath.size() + node->id.size() >
+            static_cast<size_t>(kMaximumSessionPathBytes - 2)) {
+            return SessionOutcome::AudioFailure;
+        }
+        sessionPath.append(node->id);
+        WriteSessionPath(sessionPath);
+
+        switch (node->type) {
+            case ivrdroid::RevisionNodeType::PlayPrompt: {
+                const PromptResult result = ProcessConfiguredPrompt(
+                    config, revisionId, node->promptId, guardianFd);
+                if (result != PromptResult::Completed) return PromptOutcome(result);
+                current = node->next;
+                break;
+            }
+            case ivrdroid::RevisionNodeType::CollectDigit: {
+                bool routed = false;
+                for (uint32_t attempt = 0;
+                     attempt < node->maximumAttempts && !gStopRequested;
+                     ++attempt) {
+                    if (!node->promptId.empty()) {
+                        const PromptResult prompt = ProcessConfiguredPrompt(
+                            config, revisionId, node->promptId, guardianFd);
+                        if (prompt != PromptResult::Completed) return PromptOutcome(prompt);
+                    }
+                    const DtmfResult input = CaptureDtmfDigit(
+                        guardianFd,
+                        node->timeoutMilliseconds);
+                    if (input.kind == DtmfResultKind::CallEnded) return SessionOutcome::RemoteHangup;
+                    if (input.kind == DtmfResultKind::EmergencyPreempt) return SessionOutcome::EmergencyPreempt;
+                    if (input.kind == DtmfResultKind::ExternalPreempt) return SessionOutcome::ExternalPreempt;
+                    if (input.kind == DtmfResultKind::CaptureError ||
+                        input.kind == DtmfResultKind::Stopped) {
+                        return SessionOutcome::CaptureFailure;
+                    }
+                    if (input.kind == DtmfResultKind::Digit) {
+                        const auto branch = node->digitBranches.find(input.digit);
+                        if (branch != node->digitBranches.end()) {
+                            current = branch->second;
+                            routed = true;
+                            break;
+                        }
+                        if (attempt + 1 == node->maximumAttempts) {
+                            current = node->onInvalid;
+                            routed = true;
+                        }
+                    } else if (attempt + 1 == node->maximumAttempts) {
+                        current = node->onTimeout;
+                        routed = true;
+                    }
+                    if (!routed) WriteCurrentState(CurrentState::RetryingMenu);
+                }
+                if (!routed) return SessionOutcome::CaptureFailure;
+                break;
+            }
+            case ivrdroid::RevisionNodeType::ScheduleBranch: {
+                bool holiday = false;
+                const time_t now = time(nullptr);
+                const bool open = now > 0 && config.IsScheduleOpen(
+                    node->scheduleId,
+                    static_cast<int64_t>(now),
+                    &holiday);
+                current = holiday
+                    ? node->onHoliday
+                    : (open ? node->onOpen : node->onClosed);
+                break;
+            }
+            case ivrdroid::RevisionNodeType::RepeatMenu: {
+                uint32_t& count = repeats[node->id];
+                if (count < node->maximumRepeats) {
+                    ++count;
+                    current = node->repeatTarget;
+                } else {
+                    current = node->onExhausted;
+                }
+                break;
+            }
+            case ivrdroid::RevisionNodeType::EndCall:
+                return FinishSuccessfulMenu(guardianFd);
+        }
+    }
+    return SessionOutcome::AudioFailure;
+}
+
+SessionOutcome RunSelectedMenu(int guardianFd, const std::string& callUuid) {
+    ivrdroid::RevisionConfig config;
+    uint64_t revisionId = 0;
+    const bool configured = LoadRuntimeRevision(&config, &revisionId);
+    if (!configured) {
+        WriteSessionPath("builtin");
+        return RunFixedMenu(guardianFd);
+    }
+    Log(
+        ANDROID_LOG_INFO,
+        "Starting immutable revision %llu.",
+        static_cast<unsigned long long>(revisionId));
+    const PrivacyStartResult privacy = BeginPrivateSession(guardianFd);
+    if (privacy == PrivacyStartResult::RemoteHangup) return SessionOutcome::RemoteHangup;
+    if (privacy == PrivacyStartResult::EmergencyPreempt) return SessionOutcome::EmergencyPreempt;
+    if (privacy == PrivacyStartResult::ExternalPreempt) return SessionOutcome::ExternalPreempt;
+    if (privacy != PrivacyStartResult::Started) return SessionOutcome::AudioFailure;
+    return config.schemaVersion >= 2
+        ? RunConfiguredProgramV2(config, revisionId, callUuid, guardianFd)
+        : RunConfiguredMenuBody(config, revisionId, guardianFd);
+}
+
 bool IsSafeCommandFile(const struct stat& state) {
     return S_ISREG(state.st_mode) &&
         state.st_uid == gAppUid &&
@@ -2902,7 +6030,7 @@ bool ConsumeCommand(std::string* body) {
 void DiscardRequestQueuedWhileBusy() {
     unlink(kCommandTempPath);
     if (unlink(kCommandPath) == 0) {
-        Log(ANDROID_LOG_WARN, "Discarded a START_MENU request queued while busy.");
+        Log(ANDROID_LOG_WARN, "Discarded an app request queued while busy.");
         WriteLastResult(LastResult::RejectedBusy);
     }
 }
@@ -2910,10 +6038,36 @@ void DiscardRequestQueuedWhileBusy() {
 bool ProcessOneCommand() {
     std::string body;
     if (!ConsumeCommand(&body)) return false;
-    if (ivrdroid::protocol::ParseCommand(body) !=
-        ivrdroid::protocol::Command::StartMenu) {
+    const ivrdroid::protocol::CommandRequest request =
+        ivrdroid::protocol::ParseCommandRequest(body);
+    if (request.command == ivrdroid::protocol::Command::Invalid) {
         Log(ANDROID_LOG_WARN, "Rejected malformed or unknown app request.");
         WriteLastResult(LastResult::RejectedRequest);
+        return true;
+    }
+
+    if (request.command == ivrdroid::protocol::Command::StageRevision ||
+        request.command == ivrdroid::protocol::Command::ActivateStaged) {
+        if (ReadLiveCallState() != ivrdroid::CallDisposition::Idle ||
+            ReadAudioModeState() != AudioModeState::Normal) {
+            Log(ANDROID_LOG_WARN, "Rejected revision operation while call or audio state was busy.");
+            WriteLastResult(LastResult::RejectedBusy);
+            return true;
+        }
+        const bool completed =
+            request.command == ivrdroid::protocol::Command::StageRevision
+            ? StageRevision(request.revisionId, request.manifestSha256)
+            : ActivateStagedRevision(request.revisionId);
+        WriteLastResult(
+            completed
+            ? (request.command == ivrdroid::protocol::Command::StageRevision
+                ? LastResult::RevisionStaged
+                : LastResult::RevisionActivated)
+            : LastResult::RevisionRejected);
+        if (!completed) {
+            Log(ANDROID_LOG_ERROR, "Revision operation %llu was rejected.",
+                static_cast<unsigned long long>(request.revisionId));
+        }
         return true;
     }
 
@@ -2951,7 +6105,7 @@ bool ProcessOneCommand() {
         return true;
     }
 
-    const SessionOutcome outcome = RunFixedMenu(guardian.controlFd);
+    const SessionOutcome outcome = RunSelectedMenu(guardian.controlFd, request.callUuid);
     char guardianResult = kGuardianAudioFailure;
     switch (outcome) {
         case SessionOutcome::Complete:
@@ -3159,7 +6313,16 @@ int Serve() {
         Log(ANDROID_LOG_ERROR, "App bridge is unavailable.");
         return 12;
     }
+    if (!WriteBridgeValue(
+            kCapabilitiesBridgePath,
+            kCapabilitiesBridgeTempPath,
+            ivrdroid::protocol::kCapabilities)) {
+        Log(ANDROID_LOG_ERROR, "Could not publish helper capabilities.");
+        return 12;
+    }
+    CleanupPartialRecordings();
     if (!ValidateAllPromptFiles()) return 13;
+    if (!InitializeRevisionState()) return 13;
 
     const int lockFd = open(kLockPath, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB) != 0) {

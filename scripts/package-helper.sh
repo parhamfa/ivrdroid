@@ -40,4 +40,6 @@ python3 "$REPO_DIR/scripts/package-helper.py" \
     "$STRIPPED_BINARY" \
     "$PACKAGE"
 unzip -t "$PACKAGE" >/dev/null
+sh -n "$REPO_DIR/helper/magisk/customize.sh"
+unzip -p "$PACKAGE" customize.sh | cmp - "$REPO_DIR/helper/magisk/customize.sh"
 shasum -a 256 "$STRIPPED_BINARY" "$PACKAGE"

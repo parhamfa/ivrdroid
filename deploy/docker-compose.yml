@@ -1,0 +1,137 @@
+name: ivrdroid
+
+x-logging: &rotated-logs
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:16.14-bookworm@sha256:714b08dd70c05160db032e4321033ac4e5b6328935b2d03ed419c3a898aa8219
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ivrdroid
+      POSTGRES_USER: ivrdroid
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ivrdroid -d ivrdroid"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    shm_size: 128m
+    mem_limit: 512m
+    mem_reservation: 128m
+    memswap_limit: 512m
+    pids_limit: 128
+    logging: *rotated-logs
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - database
+
+  api:
+    image: ivrdroid-api:0.8.5
+    platform: linux/amd64
+    build:
+      context: ../server
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      IVRDROID_ENVIRONMENT: production
+      IVRDROID_DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      IVRDROID_MEDIA_ROOT: /data/prompts
+      IVRDROID_RECORDING_ROOT: /data/recordings
+      IVRDROID_PUBLIC_BASE_URL: https://ivrdroid.rx1.ai
+      IVRDROID_AUTO_CREATE_SCHEMA: "false"
+      IVRDROID_CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:?CF_ACCESS_TEAM_DOMAIN is required}
+      IVRDROID_CF_ACCESS_AUDIENCE: ${CF_ACCESS_AUDIENCE:?CF_ACCESS_AUDIENCE is required}
+      IVRDROID_CF_DEVICE_SERVICE_CLIENT_ID: ${CF_DEVICE_SERVICE_CLIENT_ID:?CF_DEVICE_SERVICE_CLIENT_ID is required}
+      IVRDROID_CONFIG_SIGNING_PRIVATE_KEY_B64_FILE: /run/secrets/config_signing_private
+      IVRDROID_DATA_ENCRYPTION_KEY_B64_FILE: /run/secrets/data_encryption_key
+      IVRDROID_PAIRING_HMAC_KEY_B64_FILE: /run/secrets/pairing_hmac_key
+      IVRDROID_RECORDING_ENCRYPTION_KEY_B64_FILE: /run/secrets/recording_encryption_key
+      IVRDROID_CF_DEVICE_SERVICE_CLIENT_SECRET_FILE: /run/secrets/cf_device_service_client_secret
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 20s
+    mem_limit: 768m
+    mem_reservation: 192m
+    memswap_limit: 768m
+    pids_limit: 192
+    init: true
+    logging: *rotated-logs
+    secrets:
+      - config_signing_private
+      - data_encryption_key
+      - pairing_hmac_key
+      - recording_encryption_key
+      - cf_device_service_client_secret
+      - postgres_password
+    volumes:
+      - prompt_media:/data/prompts
+      - recording_media:/data/recordings
+    networks:
+      - database
+      - application
+
+  web:
+    image: ivrdroid-web:0.8.5
+    platform: linux/amd64
+    build:
+      context: ../dashboard
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3200:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
+    mem_limit: 128m
+    mem_reservation: 32m
+    memswap_limit: 128m
+    pids_limit: 64
+    logging: *rotated-logs
+    networks:
+      - application
+
+networks:
+  database:
+    internal: true
+  application:
+
+volumes:
+  postgres_data:
+    name: ivrdroid_postgres_data
+  prompt_media:
+    name: ivrdroid_prompt_media
+  recording_media:
+    name: ivrdroid_recording_media
+
+secrets:
+  config_signing_private:
+    file: ./secrets/config-signing-private.b64
+  data_encryption_key:
+    file: ./secrets/data-encryption-key.b64
+  pairing_hmac_key:
+    file: ./secrets/pairing-hmac-key.b64
+  recording_encryption_key:
+    file: ./secrets/recording-encryption-key.b64
+  cf_device_service_client_secret:
+    file: ./secrets/cf-device-service-client-secret
+  postgres_password:
+    file: ./secrets/postgres-password

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <privapp-permissions package="ai.rx1.ivrdroid">
+        <permission name="android.permission.CONNECTIVITY_USE_RESTRICTED_NETWORKS" />
+        <permission name="android.permission.CONTROL_INCALL_EXPERIENCE" />
+    </privapp-permissions>
+</permissions>

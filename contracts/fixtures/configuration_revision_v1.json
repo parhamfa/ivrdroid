@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "revision_id": 42,
+  "published_at": "2026-08-05T12:00:00+00:00",
+  "caller_policy": {
+    "mode": "ALLOWLIST_ONLY",
+    "route_unknown_callers": false,
+    "allowlist": [
+      { "label": "Test caller", "e164": "+989121234567" }
+    ],
+    "blocklist": []
+  },
+  "schedules": [
+    {
+      "id": "business_hours",
+      "name": "Business hours",
+      "timezone": "Asia/Tehran",
+      "weekly": [
+        { "weekday": 0, "start": "09:00", "end": "17:00" }
+      ],
+      "exceptions": [
+        { "date": "2026-08-10", "state": "holiday" }
+      ]
+    }
+  ],
+  "flow": {
+    "root_node": "schedule_gate",
+    "nodes": [
+      {
+        "id": "schedule_gate",
+        "type": "schedule_branch",
+        "schedule_id": "business_hours",
+        "on_open": "welcome",
+        "on_closed": "end",
+        "on_holiday": "end"
+      },
+      {
+        "id": "welcome",
+        "type": "play_prompt",
+        "prompt_id": "11111111-1111-1111-1111-111111111111",
+        "next": "menu"
+      },
+      {
+        "id": "menu",
+        "type": "collect_digit",
+        "prompt_id": "11111111-1111-1111-1111-111111111111",
+        "timeout_ms": 5000,
+        "maximum_attempts": 2,
+        "branches": { "1": "end", "2": "repeat" },
+        "on_timeout": "repeat",
+        "on_invalid": "repeat"
+      },
+      {
+        "id": "repeat",
+        "type": "repeat_menu",
+        "target": "menu",
+        "maximum_repeats": 2,
+        "on_exhausted": "end"
+      },
+      { "id": "end", "type": "end_call" }
+    ]
+  },
+  "prompts": [
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "name": "Main menu",
+      "version": 1,
+      "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size_bytes": 4096,
+      "duration_ms": 1000,
+      "format": "audio/wav;codec=pcm_s16le;rate=48000;channels=2"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 id=ivrdroid_helper
 name=IVRdroid Privileged Audio Helper
-version=0.4.7-dev
-versionCode=18
+version=0.8.3-dev
+versionCode=25
 author=IVRdroid contributors
-description=Device-pinned transactional TinyALSA menu, prompt, and DTMF runtime for IVRdroid.
+description=Device-pinned transactional TinyALSA IVR with voicemail and external-call conversation recording.

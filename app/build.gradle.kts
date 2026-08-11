@@ -1,20 +1,6 @@
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-}
-
-val localProperties = Properties()
-val localPropertiesFile = rootProject.file("local.properties")
-if (localPropertiesFile.isFile) {
-    localPropertiesFile.inputStream().use(localProperties::load)
-}
-val testCallerE164 =
-    providers.gradleProperty("ivrdroid.testCallerE164").orNull
-        ?: localProperties.getProperty("ivrdroid.testCallerE164", "")
-require(testCallerE164.isEmpty() || testCallerE164.matches(Regex("""\+[0-9]{8,15}"""))) {
-    "ivrdroid.testCallerE164 must be empty or an E.164 number such as +15551234567."
 }
 
 android {
@@ -25,10 +11,11 @@ android {
         applicationId = "ai.rx1.ivrdroid"
         minSdk = 29
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.3.1-dev"
+        versionCode = 17
+        versionName = "0.8.6-dev"
 
-        buildConfigField("String", "TEST_CALLER_E164", "\"$testCallerE164\"")
+        buildConfigField("String", "CONTROL_PLANE_URL", "\"https://ivrdroid.rx1.ai\"")
+        buildConfigField("String", "CONFIG_SIGNING_PUBLIC_KEY_B64", "\"fz+JZNn34uWdo408TosUYVS162AusewBxkg2ip8Cnnw=\"")
         testInstrumentationRunner = "android.app.Instrumentation"
     }
 
@@ -58,9 +45,13 @@ android {
     testOptions {
         unitTests.isReturnDefaultValues = true
     }
+
+    sourceSets.getByName("test").resources.srcDir(rootProject.file("contracts/fixtures"))
 }
 
 dependencies {
+    implementation("androidx.work:work-runtime:2.11.2")
+    implementation("net.i2p.crypto:eddsa:0.3.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 }

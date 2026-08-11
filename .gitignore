@@ -13,3 +13,15 @@ captures/
 /SHA256SUMS
 /helper/dist/
 /helper/build-android-*/
+/server/.venv/
+/server/.pytest_cache/
+/server/**/__pycache__/
+/server/var/
+/server/*.db
+/dashboard/node_modules/
+/dashboard/dist/
+/dashboard/*.tsbuildinfo
+/dashboard/vite.config.js
+/dashboard/vite.config.d.ts
+/deploy/.env
+/deploy/secrets/

@@ -1,0 +1,131 @@
+{
+  "caller_policy": {
+    "allowlist": [
+      {
+        "e164": "+989121234567",
+        "label": "Test caller"
+      }
+    ],
+    "blocklist": [],
+    "mode": "ALLOWLIST_ONLY",
+    "route_unknown_callers": false
+  },
+  "compiler_version": "4.1.0",
+  "flow": {
+    "root": {
+      "allow_prompt_barge_in": true,
+      "block_id": "00000000-0000-4000-8000-00000000012d",
+      "branches": [
+        {
+          "branch_id": "00000000-0000-4000-8000-000000000137",
+          "digit": "1",
+          "root": {
+            "block_id": "00000000-0000-4000-8000-00000000012e",
+            "type": "end_call"
+          }
+        },
+        {
+          "branch_id": "00000000-0000-4000-8000-000000000138",
+          "digit": "2",
+          "root": {
+            "block_id": "00000000-0000-4000-8000-00000000012f",
+            "type": "end_call"
+          }
+        }
+      ],
+      "maximum_attempts": 3,
+      "maximum_menu_returns": 2,
+      "on_invalid": {
+        "block_id": "00000000-0000-4000-8000-000000000131",
+        "type": "end_call"
+      },
+      "on_return_limit": {
+        "block_id": "00000000-0000-4000-8000-000000000132",
+        "type": "end_call"
+      },
+      "on_timeout": {
+        "block_id": "00000000-0000-4000-8000-000000000130",
+        "type": "end_call"
+      },
+      "prompt_id": "00000000-0000-4000-8000-000000000067",
+      "timeout_ms": 5000,
+      "type": "collect_digit"
+    }
+  },
+  "program": {
+    "entry_pc": 0,
+    "instructions": [
+      {
+        "allow_prompt_barge_in": true,
+        "block_id": "00000000-0000-4000-8000-00000000012d",
+        "branches": [
+          {
+            "digit": "1",
+            "target_pc": 1
+          },
+          {
+            "digit": "2",
+            "target_pc": 2
+          }
+        ],
+        "maximum_attempts": 3,
+        "maximum_menu_returns": 2,
+        "on_invalid_pc": 4,
+        "on_return_limit_pc": 5,
+        "on_timeout_pc": 3,
+        "op": "collect_digit",
+        "pc": 0,
+        "prompt_id": "00000000-0000-4000-8000-000000000067",
+        "timeout_ms": 5000
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-00000000012e",
+        "op": "end_call",
+        "pc": 1
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-00000000012f",
+        "op": "end_call",
+        "pc": 2
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000130",
+        "op": "end_call",
+        "pc": 3
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000131",
+        "op": "end_call",
+        "pc": 4
+      },
+      {
+        "block_id": "00000000-0000-4000-8000-000000000132",
+        "op": "end_call",
+        "pc": 5
+      }
+    ],
+    "maximum_automated_session_ms": 21000,
+    "version": 4
+  },
+  "program_sha256": "69fa7a656eb0eb9a45583540b7c7d7a974def880bfbdf19474160a93e2e3e8a0",
+  "prompts": [
+    {
+      "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "duration_ms": 2000,
+      "format": "audio/wav;codec=pcm_s16le;rate=48000;channels=2",
+      "id": "00000000-0000-4000-8000-000000000067",
+      "name": "Interruptible main menu",
+      "size_bytes": 4096,
+      "version": 1
+    }
+  ],
+  "published_at": "2026-08-10T12:00:00+00:00",
+  "recording_behavior": {
+    "finish_key": "#",
+    "maximum_duration_seconds": 60
+  },
+  "revision_id": 87,
+  "schedules": [],
+  "schema_version": 4,
+  "source_sha256": "a6d2ea30df6e2a5ab2f827e725881d789c883b446c01d3e20dd345a68704e6df"
+}

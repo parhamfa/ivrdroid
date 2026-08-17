@@ -1,11 +1,23 @@
-import { Archive, Clipboard, HardDrive, History, KeyRound, Laptop, Mic2, Plus, RotateCcw, ShieldOff, Trash2 } from "lucide-react";
+import { Archive, Bell, Clipboard, HardDrive, History, KeyRound, Laptop, Mic2, Plus, RotateCcw, ShieldOff, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { Button, ErrorState, Field, Loading, SuccessMessage, formatBytes, formatDate } from "../components/ui";
 import { useRemote } from "../hooks";
-import type { DraftConfiguration, RecordingSettings, Schedule, ScheduleException, WeeklyWindow } from "../types";
+import type { DraftConfiguration, NtfyEvents, NtfyPriority, NtfySettings, RecordingSettings, Schedule, ScheduleException, WeeklyWindow } from "../types";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const NTFY_PRIORITIES: NtfyPriority[] = ["min", "low", "default", "high", "max"];
+const NTFY_EVENTS: Array<{ key: keyof NtfyEvents; title: string; description: string }> = [
+  { key: "voicemail_ready", title: "Voicemail ready", description: "When a recorded message is playable." },
+  { key: "conversation_ready", title: "Conversation ready", description: "When an external-call recording is playable." },
+  { key: "ivr_session_failed", title: "IVR session failed", description: "Helper or answer failures after a matched caller." },
+  { key: "external_call_failed", title: "External call failed", description: "Operator step ended not connected or in system failure." },
+  { key: "revision_activation_failed", title: "Revision activation failed", description: "The tablet rejected or failed a published revision." },
+  { key: "storage_full", title: "Storage full", description: "Server quota warning or a tablet spool at its hard limit." },
+  { key: "tablet_offline", title: "Tablet offline", description: "Uses last call state, not the 3-minute Online pill." },
+  { key: "ivr_session_completed", title: "IVR session completed", description: "Successful or remote-hangup IVR sessions." },
+  { key: "stock_dialer_routing", title: "Stock-dialer routing", description: "Unmatched callers left with the Android dialer." },
+];
 
 function isExternalCallReady(status: Record<string, unknown>): boolean {
   return Array.isArray(status.runtime_versions)
@@ -23,11 +35,20 @@ function isPromptBargeInReady(status: Record<string, unknown>): boolean {
 
 export function SettingsPage() {
   const remote = useRemote(async () => {
-    const [draft, recordingSettings, devices, revisions, audit] = await Promise.all([api.draft(), api.recordingSettings(), api.devices(), api.revisions(), api.audit()]);
-    return { draft, recordingSettings, devices, revisions, audit };
+    const [draft, recordingSettings, ntfySettings, devices, revisions, audit] = await Promise.all([
+      api.draft(),
+      api.recordingSettings(),
+      api.ntfySettings(),
+      api.devices(),
+      api.revisions(),
+      api.audit(),
+    ]);
+    return { draft, recordingSettings, ntfySettings, devices, revisions, audit };
   }, []);
   const [draft, setDraft] = useState<DraftConfiguration | null>(null);
   const [retention, setRetention] = useState<RecordingSettings | null>(null);
+  const [ntfy, setNtfy] = useState<NtfySettings | null>(null);
+  const [ntfyToken, setNtfyToken] = useState("");
   const [pairingName, setPairingName] = useState("SM-T585");
   const [pairing, setPairing] = useState<{ code: string; expires_at: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -36,9 +57,11 @@ export function SettingsPage() {
   useEffect(() => {
     setDraft(remote.data?.draft ?? null);
     setRetention(remote.data?.recordingSettings ?? null);
+    setNtfy(remote.data?.ntfySettings ?? null);
+    setNtfyToken("");
   }, [remote.data]);
 
-  if (remote.loading || !draft || !retention) return <Loading label="Loading settings" />;
+  if (remote.loading || !draft || !retention || !ntfy) return <Loading label="Loading settings" />;
   if (remote.error || !remote.data) return <ErrorState message={remote.error ?? "Settings unavailable"} retry={remote.refresh} />;
   const tabletSpoolBytes = remote.data.devices.reduce((total, device) => total + Number(device.status.voicemail_spool_bytes ?? device.status.recording_spool_bytes ?? 0), 0);
   const tabletSpoolCount = remote.data.devices.reduce((total, device) => total + Number(device.status.voicemail_spool_count ?? device.status.recording_spool_count ?? 0), 0);
@@ -75,6 +98,36 @@ export function SettingsPage() {
     setBusy(true); setError(null);
     try { setRetention(await api.saveRecordingSettings(retention.mode, retention.days)); setMessage("Retention policy is effective immediately."); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Could not save retention policy"); }
+    finally { setBusy(false); }
+  };
+  const saveNtfy = async () => {
+    if (ntfy.events.tablet_offline.in_call_timeout_minutes < ntfy.events.tablet_offline.idle_timeout_minutes) {
+      setError("In-call timeout must be at least the idle timeout.");
+      return;
+    }
+    setBusy(true); setError(null);
+    try {
+      const saved = await api.saveNtfySettings({
+        enabled: ntfy.enabled,
+        server_url: ntfy.server_url,
+        topic: ntfy.topic,
+        token: ntfyToken.trim() ? ntfyToken.trim() : null,
+        events: ntfy.events,
+      });
+      setNtfy(saved);
+      setNtfyToken("");
+      setMessage("Push notification settings are effective immediately.");
+    }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not save notification settings"); }
+    finally { setBusy(false); }
+  };
+  const testNtfy = async () => {
+    setBusy(true); setError(null);
+    try {
+      await api.testNtfySettings();
+      setMessage("Test notification sent.");
+    }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not send a test notification"); }
     finally { setBusy(false); }
   };
   const createPairing = async () => {
@@ -123,6 +176,16 @@ export function SettingsPage() {
       </section>
     </div>
 
+    <NtfySettingsCard
+      ntfy={ntfy}
+      token={ntfyToken}
+      busy={busy}
+      onToken={setNtfyToken}
+      onChange={setNtfy}
+      onSave={() => void saveNtfy()}
+      onTest={() => void testNtfy()}
+    />
+
     <section className="surface settings-section"><header><div><h2>Schedules</h2><p>Exceptions override weekly hours. Every unmatched time is closed.</p></div><Button variant="secondary" onClick={addSchedule}><Plus size={17} /> Add schedule</Button></header>
       {draft.schedules.length === 0 ? <div className="settings-empty">No schedules yet. Add one before using a schedule branch in the IVR flow.</div> : draft.schedules.map((schedule, index) => <ScheduleEditor key={schedule.id} schedule={schedule} onChange={(value) => updateSchedule(index, value)} onDelete={() => setDraft({ ...draft, schedules: draft.schedules.filter((_, itemIndex) => itemIndex !== index) })} />)}
       <div className="settings-actions"><Button onClick={() => void saveSchedules()} disabled={busy}>Save schedules</Button></div>
@@ -156,6 +219,124 @@ export function SettingsPage() {
     </section>
     <footer className="source-footer">IVRdroid is open source · <a href="/source">View source</a></footer>
   </div>;
+}
+
+function NtfySettingsCard({
+  ntfy,
+  token,
+  busy,
+  onToken,
+  onChange,
+  onSave,
+  onTest,
+}: {
+  ntfy: NtfySettings;
+  token: string;
+  busy: boolean;
+  onToken: (value: string) => void;
+  onChange: (value: NtfySettings) => void;
+  onSave: () => void;
+  onTest: () => void;
+}) {
+  const disabled = busy || !ntfy.enabled;
+  const updateEvent = <K extends keyof NtfyEvents>(key: K, patch: Partial<NtfyEvents[K]>) => {
+    onChange({ ...ntfy, events: { ...ntfy.events, [key]: { ...ntfy.events[key], ...patch } } });
+  };
+  return (
+    <section className="surface settings-section" id="push-notifications">
+      <header>
+        <div>
+          <h2>Push notifications <span className="status-pill status-pill--muted">Effective immediately</span></h2>
+          <p>Server-side ntfy alerts. Public topics are world-readable; use a random topic and an access token. Full phone numbers are never sent.</p>
+        </div>
+        <Bell size={23} />
+      </header>
+      <label className="toggle-row">
+        <input type="checkbox" checked={ntfy.enabled} disabled={busy} onChange={(event) => onChange({ ...ntfy, enabled: event.target.checked })} />
+        <span className="toggle" aria-hidden="true" />
+        <span>
+          <strong>Enable ntfy</strong>
+          <small>{ntfy.enabled ? "On · posts after recordings, failures, and device health land on the server" : "Off · no notifications are sent"}</small>
+        </span>
+      </label>
+      <div className="settings-form-grid">
+        <Field label="Server URL" hint="HTTPS only. Default is ntfy.sh; a self-hosted server is safer.">
+          <input value={ntfy.server_url} disabled={disabled} onChange={(event) => onChange({ ...ntfy, server_url: event.target.value })} />
+        </Field>
+        <Field label="Topic" hint="1–64 letters, digits, underscores, or hyphens.">
+          <input value={ntfy.topic} disabled={disabled} onChange={(event) => onChange({ ...ntfy, topic: event.target.value })} />
+        </Field>
+        <Field label="Access token" hint={ntfy.token_configured ? "Saved token is kept if this is left blank." : "Optional. Required for reserved ntfy.sh topics."}>
+          <input type="password" autoComplete="new-password" value={token} disabled={disabled} placeholder={ntfy.token_configured ? "Token configured" : ""} onChange={(event) => onToken(event.target.value)} />
+        </Field>
+      </div>
+      <div className="subsection-title"><strong>Events</strong></div>
+      <div className="ntfy-events">
+        {NTFY_EVENTS.map((item) => {
+          const event = ntfy.events[item.key];
+          const eventDisabled = disabled || !event.enabled;
+          return (
+            <article className={`ntfy-event ${event.enabled ? "" : "ntfy-event--off"}`} key={item.key}>
+              <label className={`toggle-row toggle-row--compact ${disabled ? "toggle-row--disabled" : ""}`}>
+                <input type="checkbox" checked={event.enabled} disabled={disabled} onChange={(change) => updateEvent(item.key, { enabled: change.target.checked } as Partial<NtfyEvents[typeof item.key]>)} />
+                <span className="toggle" aria-hidden="true" />
+                <span><strong>{item.title}</strong><small>{item.description}</small></span>
+              </label>
+              <div className="settings-form-grid">
+                <Field label="Priority">
+                  <select value={event.priority} disabled={eventDisabled} onChange={(change) => updateEvent(item.key, { priority: change.target.value as NtfyPriority } as Partial<NtfyEvents[typeof item.key]>)}>
+                    {NTFY_PRIORITIES.map((priority) => <option key={priority} value={priority}>{priority}</option>)}
+                  </select>
+                </Field>
+                {"include_masked_caller" in event ? (
+                  <label className="ntfy-flag">
+                    <input type="checkbox" checked={event.include_masked_caller} disabled={eventDisabled} onChange={(change) => updateEvent(item.key, { include_masked_caller: change.target.checked } as Partial<NtfyEvents[typeof item.key]>)} />
+                    Include masked caller
+                  </label>
+                ) : <span />}
+                {item.key === "external_call_failed" && "not_connected" in event ? (
+                  <>
+                    <label className="ntfy-flag">
+                      <input type="checkbox" checked={event.not_connected} disabled={eventDisabled} onChange={(change) => updateEvent(item.key, { not_connected: change.target.checked } as Partial<NtfyEvents[typeof item.key]>)} />
+                      Not connected
+                    </label>
+                    <label className="ntfy-flag">
+                      <input type="checkbox" checked={event.system_failure} disabled={eventDisabled} onChange={(change) => updateEvent(item.key, { system_failure: change.target.checked } as Partial<NtfyEvents[typeof item.key]>)} />
+                      System failure
+                    </label>
+                  </>
+                ) : null}
+                {item.key === "storage_full" && "warn_at_quota_percent" in event ? (
+                  <Field label="Warn at server quota %" hint="Tablet spool caps are appliance limits and are not editable here.">
+                    <input type="number" min={50} max={100} value={event.warn_at_quota_percent} disabled={eventDisabled} onChange={(change) => updateEvent(item.key, { warn_at_quota_percent: Number(change.target.value) } as Partial<NtfyEvents[typeof item.key]>)} />
+                  </Field>
+                ) : null}
+                {item.key === "tablet_offline" && "idle_timeout_minutes" in event ? (
+                  <>
+                    <Field label="Idle timeout (minutes)" hint="Last reported call state was idle.">
+                      <input type="number" min={5} max={120} value={event.idle_timeout_minutes} disabled={eventDisabled} onChange={(change) => updateEvent(item.key, { idle_timeout_minutes: Number(change.target.value) } as Partial<NtfyEvents[typeof item.key]>)} />
+                    </Field>
+                    <Field label="In-call timeout (minutes)" hint="Must be at least the idle timeout.">
+                      <input type="number" min={15} max={180} value={event.in_call_timeout_minutes} disabled={eventDisabled} onChange={(change) => updateEvent(item.key, { in_call_timeout_minutes: Number(change.target.value) } as Partial<NtfyEvents[typeof item.key]>)} />
+                    </Field>
+                    <label className={`toggle-row toggle-row--compact ${eventDisabled ? "toggle-row--disabled" : ""}`}>
+                      <input type="checkbox" checked={event.notify_when_recovered} disabled={eventDisabled} onChange={(change) => updateEvent(item.key, { notify_when_recovered: change.target.checked } as Partial<NtfyEvents[typeof item.key]>)} />
+                      <span className="toggle" aria-hidden="true" />
+                      <span><strong>Notify when recovered</strong><small>One notification after an offline alert, when the tablet syncs again.</small></span>
+                    </label>
+                  </>
+                ) : null}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+      <div className="settings-actions">
+        <Button variant="secondary" onClick={onTest} disabled={busy || !ntfy.enabled || !ntfy.topic}>Send test</Button>
+        <Button onClick={onSave} disabled={busy}>Save</Button>
+      </div>
+    </section>
+  );
 }
 
 function ScheduleEditor({ schedule, onChange, onDelete }: { schedule: Schedule; onChange: (schedule: Schedule) => void; onDelete: () => void }) {

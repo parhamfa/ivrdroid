@@ -46,6 +46,7 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.clearAllMocks();
+  window.history.replaceState({}, "", "/");
 });
 
 describe("voicemail inbox", () => {
@@ -136,6 +137,12 @@ describe("voicemail inbox", () => {
     expect(screen.getByRole("dialog", { name: "Voicemail" })).toBeTruthy();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Voicemail" })).toBeNull();
+  });
+
+  it("opens a recording from the query string", async () => {
+    window.history.pushState({}, "", "/voicemail?recording=11111111-1111-4111-8111-111111111111");
+    render(<VoicemailPage />);
+    expect(await screen.findByRole("dialog", { name: "Voicemail" })).toBeTruthy();
   });
 
   it("presents a conversation as one logical recording with its masked operator", async () => {

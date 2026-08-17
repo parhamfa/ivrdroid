@@ -219,6 +219,21 @@ class ConversationRecordingSegment(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class NtfySettings(Base):
+    __tablename__ = "ntfy_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    server_url: Mapped[str] = mapped_column(String(200), nullable=False, default="https://ntfy.sh")
+    topic: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    events: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    last_offline_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_storage_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_by: Mapped[str] = mapped_column(String(320), nullable=False)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

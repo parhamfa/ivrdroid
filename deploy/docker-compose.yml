@@ -35,7 +35,7 @@ services:
       - database
 
   api:
-    image: ivrdroid-api:0.8.5
+    image: ivrdroid-api:0.8.6
     platform: linux/amd64
     build:
       context: ../server
@@ -85,7 +85,7 @@ services:
       - application
 
   web:
-    image: ivrdroid-web:0.8.5
+    image: ivrdroid-web:0.8.6
     platform: linux/amd64
     build:
       context: ../dashboard

@@ -290,3 +290,51 @@ export interface RecordingSettings {
   updated_at: string;
   updated_by: string;
 }
+
+export type NtfyPriority = "min" | "low" | "default" | "high" | "max";
+
+export interface NtfyEventBase {
+  enabled: boolean;
+  priority: NtfyPriority;
+}
+
+export interface NtfyCallerEvent extends NtfyEventBase {
+  include_masked_caller: boolean;
+}
+
+export interface NtfyExternalCallEvent extends NtfyCallerEvent {
+  not_connected: boolean;
+  system_failure: boolean;
+}
+
+export interface NtfyStorageEvent extends NtfyEventBase {
+  warn_at_quota_percent: number;
+}
+
+export interface NtfyOfflineEvent extends NtfyEventBase {
+  idle_timeout_minutes: number;
+  in_call_timeout_minutes: number;
+  notify_when_recovered: boolean;
+}
+
+export interface NtfyEvents {
+  voicemail_ready: NtfyCallerEvent;
+  conversation_ready: NtfyCallerEvent;
+  ivr_session_failed: NtfyCallerEvent;
+  external_call_failed: NtfyExternalCallEvent;
+  revision_activation_failed: NtfyEventBase;
+  storage_full: NtfyStorageEvent;
+  tablet_offline: NtfyOfflineEvent;
+  ivr_session_completed: NtfyCallerEvent;
+  stock_dialer_routing: NtfyCallerEvent;
+}
+
+export interface NtfySettings {
+  enabled: boolean;
+  server_url: string;
+  topic: string;
+  token_configured: boolean;
+  events: NtfyEvents;
+  updated_at: string;
+  updated_by: string;
+}

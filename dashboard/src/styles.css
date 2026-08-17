@@ -279,7 +279,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monos
 .recording-capacity span { color: var(--muted); font-size: 10px; }
 .recording-capacity--critical { border-color: #ebc0c4; background: var(--danger-soft); }
 .recording-capacity--critical > svg, .recording-capacity--critical strong { color: var(--danger); }
-.settings-actions { display: flex; justify-content: flex-end; margin-top: 15px; }
+.settings-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 15px; }
+.ntfy-events { display: grid; gap: 10px; margin-top: 8px; }
+.ntfy-event { padding: 14px; border: 1px solid var(--line); border-radius: 7px; background: #fafcfc; }
+.ntfy-event--off { opacity: .72; }
+.toggle-row--compact { margin: 0 0 12px; padding: 0; border: 0; background: transparent; }
+.ntfy-event .settings-form-grid { margin-top: 4px; }
+.ntfy-flag { display: flex; align-items: center; gap: 8px; min-height: 38px; color: var(--ink); font-size: 12px; font-weight: 600; }
+.ntfy-flag input { width: auto; }
 .settings-empty { padding: 25px; border: 1px dashed var(--line-dark); border-radius: 6px; color: var(--muted); font-size: 12px; text-align: center; }
 .schedule-editor { margin-top: 13px; padding: 15px; border: 1px solid var(--line); border-radius: 7px; background: #fafcfc; }
 .schedule-editor__head { display: grid; grid-template-columns: 1fr .8fr 1fr auto; align-items: end; gap: 12px; }

@@ -29,10 +29,24 @@ export function VoicemailPage() {
   const remote = useRemote(() => api.recordings(unreadOnly, page), [unreadOnly, page]);
 
   useEffect(() => {
-    if (!selected || !remote.data) return;
+    if (!remote.data) return;
+    const requested = new URLSearchParams(window.location.search).get("recording");
+    if (requested) {
+      const found = remote.data.items.find((item) => item.id === requested);
+      if (found) {
+        setSelected(found);
+        return;
+      }
+      if (unreadOnly) {
+        setUnreadOnly(false);
+        setPage(1);
+        return;
+      }
+    }
+    if (!selected) return;
     const current = remote.data.items.find((item) => item.id === selected.id);
     if (current) setSelected(current);
-  }, [remote.data, selected?.id]);
+  }, [remote.data, unreadOnly, selected?.id]);
 
   const updateListened = async (recording: Recording, listened: boolean) => {
     if (busy || Boolean(recording.listened_at) === listened) return;

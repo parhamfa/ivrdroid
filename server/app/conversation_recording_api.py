@@ -4,12 +4,13 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .auth import require_device
+from .crypto import mask_phone
 from .database import get_session
 from .models import (
     CallRecord,
@@ -39,6 +40,7 @@ from .schemas import (
     ExternalCallSubEvent,
 )
 from .services import load_manifest
+from .ntfy import notify_storage_full, schedule_ntfy
 
 
 router = APIRouter(
@@ -130,6 +132,10 @@ def _require_capacity(request: Request, session: Session, required_bytes: int) -
         request.app.state.settings.development_admin_email,
     )
     if recording_used_bytes(session) + required_bytes > request.app.state.settings.recording_quota_bytes:
+        notify_storage_full(
+            request.app,
+            "Recording storage quota is full; retain the encrypted device spool",
+        )
         raise HTTPException(
             status_code=507,
             detail="Recording storage quota is full; retain the encrypted device spool",
@@ -454,6 +460,7 @@ def complete_conversation_recording(
     recording_id: str,
     body: ConversationRecordingCompleteRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     device: Device = Depends(require_device),
     session: Session = Depends(get_session),
 ) -> ConversationRecordingUploadResponse:
@@ -489,7 +496,15 @@ def complete_conversation_recording(
             segments,
         )
     except RecordingError as error:
+        if error.status_code == 507:
+            notify_storage_full(request.app, str(error))
         raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+    call = session.get(CallRecord, recording.call_id)
+    caller = (
+        request.app.state.cipher.decrypt(call.caller_encrypted)
+        if call is not None and call.caller_encrypted
+        else None
+    )
     try:
         session.commit()
     except Exception:
@@ -499,4 +514,15 @@ def complete_conversation_recording(
         raise
     for segment in segments:
         remove_upload_files(request.app.state.settings, segment)
+    schedule_ntfy(
+        background_tasks,
+        request.app,
+        "conversation_ready",
+        title="Conversation ready",
+        message="An external-call recording is ready to play.",
+        click_path=f"/voicemail?recording={recording.id}",
+        tags="telephone_receiver,ivrdroid",
+        caller_masked=mask_phone(caller) if caller else None,
+    )
     return _recording_response(recording)
+

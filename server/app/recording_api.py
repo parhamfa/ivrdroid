@@ -5,7 +5,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from sqlalchemy import func, select
@@ -50,6 +50,7 @@ from .schemas import (
     RetentionPolicyRequest,
     RetentionPolicyResponse,
 )
+from .ntfy import notify_storage_full, schedule_ntfy
 from .services import audit, load_manifest
 
 
@@ -114,6 +115,10 @@ def _require_recording_capacity(
         recording_used_bytes(session) + required_bytes
         > request.app.state.settings.recording_quota_bytes
     ):
+        notify_storage_full(
+            request.app,
+            "Voicemail storage quota is full; retain the encrypted device spool",
+        )
         raise HTTPException(
             status_code=507,
             detail="Voicemail storage quota is full; retain the encrypted device spool",
@@ -307,6 +312,7 @@ async def upload_recording_content(
 def complete_recording(
     recording_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     device: Device = Depends(require_device),
     session: Session = Depends(get_session),
 ) -> RecordingUploadResponse:
@@ -330,8 +336,16 @@ def complete_recording(
             upload,
         )
     except RecordingError as error:
+        if error.status_code == 507:
+            notify_storage_full(request.app, str(error))
         raise HTTPException(status_code=error.status_code, detail=str(error)) from error
     session.delete(upload)
+    call = session.get(CallRecord, recording.call_id)
+    caller = (
+        request.app.state.cipher.decrypt(call.caller_encrypted)
+        if call is not None and call.caller_encrypted
+        else None
+    )
     try:
         session.commit()
     except Exception:
@@ -340,6 +354,16 @@ def complete_recording(
             destination.unlink(missing_ok=True)
         raise
     remove_upload_files(request.app.state.settings, upload)
+    schedule_ntfy(
+        background_tasks,
+        request.app,
+        "voicemail_ready",
+        title="Voicemail ready",
+        message="A recorded message is ready to play.",
+        click_path=f"/voicemail?recording={recording.id}",
+        tags="mailbox_with_mail,ivrdroid",
+        caller_masked=mask_phone(caller) if caller else None,
+    )
     return _as_upload_response(recording, None)
 
 

@@ -1,13 +1,16 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api";
-import type { DraftConfiguration, RecordingSettings } from "../types";
+import type { DraftConfiguration, NtfySettings, RecordingSettings } from "../types";
 import { SettingsPage } from "./SettingsPage";
 
 vi.mock("../api", () => ({
   api: {
     draft: vi.fn(),
     recordingSettings: vi.fn(),
+    ntfySettings: vi.fn(),
+    saveNtfySettings: vi.fn(),
+    testNtfySettings: vi.fn(),
     devices: vi.fn(),
     revisions: vi.fn(),
     audit: vi.fn(),
@@ -39,9 +42,38 @@ const operational: RecordingSettings = {
   updated_by: "owner@example.com",
 };
 
+const ntfy: NtfySettings = {
+  enabled: false,
+  server_url: "https://ntfy.sh",
+  topic: "",
+  token_configured: false,
+  events: {
+    voicemail_ready: { enabled: true, priority: "default", include_masked_caller: true },
+    conversation_ready: { enabled: true, priority: "default", include_masked_caller: true },
+    ivr_session_failed: { enabled: true, priority: "high", include_masked_caller: true },
+    external_call_failed: { enabled: true, priority: "high", include_masked_caller: true, not_connected: true, system_failure: true },
+    revision_activation_failed: { enabled: true, priority: "high" },
+    storage_full: { enabled: true, priority: "max", warn_at_quota_percent: 90 },
+    tablet_offline: { enabled: true, priority: "high", idle_timeout_minutes: 15, in_call_timeout_minutes: 45, notify_when_recovered: true },
+    ivr_session_completed: { enabled: false, priority: "default", include_masked_caller: true },
+    stock_dialer_routing: { enabled: false, priority: "low", include_masked_caller: false },
+  },
+  updated_at: "2026-08-17T00:00:00Z",
+  updated_by: "owner@example.com",
+};
+
 beforeEach(() => {
   vi.mocked(api.draft).mockResolvedValue(structuredClone(draft));
   vi.mocked(api.recordingSettings).mockResolvedValue({ ...operational });
+  vi.mocked(api.ntfySettings).mockResolvedValue(structuredClone(ntfy));
+  vi.mocked(api.saveNtfySettings).mockImplementation(async (body) => ({
+    ...ntfy,
+    ...body,
+    token_configured: Boolean(body.token) || ntfy.token_configured,
+    updated_at: "2026-08-17T01:00:00Z",
+    updated_by: "owner@example.com",
+  }));
+  vi.mocked(api.testNtfySettings).mockResolvedValue({ ...ntfy, enabled: true, topic: "ivrdroid-test" });
   vi.mocked(api.devices).mockResolvedValue([]);
   vi.mocked(api.revisions).mockResolvedValue([]);
   vi.mocked(api.audit).mockResolvedValue([]);
@@ -98,5 +130,33 @@ describe("recording settings", () => {
     await waitFor(() => expect(api.saveRecordingSettings).toHaveBeenCalledWith("automatic", 45));
     expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("irreversibly delete"));
     expect(screen.getByText(/2 pending on server/i)).toBeTruthy();
+  });
+});
+
+describe("ntfy settings", () => {
+  it("saves per-event knobs without sending a blank token", async () => {
+    render(<SettingsPage />);
+    await screen.findByRole("heading", { name: /Push notifications/i });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Enable ntfy/i }));
+    fireEvent.change(screen.getByRole("textbox", { name: /Topic/i }), { target: { value: "ivrdroid-test" } });
+    fireEvent.change(screen.getByRole("spinbutton", { name: /Idle timeout \(minutes\)/i }), { target: { value: "20" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(api.saveNtfySettings).toHaveBeenCalledWith(expect.objectContaining({
+      enabled: true,
+      topic: "ivrdroid-test",
+      token: null,
+      events: expect.objectContaining({
+        tablet_offline: expect.objectContaining({ idle_timeout_minutes: 20 }),
+      }),
+    })));
+  });
+
+  it("sends a single test notification", async () => {
+    render(<SettingsPage />);
+    await screen.findByRole("heading", { name: /Push notifications/i });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Enable ntfy/i }));
+    fireEvent.change(screen.getByRole("textbox", { name: /Topic/i }), { target: { value: "ivrdroid-test" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send test" }));
+    await waitFor(() => expect(api.testNtfySettings).toHaveBeenCalledTimes(1));
   });
 });

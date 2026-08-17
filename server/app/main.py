@@ -15,6 +15,7 @@ from typing import Annotated
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -112,6 +113,13 @@ from .recording_service import (
     remove_upload_files,
     restore_quarantined_media,
 )
+from .ntfy import (
+    call_notification_kwargs,
+    classify_call_notifications,
+    run_ntfy_watch,
+    schedule_ntfy,
+)
+from .ntfy_api import router as ntfy_settings_router
 from .v3_api import router as admin_v3_router
 from .v4_api import router as admin_v4_router
 from .conversation_recording_api import router as conversation_recording_device_router
@@ -180,6 +188,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except Exception:
                 LOGGER.exception("Scheduled recording maintenance failed")
 
+    async def ntfy_watch_loop(application: FastAPI) -> None:
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await asyncio.to_thread(run_ntfy_watch, application)
+            except Exception:
+                LOGGER.exception("Scheduled ntfy watch failed")
+
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         if configured.auto_create_schema:
@@ -199,12 +215,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             session.commit()
         maintain_recordings()
         maintenance = asyncio.create_task(recording_maintenance_loop())
+        watch = asyncio.create_task(ntfy_watch_loop(application))
         try:
             yield
         finally:
             maintenance.cancel()
+            watch.cancel()
             with suppress(asyncio.CancelledError):
                 await maintenance
+            with suppress(asyncio.CancelledError):
+                await watch
 
     app = FastAPI(
         title="IVRdroid API",
@@ -225,6 +245,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(device_router)
     app.include_router(recording_admin_router)
     app.include_router(recording_settings_router)
+    app.include_router(ntfy_settings_router)
     app.include_router(recording_device_router)
     app.include_router(conversation_recording_device_router)
 
@@ -947,6 +968,7 @@ def enroll_device(
 def sync_device(
     body: DeviceSyncRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     device: Device = Depends(require_device),
     session: Session = Depends(get_session),
 ) -> DeviceSyncResponse:
@@ -956,6 +978,7 @@ def sync_device(
     device.last_seen_at = utcnow()
     revision = session.get(Revision, device.desired_revision_id) if device.desired_revision_id else None
     session.commit()
+    background_tasks.add_task(run_ntfy_watch, request.app)
     return DeviceSyncResponse(
         server_time=utcnow(),
         desired_revision_id=device.desired_revision_id,
@@ -1012,6 +1035,8 @@ def device_prompt(
 def acknowledge_revision(
     revision_id: int,
     body: RevisionAckRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
     device: Device = Depends(require_device),
     session: Session = Depends(get_session),
 ) -> None:
@@ -1030,19 +1055,33 @@ def acknowledge_revision(
         device.active_revision_id = revision_id
     device.last_seen_at = utcnow()
     session.commit()
+    if body.state == "failed":
+        detail = body.error or "The tablet rejected the assigned revision."
+        schedule_ntfy(
+            background_tasks,
+            request.app,
+            "revision_activation_failed",
+            title="Revision activation failed",
+            message=f"Revision {revision_id} failed: {detail}",
+            click_path="/settings",
+            tags="x,ivrdroid",
+        )
 
 
 @device_router.post("/events:batch")
 def upload_events(
     body: EventBatchRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     device: Device = Depends(require_device),
     session: Session = Depends(get_session),
 ) -> dict:
     accepted: list[str] = []
+    pending_notifications: list[tuple[str, dict]] = []
     for call in body.calls:
         event_documents = [event.model_dump(mode="json") for event in call.events]
         existing = session.get(CallRecord, call.call_id)
+        notify = False
         if existing is not None:
             if existing.device_id != device.id:
                 raise HTTPException(status_code=409, detail="Call ID belongs to another device")
@@ -1052,27 +1091,53 @@ def upload_events(
                 existing.duration_seconds = call.duration_seconds
                 existing.events = event_documents
                 existing.received_at = utcnow()
+                notify = True
             accepted.append(call.call_id)
-            continue
-        caller_encrypted = request.app.state.cipher.encrypt(call.caller) if call.caller else None
-        session.add(
-            CallRecord(
-                id=call.call_id,
-                device_id=device.id,
-                started_at=call.started_at,
-                caller_encrypted=caller_encrypted,
-                caller_last4="" if not call.caller else call.caller[-4:],
-                policy_decision=call.policy_decision,
-                revision_id=call.revision_id,
-                menu_path=call.menu_path,
-                result=call.result,
-                duration_seconds=call.duration_seconds,
-                events=event_documents,
-            ),
-        )
-        accepted.append(call.call_id)
+        else:
+            caller_encrypted = request.app.state.cipher.encrypt(call.caller) if call.caller else None
+            session.add(
+                CallRecord(
+                    id=call.call_id,
+                    device_id=device.id,
+                    started_at=call.started_at,
+                    caller_encrypted=caller_encrypted,
+                    caller_last4="" if not call.caller else call.caller[-4:],
+                    policy_decision=call.policy_decision,
+                    revision_id=call.revision_id,
+                    menu_path=call.menu_path,
+                    result=call.result,
+                    duration_seconds=call.duration_seconds,
+                    events=event_documents,
+                ),
+            )
+            accepted.append(call.call_id)
+            notify = call.result != "IN_PROGRESS"
+        if notify:
+            caller = mask_phone(call.caller) if call.caller else None
+            for event_key, extra in classify_call_notifications(
+                call.policy_decision,
+                call.result,
+                event_documents,
+            ):
+                pending_notifications.append(
+                    (
+                        event_key,
+                        {
+                            **call_notification_kwargs(
+                                event_key,
+                                call_id=call.call_id,
+                                result=call.result,
+                                policy_decision=call.policy_decision,
+                                extra=extra,
+                            ),
+                            "caller_masked": caller,
+                        },
+                    ),
+                )
     device.last_seen_at = utcnow()
     session.commit()
+    for event_key, kwargs in pending_notifications:
+        schedule_ntfy(background_tasks, request.app, event_key, **kwargs)
     return {"accepted_call_ids": accepted}
 
 

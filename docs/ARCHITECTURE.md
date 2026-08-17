@@ -5,7 +5,8 @@
 IVRdroid handles one active cellular call and one menu session at a time. V3 adds explicit
 voicemail to the single-host control plane and one enrolled SM-T585 while preserving the
 appliance boundary: it is not a concurrent PBX, queue, extension, transfer, live-agent,
-whole-call recorder, transcription service, or arbitrary-webhook system.
+whole-call recorder, transcription service, or arbitrary-webhook system. A bounded
+owner-configured ntfy publisher may post a closed catalog of operational alerts to one topic.
 
 ## Trust boundary
 

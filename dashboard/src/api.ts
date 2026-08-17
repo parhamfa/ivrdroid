@@ -12,6 +12,7 @@ import type {
   Revision,
   RevisionDetail,
   SimulationResult,
+  NtfySettings,
   ValidationResult,
 } from "./types";
 
@@ -132,5 +133,19 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ mode, days }),
     }),
+  ntfySettings: () => request<NtfySettings>("/api/admin/v1/ntfy-settings"),
+  saveNtfySettings: (body: {
+    enabled: boolean;
+    server_url: string;
+    topic: string;
+    token?: string | null;
+    events: NtfySettings["events"];
+  }) =>
+    request<NtfySettings>("/api/admin/v1/ntfy-settings", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  testNtfySettings: () =>
+    request<NtfySettings>("/api/admin/v1/ntfy-settings/test", { method: "POST" }),
   audit: () => request<AuditRecord[]>("/api/admin/v1/audit"),
 };

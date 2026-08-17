@@ -5,6 +5,8 @@ from enum import Enum
 from typing import Annotated, Literal
 from uuid import UUID
 
+import re
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
@@ -830,3 +832,130 @@ class AuditResponse(StrictModel):
     target: str
     details: dict
     created_at: datetime
+
+
+NtfyPriority = Literal["min", "low", "default", "high", "max"]
+NTFY_TOPIC_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+
+
+class NtfyEventBase(StrictModel):
+    enabled: bool
+    priority: NtfyPriority = "default"
+
+
+class NtfyCallerEvent(NtfyEventBase):
+    include_masked_caller: bool = True
+
+
+class NtfyExternalCallEvent(NtfyCallerEvent):
+    not_connected: bool = True
+    system_failure: bool = True
+
+
+class NtfyStorageEvent(NtfyEventBase):
+    warn_at_quota_percent: int = Field(default=90, ge=50, le=100)
+
+
+class NtfyOfflineEvent(NtfyEventBase):
+    idle_timeout_minutes: int = Field(default=15, ge=5, le=120)
+    in_call_timeout_minutes: int = Field(default=45, ge=15, le=180)
+    notify_when_recovered: bool = True
+
+    @model_validator(mode="after")
+    def in_call_timeout_covers_idle(self):
+        if self.in_call_timeout_minutes < self.idle_timeout_minutes:
+            raise ValueError("in-call timeout must be at least the idle timeout")
+        return self
+
+
+class NtfyEvents(StrictModel):
+    voicemail_ready: NtfyCallerEvent
+    conversation_ready: NtfyCallerEvent
+    ivr_session_failed: NtfyCallerEvent
+    external_call_failed: NtfyExternalCallEvent
+    revision_activation_failed: NtfyEventBase
+    storage_full: NtfyStorageEvent
+    tablet_offline: NtfyOfflineEvent
+    ivr_session_completed: NtfyCallerEvent
+    stock_dialer_routing: NtfyCallerEvent
+
+
+def default_ntfy_events() -> NtfyEvents:
+    return NtfyEvents(
+        voicemail_ready=NtfyCallerEvent(enabled=True, priority="default", include_masked_caller=True),
+        conversation_ready=NtfyCallerEvent(enabled=True, priority="default", include_masked_caller=True),
+        ivr_session_failed=NtfyCallerEvent(enabled=True, priority="high", include_masked_caller=True),
+        external_call_failed=NtfyExternalCallEvent(
+            enabled=True,
+            priority="high",
+            include_masked_caller=True,
+            not_connected=True,
+            system_failure=True,
+        ),
+        revision_activation_failed=NtfyEventBase(enabled=True, priority="high"),
+        storage_full=NtfyStorageEvent(enabled=True, priority="max", warn_at_quota_percent=90),
+        tablet_offline=NtfyOfflineEvent(
+            enabled=True,
+            priority="high",
+            idle_timeout_minutes=15,
+            in_call_timeout_minutes=45,
+            notify_when_recovered=True,
+        ),
+        ivr_session_completed=NtfyCallerEvent(enabled=False, priority="default", include_masked_caller=True),
+        stock_dialer_routing=NtfyCallerEvent(enabled=False, priority="low", include_masked_caller=False),
+    )
+
+
+class NtfySettingsRequest(StrictModel):
+    enabled: bool
+    server_url: str = Field(default="https://ntfy.sh", min_length=8, max_length=200)
+    topic: str = Field(default="", max_length=64)
+    token: str | None = Field(default=None, max_length=200)
+    events: NtfyEvents
+
+    @field_validator("server_url")
+    @classmethod
+    def https_server_without_secrets(cls, value: str) -> str:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(value.strip())
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("ntfy server URL must be https with a hostname")
+        if parsed.username or parsed.password:
+            raise ValueError("ntfy server URL cannot contain credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("ntfy server URL cannot contain a query or fragment")
+        if parsed.path not in {"", "/"}:
+            raise ValueError("ntfy server URL must not include a path")
+        return f"https://{parsed.hostname}{'' if parsed.port in {None, 443} else f':{parsed.port}'}"
+
+    @field_validator("topic")
+    @classmethod
+    def strip_topic(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("token")
+    @classmethod
+    def blank_token_is_absent(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def topic_required_when_enabled(self):
+        if self.enabled and not self.topic:
+            raise ValueError("ntfy topic is required when notifications are enabled")
+        if self.topic and not re.fullmatch(NTFY_TOPIC_PATTERN, self.topic):
+            raise ValueError("ntfy topic must be 1-64 letters, digits, underscores, or hyphens")
+        return self
+
+
+class NtfySettingsResponse(StrictModel):
+    enabled: bool
+    server_url: str
+    topic: str
+    token_configured: bool
+    events: NtfyEvents
+    updated_at: datetime
+    updated_by: str

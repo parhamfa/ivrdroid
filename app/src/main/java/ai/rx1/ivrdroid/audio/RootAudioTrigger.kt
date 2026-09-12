@@ -50,6 +50,7 @@ object RootAudioTrigger {
                 ensurePrivateFile(File(directory, STAGED_REVISION_NAME), "0") &&
                 ensurePrivateFile(File(directory, SESSION_PATH_NAME), "none") &&
                 ensurePrivateFile(File(directory, HELPER_VERSION_NAME), "NOT_INSTALLED") &&
+                ensurePrivateFile(File(directory, "helper_source_commit"), "unknown") &&
                 ensurePrivateFile(File(directory, CAPABILITIES_NAME), "runtime=1,2;recording=0") &&
                 ensureRecordingCapacityFile(
                     File(directory, RECORDING_CAPACITY_NAME),

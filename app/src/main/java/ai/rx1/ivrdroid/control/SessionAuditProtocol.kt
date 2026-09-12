@@ -5,6 +5,7 @@ import net.i2p.crypto.eddsa.EdDSAEngine
 import net.i2p.crypto.eddsa.EdDSAPublicKey
 import net.i2p.crypto.eddsa.spec.EdDSANamedCurveTable
 import net.i2p.crypto.eddsa.spec.EdDSAPublicKeySpec
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.time.Instant
@@ -52,16 +53,18 @@ object SessionAuditProtocol {
         val reason = report.getString("stop_reason").also { require(it in terminalReasons) }
         require(report.getBoolean("partial") == (reason !in setOf("session_complete", "caller_hangup")))
         val events = report.getJSONArray("events").also { require(it.length() <= 4096) }
-        var previous = 0L
         for (index in 0 until events.length()) {
             val event = events.getJSONObject(index)
-            previous = event.getLong("offset_ms").also { require(it in previous..(duration + 1000)) }
+            require(event.getLong("offset_ms") in 0..(duration + 1000))
             require(event.getString("type") in eventTypes)
             if (!event.isNull("block_id")) canonicalId(event.getString("block_id"))
             val detail = event.optString("detail")
             require(detail.length <= 80 && detail.matches(Regex("[A-Za-z0-9_ .:#/*-]*")) && detail.count(Char::isDigit) < 8)
         }
-        return report
+        // Older helpers appended the coverage gap after a slightly later disconnect.
+        // Preserve every observed timestamp, while normalizing local receipts for upload.
+        val ordered = (0 until events.length()).map(events::getJSONObject).sortedBy { it.getLong("offset_ms") }
+        return report.put("events", JSONArray(ordered))
     }
 
     fun validateSegment(callId: String, index: Int, metadata: JSONObject): JSONObject {

@@ -61,6 +61,19 @@ class SessionAuditProtocolTest {
             .put("type", "external_call").put("offset_ms", 10).put("detail", "+989123456789")))) }
     }
 
+    @Test fun recoveredCoverageGapPrecedesALaterDisconnectWithoutChangingTimestamps() {
+        val source = report().put("duration_ms", 10500).put("partial", true).put("stop_reason", "interrupted")
+        source.getJSONArray("events")
+            .put(JSONObject().put("offset_ms", 10539).put("type", "ended").put("detail", "interrupted"))
+            .put(JSONObject().put("offset_ms", 10500).put("type", "gap").put("detail", "interrupted"))
+        val events = SessionAuditProtocol.validateReport(id, source).getJSONArray("events")
+        assertEquals(3, events.length())
+        assertEquals(10500, events.getJSONObject(1).getLong("offset_ms"))
+        assertEquals("gap", events.getJSONObject(1).getString("type"))
+        assertEquals(10539, events.getJSONObject(2).getLong("offset_ms"))
+        assertEquals("ended", events.getJSONObject(2).getString("type"))
+    }
+
     @Test fun receiptMustAcknowledgeTheExactSegmentHashSizeAndOffset() {
         val metadata = segment()
         val receipt = JSONObject().put("id", id).put("segment_index", 0).put("source_sha256", "a".repeat(64))

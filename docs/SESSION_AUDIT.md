@@ -36,6 +36,10 @@ for encryption or upload. Worker draining/recovery is bounded. No capture produc
 with no fabricated audio timestamp. A recovered session's call duration is the observed lower
 bound; the exact disconnected time is not invented.
 
+Coverage boundaries precede later disconnect events in the timeline without changing either
+timestamp. Android also normalizes older local reports before strict upload validation, so
+preserved interrupted recordings can finish uploading after an upgrade.
+
 ## Control and data contracts
 
 - `GET/PUT /api/admin/v1/audit-recording-settings`: independent signed policy, capability,
@@ -98,8 +102,8 @@ adb -s "$SERIAL" shell am instrument -w \
 Physical acceptance and exact deployed artifacts are recorded in the release evidence, not
 inferred from automated checks. See [DEPLOYMENT.md](DEPLOYMENT.md) for rollout and rollback.
 
-Pre-release checks on 2026-09-12 passed 104 Android unit tests in each build variant, Android
-lint, 18 native test executables, 94 server tests, 63 dashboard tests and the dashboard build.
+Pre-release checks on 2026-09-12 passed 105 Android unit tests in each build variant, Android
+lint, 18 native test executables, 94 server tests, 64 dashboard tests and the dashboard build.
 Helper binaries and privileged overlay packaging reproduced across separate build paths.
 The native harness passed on the SM-T585, including writer interruption and durable recovery.
 An isolated PostgreSQL 16 copy migrated from 0005 to 0006 while preserving 105 calls and 17

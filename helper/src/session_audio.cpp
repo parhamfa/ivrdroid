@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <dirent.h>
@@ -208,10 +209,24 @@ bool SaveReport(const Context& context, int reason, bool checkpoint = false) {
     if (events.empty()) events = "[]";
     if (checkpoint) return AtomicFile(context.directory() + "/events", events);
     if (reason > 2 && context.total && events.back() == ']') {
-        events.pop_back();
-        if (events.size() > 1) events += ',';
-        events += "{\"offset_ms\":" + std::to_string(context.total / 48) +
-            ",\"type\":\"gap\",\"block_id\":null,\"detail\":\"" + ReasonText(reason) + "\"}]";
+        const int64_t boundary = context.total / 48;
+        const std::string gap = "{\"offset_ms\":" + std::to_string(boundary) +
+            ",\"type\":\"gap\",\"block_id\":null,\"detail\":\"" + ReasonText(reason) + "\"}";
+        // These objects are emitted by Timeline, including recovered checkpoints.
+        // A disconnect can be observed after the final PCM frame: keep that timestamp
+        // and insert the coverage boundary before it rather than appending out of order.
+        const std::string marker = "{\"offset_ms\":";
+        size_t insertion = 0;
+        while ((insertion = events.find(marker, insertion)) != std::string::npos) {
+            const char* start = events.c_str() + insertion + marker.size();
+            char* end = nullptr;
+            const int64_t offset = std::strtoll(start, &end, 10);
+            if (end == start || *end != ',' || offset < 0) return false;
+            if (offset > boundary) break;
+            insertion += marker.size();
+        }
+        if (insertion != std::string::npos) events.insert(insertion, gap + ",");
+        else events.insert(events.size() - 1, (events.size() > 2 ? "," : "") + gap);
     }
     std::ostringstream out;
     out << "{\"recording_id\":\"" << context.id << "\",\"policy_version\":" << context.version

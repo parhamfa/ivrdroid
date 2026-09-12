@@ -4809,7 +4809,8 @@ void StopCallMonitor(CallMonitor* monitor) {
     CallMonitor* callMonitor,
     LastResult failureResult,
     bool stopWorker) {
-    ivrdroid::StopSessionAudio(failureResult == LastResult::RemoteHangup ? "caller_hangup" : "interrupted");
+    ivrdroid::StopSessionAudio(failureResult == LastResult::RemoteHangup ? "caller_hangup" :
+        failureResult == LastResult::FailedCapture ? "capture_failure" : "interrupted");
     if (stopWorker) kill(workerPid, SIGKILL);
     CleanupPartialRecordings();
     StopCallMonitor(callMonitor);
@@ -6194,7 +6195,8 @@ bool ProcessOneCommand() {
     }
 
     ivrdroid::StopSessionAudio(outcome == SessionOutcome::Complete ? "session_complete" :
-        outcome == SessionOutcome::RemoteHangup ? "caller_hangup" : "interrupted");
+        outcome == SessionOutcome::RemoteHangup ? "caller_hangup" :
+        outcome == SessionOutcome::CaptureFailure ? "capture_failure" : "interrupted");
     const bool guardianSucceeded =
         FinishSessionGuardian(&guardian, guardianResult);
     ivrdroid::ReleaseSessionAudio();

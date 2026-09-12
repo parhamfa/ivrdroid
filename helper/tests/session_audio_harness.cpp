@@ -115,6 +115,17 @@ int main() {
     assert(std::filesystem::file_size(folder() + "/00000.wav") == 44 + 2000 * 192);
     std::cout << "PASS: interrupted writer recovers only the last durable checkpoint\n";
 
+    start(); waitFrames(40);
+    fake->failAfter = fake->reads.load() + 1;
+    while (!ivrdroid::shared->failed.load()) usleep(2000);
+    usleep(60'000); // The guardian classifies failure after the last captured frame.
+    report = finish("capture_failure");
+    assert(report.find("\"partial\":true") != std::string::npos);
+    assert(report.find("\"type\":\"gap\"") < report.find("\"type\":\"ended\""));
+    assert(report.find("\"type\":\"ended\"") != std::string::npos);
+    assert(report.find("\"stop_reason\":\"capture_failure\"") != std::string::npos);
+    std::cout << "PASS: capture failure keeps the coverage boundary before the later disconnect\n";
+
     start(); waitFrames(20);
     assert(ivrdroid::AtomicFile(folder() + "/abort", "writer_failure\n"));
     waitFrames(80);

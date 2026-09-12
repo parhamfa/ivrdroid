@@ -69,6 +69,11 @@ def main() -> int:
             "system/etc/permissions/privapp-permissions-ai.rx1.ivrdroid.xml",
             0o644,
         ),
+        (
+            repository / "app/magisk/sysconfig-ai.rx1.ivrdroid.xml",
+            "system/etc/sysconfig/ai.rx1.ivrdroid.xml",
+            0o644,
+        ),
         (apk, "system/priv-app/IVRdroid/IVRdroid.apk", 0o644),
     )
 

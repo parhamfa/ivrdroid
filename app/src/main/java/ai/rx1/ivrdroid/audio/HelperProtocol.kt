@@ -7,11 +7,13 @@ data class HelperBridgeState(
     val stagedRevision: Long? = null,
     val sessionPath: List<String> = emptyList(),
     val helperVersion: String = "NOT_INSTALLED",
+    val sourceCommit: String = "unknown",
     val recordingCapable: Boolean = false,
     val runtimeVersions: Set<Int> = emptySet(),
     val callControlCapable: Boolean = false,
     val conversationRecordingCapable: Boolean = false,
     val promptBargeInCapable: Boolean = false,
+    val sessionAuditCapable: Boolean = false,
 ) {
     val isIdle: Boolean
         get() = current == HelperProtocol.READY
@@ -29,6 +31,7 @@ data class HelperCapabilities(
     val callControlCapable: Boolean,
     val conversationRecordingCapable: Boolean,
     val promptBargeInCapable: Boolean,
+    val sessionAuditCapable: Boolean = false,
 )
 
 object HelperCapabilityProtocol {
@@ -46,6 +49,7 @@ object HelperCapabilityProtocol {
             callControlCapable = values.contains("call_control=1"),
             conversationRecordingCapable = values.contains("conversation_recording=1"),
             promptBargeInCapable = values.contains("prompt_barge_in=1"),
+            sessionAuditCapable = values.contains("session_audit=1"),
         )
     }
 }

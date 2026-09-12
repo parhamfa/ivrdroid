@@ -185,6 +185,8 @@ export interface CallRecord {
   events: Record<string, unknown>[];
   recording_count: number;
   pending_recording_count: number;
+  session_audit?: SessionAudit | null;
+  recordings?: Recording[];
 }
 
 export interface AuditRecord {
@@ -250,16 +252,16 @@ export interface RevisionDetail {
   legacy: boolean;
 }
 
-export type RecordingStopReason = "finish_key" | "maximum_duration" | "caller_hangup" | "operator_hangup" | "recording_failure";
+export type RecordingStopReason = "finish_key" | "maximum_duration" | "caller_hangup" | "operator_hangup" | "recording_failure" | "session_complete" | "preempted" | "capture_failure" | "storage_full" | "interrupted" | "writer_failure";
 
 export interface Recording {
   id: string;
   call_id: string;
   device_id: string;
-  revision_id: number;
-  block_id: string;
+  revision_id: number | null;
+  block_id: string | null;
   sequence: number;
-  kind?: "voicemail" | "conversation";
+  kind?: "voicemail" | "conversation" | "session_audit";
   caller: string | null;
   caller_masked: string;
   operator_masked?: string | null;
@@ -267,7 +269,7 @@ export interface Recording {
   captured_at: string;
   duration_ms: number;
   stop_reason: RecordingStopReason;
-  status: "uploading" | "processing" | "ready" | "failed";
+  status: "uploading" | "processing" | "ready" | "failed" | "deleted";
   listened_at: string | null;
   deleted_at: string | null;
   playback_url: string | null;
@@ -337,4 +339,31 @@ export interface NtfySettings {
   events: NtfyEvents;
   updated_at: string;
   updated_by: string;
+}
+
+export interface SessionAuditEvent {
+  offset_ms: number;
+  type: "answered" | "prompt" | "digit" | "timeout" | "invalid" | "schedule" | "return" | "voicemail" | "external_call" | "ended" | "gap";
+  block_id?: string | null;
+  detail?: string;
+}
+
+export interface SessionAudit {
+  recording_id?: string | null;
+  policy_version: number;
+  state: "disabled" | "pending_upload" | "unavailable" | Recording["status"];
+  captured_at?: string | null;
+  duration_ms: number;
+  partial: boolean;
+  stop_reason: string;
+  events?: SessionAuditEvent[];
+  recording?: Recording;
+}
+
+export interface SessionAuditSettings {
+  document: { kind: "session_audit_policy"; version: number; enabled: boolean; local_quota_bytes: number };
+  sha256: string;
+  signature_b64: string;
+  server_quota_bytes: number;
+  devices: Array<{ id: string; name: string; capable: boolean; applied_version: number; enabled: boolean; spool_bytes: number; spool_count: number; last_error: string | null }>;
 }

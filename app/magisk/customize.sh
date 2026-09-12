@@ -8,3 +8,6 @@ set_perm "$MODPATH/system/priv-app/IVRdroid/IVRdroid.apk" 0 0 0644
 set_perm \
     "$MODPATH/system/etc/permissions/privapp-permissions-ai.rx1.ivrdroid.xml" \
     0 0 0644
+set_perm \
+    "$MODPATH/system/etc/sysconfig/ai.rx1.ivrdroid.xml" \
+    0 0 0644

@@ -1,149 +1,110 @@
 # Production deployment and rollback
 
-This file preserves the completed V3 production runbook. The not-yet-deployed V4 external-call
-rollout and physical acceptance gate are documented separately in
-[EXTERNAL_CALL_V4.md](EXTERNAL_CALL_V4.md); do not treat a local V4 build as carrier validation.
+The production targets are **old-mac** and the enrolled **SM-T585**. Runtime configuration is
+`/Users/parhamfatemi/Services/ivrdroid/deploy`; the Compose project is `ivrdroid`. old-mac runs
+Docker through the `parhamfatemi` Colima instance. The existing `com.cloudflare.cloudflared`
+launch service routes `ivrdroid.rx1.ai` to the loopback-only web port, `127.0.0.1:3200`.
+Hetzner/OpenLiteSpeed instructions in older verification records describe a retired deployment.
+Do not modify unrelated hosts, tunnels, applications or volumes during this release.
 
-This is the production deployment and rollback runbook. V3 was deployed under explicit approval
-on 2026-08-09: the control plane API/web are 0.7.1 at migration
-`0003_voicemail_recordings`, the tablet runs the 0.7.0 app/helper, and signed V3 revision 13 is
-active. A consented physical call proved caller-only capture, finish-key handling, encrypted
-upload, acknowledgement, inbox delivery, safe audio-mode restoration, and no ambient or prompt
-capture. The first MP3 was too quiet; server 0.7.1 corrected its mono/loudness normalization and
-the reprocessed dashboard playback was accepted. One fresh consented call is still required to
-prove that the corrected normalization is applied automatically to a new upload. Do not treat
-this runbook as standing authorization for later deployments, migrations, revision activation,
-or tablet changes.
-
-## Host layout
-
-The authoritative production host is `hetzner`. Runtime configuration is rooted at
-`/opt/ivrdroid/deploy`, and the standalone Compose project is named `ivrdroid`. Release build
-contexts may be staged under `/opt/ivrdroid/server` and `/opt/ivrdroid/dashboard`; they are not a
-production git checkout. IVRdroid does not join or restart unrelated Hetzner services.
-
-Runtime values belong in ignored files:
-
-```text
-deploy/.env
-deploy/secrets/config-signing-private.b64
-deploy/secrets/data-encryption-key.b64
-deploy/secrets/pairing-hmac-key.b64
-deploy/secrets/recording-encryption-key.b64
-deploy/secrets/cf-device-service-client-secret
-deploy/secrets/postgres-password
-```
-
-The secrets directory is mode 0700 and each file is mode 0600. Only the Ed25519 public
-verification key is committed in the Android build. The recording key must be an independent
-32-byte AES key, not the configuration/data key. Never copy private keys into the APK, database,
-dashboard bundle, filenames, or logs.
-
-## Network boundary
-
-- `ivrdroid-web` publishes `127.0.0.1:3200 -> 8080`.
-- `ivrdroid-api` is reachable only from the application Compose network.
-- `ivrdroid-db` is reachable only from the internal database Compose network.
-- The existing OpenLiteSpeed `ivrdroid.rx1.ai` vhost proxies to `127.0.0.1:3200`.
-- There is no production IVRdroid Cloudflare Tunnel. The old-mac tunnel route is retired.
-- Cloudflare Access applications, from most specific to least specific:
-  - `ivrdroid-device-enroll`: `ivrdroid.rx1.ai/api/device/v1/enroll`, bypass;
-  - `ivrdroid-device-api`: `ivrdroid.rx1.ai/api/device/*`, service auth;
-  - `ivrdroid-dashboard`: `ivrdroid.rx1.ai`, owner email OTP.
-
-The enrollment bypass is intentional but narrow. FastAPI still enforces an eight-digit
-single-use code, ten-minute expiry, five failures per IP per fifteen minutes, and one active
-tablet. All post-enrollment requests require both the Cloudflare service credential and the
-independent device bearer credential.
-
-## Deployment order
-
-1. Record existing container health, image digests, port listeners, OpenLiteSpeed proxy state,
-   installed tablet artifacts, and their hashes. Create rollback copies before any mutation.
-2. Preserve a validated PostgreSQL dump, prompt and recording archives, every recording-key
-   version needed to decrypt them, encrypted active manifest, installed app/helper packages,
-   exact hashes, and the signed active V2 revision before staging V3.
-3. Stage only the release build contexts on `hetzner`; retain ignored runtime configuration and
-   secrets under `/opt/ivrdroid/deploy`, then validate the Compose model.
-4. Build the pinned `linux/amd64` images, start PostgreSQL, run Alembic, then start API and web.
-   Migration `0003_voicemail_recordings` adds recording/upload/retention tables. V3 draft
-   initialization archives the V2 draft while retaining caller policy and schedules; immutable
-   V1/V2 revision rows are not rewritten.
-5. Verify `http://127.0.0.1:3200/health`, container health, port bindings, database migration
-   head, and unchanged neighboring services.
-6. Verify the V2 active revision and tablet acknowledgement remain unchanged. V3 authoring may
-   begin, but publish is rejected until every active tablet reports runtime V3 and recording
-   capability when the flow contains `record_message`.
-7. Keep the OpenLiteSpeed vhost, Cloudflare proxy/Access policy, service token, and path-specific
-   Access applications unchanged. Do not create a tunnel or reload unrelated vhosts.
-8. Verify the public owner login, device endpoint precedence, and local/public health.
-9. Only after separate approval, install/open the Android 0.7.0 app and the 0.7.0 disabled helper
-   module, run its self-test, then enable the audited helper. Validate the V3 tree before publishing
-   a signed V3 revision and verify a real idle-time acknowledgement. Keep the active V2 revision
-   available for immediate rollback.
-
-The audited tablet has Android restricted-networking mode enabled. Install
-`app/dist/IVRdroid-system-app-0.7.0-dev.zip` through Magisk with the APK. This systemizes only
-IVRdroid and grants only `CONNECTIVITY_USE_RESTRICTED_NETWORKS`; do not disable the device-wide
-restriction or add a broad UID firewall exception. After reboot, verify IVRdroid is a privileged
-system app, the permission is granted, the call-screening role is still held, and restricted
-networking remains enabled.
-
-The boot-only Wi-Fi guardian never issues a Wi-Fi-disable operation or writes
-an SSID/password. If the tablet has no usable Wi-Fi address, it may enable an already-disabled
-radio and issue at most three framework reconnect requests during the first three minutes after
-boot. Every request is deferred while the app, helper, or Android audio mode reports an active
-call. Its sanitized outcome is included in the next device heartbeat.
-
-Dashboard upload is the normal prompt path. For recovery or a deployment-time import, copy a
-source file into the API container and run the same validation pipeline with:
+For this host, invoke Docker as its Colima owner (SSH currently enters as root):
 
 ```sh
-ivrdroid-entrypoint python -m app.manage import-prompt \
-  --name "Prompt name" --file /tmp/prompt.wav --actor local-deployment
+sudo -n -H -u parhamfatemi /opt/local/bin/docker \
+  --host unix:///Users/parhamfatemi/.colima/default/docker.sock ps
 ```
 
-The command enforces the same suffix, 25 MiB, five-minute, conversion, duplicate, quota,
-versioning, and audit rules as the dashboard API. Remove the temporary source after import.
+Release staging directories must be readable by that owner for Colima bind mounts. Runtime
+`.env`, `deploy/secrets/`, signing keys and rollback archives stay private. Preserve every key
+version required by existing media. Do not print credentials or copy them into build contexts.
 
-## Backup and rollback
+## Release 0.9.0 order
 
-The database and prompt volumes are named `ivrdroid_postgres_data` and
-`ivrdroid_prompt_media`; voicemail uses the separate `ivrdroid_recording_media` volume. A backup
-must include a PostgreSQL dump, prompt media, encrypted recording media, ignored runtime
-configuration, all required recording-key versions, and hashes. A volume directory alone is not
-a portable database backup. Restore validation must decrypt and play a non-sensitive fixture, not
-merely confirm that encrypted files exist.
+1. Recheck actual image IDs, schema head, device versions/version codes, active revision, idle
+   Telecom/audio state, storage, enrollment and signing identity. Preserve original local changes
+   and implement on an isolated `codex/` branch/worktree.
+2. Back up a PostgreSQL custom-format dump; prompt/recording media; ignored deployment config;
+   Android signing material; active APK; both persistent Magisk modules; and application state.
+   Protect backups with directory mode 0700/files 0600 and verify archive hashes. Android
+   Keystore keys are nonexportable: keep the original application UID, data and signing identity.
+3. Run Android unit tests/lint/build, native policy tests and reproducibility checks, server
+   pytest, dashboard tests/build and actual browser playback/seek checks. Restore the dump into
+   an isolated PostgreSQL database and test migration `0006_session_audit` with legacy rows.
+4. Commit all source, tests, migration, documentation and release metadata. Reconcile with
+   `origin/main`, rerun affected checks, merge and push without force. Preserve any dirty original
+   checkout. Version metadata is 0.9.0; APK/overlay versionCode >=18 and helper versionCode >=26.
+5. From the exact clean merge commit, run `scripts/build-release.sh /protected/release/path`.
+   The output includes APK, privileged overlay ZIP, disabled helper ZIP, acceptance harnesses,
+   exact `source.tar`, `manifest.json` and SHA256SUMS. Keep the same source commit in Android,
+   helper, API and dashboard diagnostics. Do not build a production artifact from a dirty tree.
+6. Extract the source archive into a new owner-readable release directory on old-mac. Build
+   `linux/amd64` API/web images with `SOURCE_COMMIT` set to the full manifest commit. Tag each as
+   `0.9.0-<first12commit>` and retain the image IDs in the host release manifest. The Compose
+   `IVRDROID_RELEASE_TAG` chooses those immutable tags. Preserve the current image tags too.
+7. Prepare a schema-compatible rollback API using `scripts/build-rollback-api.py BASE OUTPUT`.
+   This backports only recording read compatibility and the additive migration to the prior
+   API, excludes audits from old dashboard counts/inbox, and leaves old call-control routes.
+   Build it alongside the retained old web image. Test its health and recording reads against
+   the migrated isolated database before cutover. Its provenance includes both commits.
+8. Copy only the reviewed Compose definition into the existing deploy directory. Preserve
+   runtime secrets, volume names, Access policies and the tunnel. Set the release tag/source
+   commit in `.env`. Keep auditing off. Run the explicit Alembic migration, then deploy matching
+   API/web containers. Verify migration head, image IDs, health, authenticated public access,
+   existing recording playback and tablet synchronization.
+9. Wait for an idle call state. During a bounded maintenance window, update the active APK with
+   the same signing certificate (`adb install -r`; never uninstall), persistent `ivrdroid_app`
+   overlay and `ivrdroid_helper`. The overlay preserves restricted-network permission,
+   privileged in-call control and the scoped Doze exemption. Keep device-wide restricted
+   networking enabled. The helper ZIP installs disabled; run its self-test before enabling.
+   Reboot as needed, then verify active/system APK hashes, helper binary hash, version codes,
+   runtime commits, permissions, role, enrollment, active IVR revision and post-boot sync.
+10. Run the isolated native/Android acceptance harnesses while idle. Enable auditing for the
+    controlled physical-call matrix. Verify setting → applied acknowledgement → full capture
+    → encrypted upload acknowledgement → authenticated production playback → clean idle state.
+    Exercise voicemail/finish key, connected operator conversation, no-answer, caller/operator
+    hangup, screen-off and interruption/recovery. Use synthetic topology fixtures for emergency
+    cases; never place a real emergency test call.
+11. Confirm expected caller/operator voices and prompts exactly once, no ambient tablet audio,
+    and timeline alignment within 250 ms. Verify voicemail/conversation recordings separately.
+    Restore the normal caller policy and leave auditing enabled only after acceptance passes.
+    Commit/push any fixes, rebuild and redeploy from the new exact commit. Push `v0.9.0` only
+    when every intended target and physical acceptance agree with that commit.
 
-Rollback is scoped to IVRdroid. During V3 cutover, retain exact signed V1/V2 manifests and the V2
-app/helper packages until all physical recording tests pass. For an engine rollback, use a V1/V2
-row's `Emergency activate` action in Settings, wait for idle activation, and verify desired and
-active revision IDs both equal that immutable revision. Returning to V3 must use `Restore as new`,
-which publishes a new signed V3 revision instead of rewriting history.
+Deployment evidence must state what actually passed. A successful synthetic harness does not
+prove a carrier conference. If a physical test is unavailable, record the gap and do not tag an
+accepted release.
 
-## Recording storage and key rotation
+## Rollback without data loss
 
-- The local media quota is 5 GiB. Default retention is automatic deletion after 30 days; manual
-  mode never silently deletes audio. At quota, the API returns `507`, the tablet retains its
-  encrypted spool, the dashboard shows a critical backlog warning, and a new recording follows
-  `on_unavailable` only when the bounded tablet spool cannot accept it.
-- Abandoned uploads are tombstoned/cleaned after 24 hours and can restart idempotently. Completed
-  audio is deleted only through retention or an explicit owner action; the audit tombstone stays.
-- Set `IVRDROID_RECORDING_ENCRYPTION_KEY_VERSION` to a monotonically increasing integer on key
-  rotation. Mount a one-line JSON object mapping every still-needed old version to its base64 key
-  and set `IVRDROID_RECORDING_ENCRYPTION_PREVIOUS_KEYS_JSON_FILE` through a deployment-specific
-  Compose override. Verify old and new messages before retiring an old key. Losing an old key makes
-  its retained voicemail irrecoverable.
+First disable full-session auditing in Settings. Wait for an idle applied-policy acknowledgement.
+Existing pending recordings remain uploadable under their original acknowledged policy. If the
+new app/helper is unhealthy, disable the local IVR switch during recovery and restore the known
+working app/helper artifacts with the original signer and retained application data. Never
+uninstall, re-enroll, delete the audit spool, or reset Android Keystore as a routine rollback.
+Android may require an explicit same-signer version downgrade for the preserved prior APK.
 
-If the control plane or tablet package itself must be rolled back:
+Restore the prior persistent Magisk modules and active APK, then reboot and verify permissions,
+role, enrollment, revision and clean audio state. The privileged overlay can be lower than the
+active data APK; verify both rather than assuming an overlay alone replaces the running app.
 
-1. turn off the tablet's local IVR switch;
-2. leave the OpenLiteSpeed vhost and Cloudflare/Access configuration unchanged unless that exact
-   layer is the proven fault;
-3. restore the previous APK/helper package if the tablet update caused the failure;
-4. restore the pinned IVRdroid images or database dump if the control plane caused the failure;
-5. leave the helper's previous active revision or built-in menu in place;
-6. re-check unrelated Hetzner services, OpenLiteSpeed, and the stock dialer.
+For the server, use the prepared compatible rollback API with the retained prior web image, or
+keep the accepted new backend with auditing disabled while rolling back the tablet. Preserve
+`0006_session_audit`, all call rows, encrypted media and tombstones. Unpatched older APIs may fail
+on new recording kinds or an unknown Alembic revision. Do not run `alembic downgrade`, restore a
+stale database over live history, remove volumes, or discard audit recordings during routine
+rollback. A disaster restore is a separate reviewed operation.
 
-Do not reload unrelated OpenLiteSpeed vhosts or prune shared Docker images/volumes as part of this
-rollback.
+## Protected baseline for this release
+
+The initial 2026-09-12 baseline was API/web 0.8.6, schema `0005_ntfy_settings`, active APK
+0.8.6-dev/code17, persistent app overlay 0.8.4-dev/code15, helper 0.8.2-dev/code24 and IVR revision
+21. Recheck before installing; do not rely on these dated values after another release.
+
+- old-mac: `/Users/parhamfatemi/Services/ivrdroid/backups/20260912T162721Z-session-audit`
+- Local: `/Users/parhamfatemi/Backups/ivrdroid/20260912T162721Z-session-audit`
+- Tablet: `/data/local/tmp/ivrdroid-rollback-20260912T162721Z.tar.gz`
+
+The valid tablet archive is `tablet-packages-and-state.tar.gz`. The explicitly named
+`tablet-packages-and-state.failed-pty-stream` is a rejected capture and must never be restored.
+The verified archive includes both modules, the active APK and app state. Retain the protected
+checksums and exact image IDs with the release evidence.

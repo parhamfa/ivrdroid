@@ -8,6 +8,8 @@ vi.mock("../api", () => ({
   api: {
     draft: vi.fn(),
     recordingSettings: vi.fn(),
+    sessionAuditSettings: vi.fn(),
+    saveSessionAuditSettings: vi.fn(),
     ntfySettings: vi.fn(),
     saveNtfySettings: vi.fn(),
     testNtfySettings: vi.fn(),
@@ -63,6 +65,7 @@ const ntfy: NtfySettings = {
 };
 
 beforeEach(() => {
+  vi.mocked(api.sessionAuditSettings).mockResolvedValue({ document: { kind: "session_audit_policy", version: 0, enabled: false, local_quota_bytes: 1024 ** 3 }, sha256: "", signature_b64: "", server_quota_bytes: 1024 ** 3, devices: [] });
   vi.mocked(api.draft).mockResolvedValue(structuredClone(draft));
   vi.mocked(api.recordingSettings).mockResolvedValue({ ...operational });
   vi.mocked(api.ntfySettings).mockResolvedValue(structuredClone(ntfy));

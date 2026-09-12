@@ -1,9 +1,11 @@
-import { Download, Filter, Search } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { Download, Filter, Headphones, Search } from "lucide-react";
+import { useMemo, useState } from "react";
 import { api } from "../api";
-import { Button, Drawer, EmptyState, ErrorState, Loading, formatDate, formatDuration } from "../components/ui";
+import { Button, EmptyState, ErrorState, Loading, formatDate, formatDuration } from "../components/ui";
 import { useRemote } from "../hooks";
 import type { CallRecord } from "../types";
+import { CallDetails } from "./CallDetails";
+import { audioMatches, sessionAudioStatus } from "./callAudit";
 
 function csvCell(value: unknown): string {
   return `"${String(value ?? "").replaceAll('"', '""')}"`;
@@ -24,27 +26,30 @@ export function CallsPage() {
   const remote = useRemote(api.calls, []);
   const [search, setSearch] = useState("");
   const [result, setResult] = useState("all");
-  const [selected, setSelected] = useState<CallRecord | null>(null);
-
-  useEffect(() => {
-    if (!remote.data) return;
-    const requested = new URLSearchParams(window.location.search).get("call");
-    if (requested) setSelected(remote.data.find((call) => call.id === requested) ?? null);
-  }, [remote.data]);
+  const [selected, setSelected] = useState<string | null>(() => new URLSearchParams(window.location.search).get("call"));
+  const [autoPlay, setAutoPlay] = useState(false);
+  const [audioFilter, setAudioFilter] = useState("all");
+  const open = (id: string | null, play = false) => {
+    setSelected(id); setAutoPlay(play);
+    const url = new URL(window.location.href);
+    if (id) url.searchParams.set("call", id); else url.searchParams.delete("call");
+    window.history.replaceState(null, "", url);
+  };
+  const updateCall = (changed: CallRecord) => remote.setData((current) => current?.map((call) => call.id === changed.id ? changed : call) ?? current);
 
   const calls = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return (remote.data ?? []).filter((call) => {
       const matchesResult = result === "all" || call.result === result;
       const haystack = [call.caller ?? "", call.caller_masked, call.policy_decision, call.result, ...call.menu_path].join(" ").toLowerCase();
-      return matchesResult && (!needle || haystack.includes(needle));
+      return matchesResult && audioMatches(call, audioFilter) && (!needle || haystack.includes(needle));
     });
-  }, [remote.data, result, search]);
+  }, [remote.data, result, search, audioFilter]);
 
   const exportCsv = () => {
     const rows = [
-      ["Started", "Caller", "Policy", "Revision", "Menu path", "Result", "Duration seconds"],
-      ...calls.map((call) => [call.started_at, call.caller ?? "", call.policy_decision, call.revision_id ?? "", call.menu_path.map(traceText).join(" > "), call.result, call.duration_seconds]),
+      ["Started", "Caller", "Policy", "Revision", "Menu path", "Result", "Duration seconds", "Session audio", "Session audio listened"],
+      ...calls.map((call) => [call.started_at, call.caller ?? "", call.policy_decision, call.revision_id ?? "", call.menu_path.map(traceText).join(" > "), call.result, call.duration_seconds, sessionAudioStatus(call), call.session_audit?.recording?.listened_at ?? ""]),
     ];
     const blob = new Blob([rows.map((row) => row.map(csvCell).join(",")).join("\n")], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -69,26 +74,22 @@ export function CallsPage() {
           <div><small>Recordings</small><strong>{remote.data?.reduce((total, call) => total + call.recording_count, 0) ?? 0}</strong><span>{remote.data?.reduce((total, call) => total + call.pending_recording_count, 0) ?? 0} pending upload</span></div>
         </section>
         <section className="surface calls-table">
-          <div className="section-toolbar">
+          <div className="section-toolbar calls-toolbar">
             <h2>Call history</h2>
             <label className="search-input"><Search size={19} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search calls" /></label>
             <label className="compact-select"><Filter size={17} /><select value={result} onChange={(event) => setResult(event.target.value)}><option value="all">All results</option>{results.map((item) => <option key={item}>{item}</option>)}</select></label>
+            <label className="compact-select"><Headphones size={17} /><select aria-label="Session audio filter" value={audioFilter} onChange={(event) => setAudioFilter(event.target.value)}><option value="all">All session audio</option><option value="unlistened">Unlistened</option><option value="ready">Ready to listen</option><option value="partial">Partial</option><option value="Pending upload">Pending upload</option><option value="Unavailable">Unavailable</option><option value="Not recorded">Not recorded</option></select></label>
             <Button variant="secondary" onClick={exportCsv} disabled={!calls.length}><Download size={17} /> Export CSV</Button>
           </div>
           {calls.length === 0 ? <EmptyState title="No matching calls">Call metadata appears here after the tablet uploads acknowledged events.</EmptyState> : (
-            <div className="table-scroll"><table><thead><tr><th>Time</th><th>Caller</th><th>Policy</th><th>Revision</th><th>Menu path</th><th>Recordings</th><th>Result</th><th>Duration</th></tr></thead><tbody>{calls.map((call) => (
-              <tr key={call.id} className="clickable-row" onClick={() => setSelected(call)}><td>{formatDate(call.started_at)}</td><td>{call.caller_masked}</td><td>{call.policy_decision}</td><td>{call.revision_id ?? "Built-in"}</td><td>{call.menu_path.map(traceText).join(" › ") || "—"}</td><td>{call.recording_count ? `${call.recording_count} ready` : call.pending_recording_count ? `${call.pending_recording_count} pending` : "—"}</td><td>{call.result}</td><td>{formatDuration(call.duration_seconds)}</td></tr>
+            <div className="table-scroll"><table><thead><tr><th>Time</th><th>Caller</th><th>Policy</th><th>Revision</th><th>Menu path</th><th>Session audio</th><th>Recordings</th><th>Result</th><th>Duration</th></tr></thead><tbody>{calls.map((call) => (
+              <tr key={call.id} className="clickable-row" onClick={() => open(call.id)}><td>{formatDate(call.started_at)}</td><td>{call.caller_masked}</td><td>{call.policy_decision}</td><td>{call.revision_id ?? "Built-in"}</td><td>{call.menu_path.map(traceText).join(" › ") || "—"}</td><td className="session-audio-cell">{sessionAudioStatus(call).includes("Listen") ? <Button variant="secondary" aria-label={`Listen to session from ${call.caller_masked} at ${formatDate(call.started_at)}`} onClick={(event) => { event.stopPropagation(); open(call.id, true); }}><Headphones size={15} />{sessionAudioStatus(call)}{!call.session_audit?.recording?.listened_at ? <span className="unlistened-dot" title="Unlistened" /> : null}</Button> : <span>{sessionAudioStatus(call)}</span>}</td><td>{call.recording_count ? `${call.recording_count} ready` : call.pending_recording_count ? `${call.pending_recording_count} pending` : "—"}</td><td>{call.result}</td><td>{formatDuration(call.duration_seconds)}</td></tr>
             ))}</tbody></table></div>
           )}
         </section>
       </div>
 
-      {selected ? <Drawer title="Call details" subtitle={formatDate(selected.started_at)} onClose={() => setSelected(null)}>
-        <dl className="detail-list"><div><dt>Caller</dt><dd>{selected.caller ?? selected.caller_masked}</dd></div><div><dt>Policy decision</dt><dd>{selected.policy_decision}</dd></div><div><dt>Revision</dt><dd>{selected.revision_id ?? "Built-in fallback"}</dd></div><div><dt>Result</dt><dd>{selected.result}</dd></div><div><dt>Duration</dt><dd>{formatDuration(selected.duration_seconds)}</dd></div><div><dt>Recordings</dt><dd>{selected.recording_count ? `${selected.recording_count} available` : selected.pending_recording_count ? `${selected.pending_recording_count} pending upload` : "None"}</dd></div><div><dt>Device</dt><dd>{selected.device_id}</dd></div></dl>
-        <h3>Execution trace</h3><ol className="event-list">{selected.menu_path.length ? selected.menu_path.map((step, index) => { const trace = describeTrace(step); return <li key={`${step}-${index}`}><strong>{trace.label}</strong>{trace.event ? <span> · {trace.event}</span> : null}{trace.blockId ? <code>{trace.blockId}</code> : null}</li>; }) : <li>No IVR steps reported</li>}</ol>
-        <h3>Events</h3><pre className="event-json">{JSON.stringify(selected.events, null, 2)}</pre>
-        {selected.recording_count || selected.pending_recording_count ? <p className="inspector-note"><a href="/voicemail">Open recordings</a> to play or manage audio from this call.</p> : <p className="inspector-note">No voicemail or external-call conversation produced audio for this call.</p>}
-      </Drawer> : null}
+      {selected ? <CallDetails key={selected} id={selected} autoPlay={autoPlay} onClose={() => open(null)} onChange={updateCall} /> : null}
     </div>
   );
 }

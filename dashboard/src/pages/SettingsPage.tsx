@@ -3,6 +3,8 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { Button, ErrorState, Field, Loading, SuccessMessage, formatBytes, formatDate } from "../components/ui";
 import { useRemote } from "../hooks";
+import { RELEASE_VERSION, SOURCE_COMMIT } from "../release";
+import { SessionAuditSettingsCard } from "./SessionAuditSettingsCard";
 import type { DraftConfiguration, NtfyEvents, NtfyPriority, NtfySettings, RecordingSettings, Schedule, ScheduleException, WeeklyWindow } from "../types";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
@@ -61,8 +63,9 @@ export function SettingsPage() {
     setNtfyToken("");
   }, [remote.data]);
 
+  if (remote.error) return <ErrorState message={remote.error} retry={remote.refresh} />;
   if (remote.loading || !draft || !retention || !ntfy) return <Loading label="Loading settings" />;
-  if (remote.error || !remote.data) return <ErrorState message={remote.error ?? "Settings unavailable"} retry={remote.refresh} />;
+  if (!remote.data) return <ErrorState message={remote.error ?? "Settings unavailable"} retry={remote.refresh} />;
   const tabletSpoolBytes = remote.data.devices.reduce((total, device) => total + Number(device.status.voicemail_spool_bytes ?? device.status.recording_spool_bytes ?? 0), 0);
   const tabletSpoolCount = remote.data.devices.reduce((total, device) => total + Number(device.status.voicemail_spool_count ?? device.status.recording_spool_count ?? 0), 0);
   const conversationSpoolBytes = remote.data.devices.reduce((total, device) => total + Number(device.status.conversation_spool_bytes ?? 0), 0);
@@ -92,7 +95,7 @@ export function SettingsPage() {
   };
   const saveRetention = async () => {
     const explanation = retention.mode === "automatic"
-      ? `Automatically and irreversibly delete voicemail and conversation audio older than ${retention.days} days? Audit tombstones remain.`
+      ? `Automatically and irreversibly delete session audit, voicemail and conversation audio older than ${retention.days} days? Audit tombstones remain.`
       : "Switch to manual retention? Existing recordings remain until you delete them.";
     if (!window.confirm(explanation)) return;
     setBusy(true); setError(null);
@@ -160,13 +163,15 @@ export function SettingsPage() {
 
   return <div className="settings-page">
     {message ? <SuccessMessage>{message}</SuccessMessage> : null}{error ? <ErrorState message={error} /> : null}
+    <p className="inspector-note">Dashboard {RELEASE_VERSION} · Source {SOURCE_COMMIT}</p>
+    <SessionAuditSettingsCard />
     <div className="settings-grid settings-grid--recording">
       <section className="surface settings-section" id="recording-behavior"><header><div><h2>Recording behavior <span className="draft-label">Signed draft</span></h2><p>Shared by every Record message step. Saving does not activate it; publication creates a signed V4 revision.</p></div><Mic2 size={23} /></header>
         <div className="settings-form-grid"><Field label="Maximum duration" hint="Hard limit: 10–180 seconds. Caller hangup always stops sooner."><input type="number" min={10} max={180} value={draft.recording_behavior.maximum_duration_seconds} onChange={(event) => setDraft({ ...draft, recording_behavior: { ...draft.recording_behavior, maximum_duration_seconds: Number(event.target.value) } })} /></Field><Field label="DTMF finish key" hint="No silence detector is used."><select value={draft.recording_behavior.finish_key ?? ""} onChange={(event) => setDraft({ ...draft, recording_behavior: { ...draft.recording_behavior, finish_key: event.target.value || null } })}><option value="">Disabled</option>{"0123456789*#".split("").map((key) => <option key={key} value={key}>{key}</option>)}</select></Field></div>
         <div className="settings-actions"><Button onClick={() => void saveRecordingBehavior()} disabled={busy || draft.recording_behavior.maximum_duration_seconds < 10 || draft.recording_behavior.maximum_duration_seconds > 180}>Save signed draft settings</Button></div>
       </section>
 
-      <section className="surface settings-section" id="voicemail-retention"><header><div><h2>Recording retention <span className="status-pill status-pill--muted">Effective immediately</span></h2><p>Shared by voicemail and conversations. Automatic deletion is irreversible, but audit tombstones remain.</p></div><Archive size={23} /></header>
+      <section className="surface settings-section" id="voicemail-retention"><header><div><h2>Recording retention <span className="status-pill status-pill--muted">Effective immediately</span></h2><p>Shared by session audits, voicemail and conversations. Automatic deletion is irreversible, but audit tombstones remain.</p></div><Archive size={23} /></header>
         <div className="settings-form-grid"><Field label="Retention mode"><select value={retention.mode} onChange={(event) => setRetention({ ...retention, mode: event.target.value as RecordingSettings["mode"] })}><option value="manual">Manual deletion only</option><option value="automatic">Automatic deletion</option></select></Field><Field label="Retention days" hint="Used only in automatic mode; range 1–365 days."><input type="number" min={1} max={365} value={retention.days} disabled={retention.mode === "manual"} onChange={(event) => setRetention({ ...retention, days: Number(event.target.value) })} /></Field></div>
         <div className={`recording-capacity ${retention.used_bytes >= retention.quota_bytes || tabletSpoolFull || conversationSpoolFull ? "recording-capacity--critical" : ""}`}><HardDrive size={18} /><div><strong>{formatBytes(retention.used_bytes)} of {formatBytes(retention.quota_bytes)} reserved on server</strong><span>Includes incomplete uploads · {retention.pending_count} pending on server · voicemail spool: {tabletSpoolCount} ({formatBytes(tabletSpoolBytes)}) · conversation spool: {conversationSpoolCount} ({formatBytes(conversationSpoolBytes)})</span></div></div>
         {retention.used_bytes >= retention.quota_bytes ? <ErrorState message="Recording storage is full. New uploads return 507 and remain encrypted on the tablet." /> : null}
@@ -204,7 +209,7 @@ export function SettingsPage() {
           const wifiTime = typeof wifi?.completed_at === "string" ? formatDate(wifi.completed_at) : "Never";
           const externalReady = isExternalCallReady(device.status);
           const promptBargeInReady = isPromptBargeInReady(device.status);
-          return <div className="device-card" key={device.id}><div><strong>{device.display_name}</strong><span>{device.revoked_at ? "Revoked" : `App ${device.app_version} · Helper ${device.helper_version}`}</span><small>Last seen {formatDate(device.last_seen_at)}</small><small>Boot Wi-Fi: {wifiOutcome} · {wifiTime}</small>{device.revoked_at ? null : <><small>External call V4: {externalReady ? "ready" : "not ready — V4 publication is blocked"}</small><small>Prompt interruption: {promptBargeInReady ? "ready" : "not ready — enabled flows cannot publish"}</small></>}</div>{device.revoked_at ? null : <Button variant="danger" onClick={() => void revoke(device.id)} disabled={busy}><ShieldOff size={16} /> Revoke</Button>}</div>;
+          return <div className="device-card" key={device.id}><div><strong>{device.display_name}</strong><span>{device.revoked_at ? "Revoked" : `App ${device.app_version} · Helper ${device.helper_version}`}</span><small>Last seen {formatDate(device.last_seen_at)}</small><small>App source: {String(device.status.source_commit ?? "Not reported")}</small><small>Helper source: {String(device.status.helper_source_commit ?? "Not reported")}</small><small>Boot Wi-Fi: {wifiOutcome} · {wifiTime}</small>{device.revoked_at ? null : <><small>External call V4: {externalReady ? "ready" : "not ready — V4 publication is blocked"}</small><small>Prompt interruption: {promptBargeInReady ? "ready" : "not ready — enabled flows cannot publish"}</small></>}</div>{device.revoked_at ? null : <Button variant="danger" onClick={() => void revoke(device.id)} disabled={busy}><ShieldOff size={16} /> Revoke</Button>}</div>;
         })}
       </section>
     </div>

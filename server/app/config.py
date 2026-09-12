@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     prompt_duration_limit_seconds: int = 300
     revision_asset_limit_bytes: int = 128 * 1024 * 1024
     recording_quota_bytes: int = 5 * 1024 * 1024 * 1024
+    audit_recording_quota_bytes: int = 1024 * 1024 * 1024
+    audit_recording_reserve_bytes: int = 512 * 1024 * 1024
     recording_upload_limit_bytes: int = 40 * 1024 * 1024
     recording_chunk_limit_bytes: int = 1024 * 1024
     recording_abandoned_upload_hours: int = 24

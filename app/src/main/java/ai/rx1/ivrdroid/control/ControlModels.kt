@@ -22,6 +22,9 @@ data class PendingCallEvent(
     val result: String,
     val durationSeconds: Int,
     val events: List<PendingCallSubEvent> = emptyList(),
+    val sessionAudit: JSONObject? = null,
+    val auditPolicyVersion: Long? = null,
+    val auditQuotaBytes: Long? = null,
 )
 
 data class PendingCallSubEvent(
@@ -41,7 +44,12 @@ data class PendingCallSubEvent(
 object CallEventPayload {
     fun preserveEvents(previous: PendingCallEvent, replacement: PendingCallEvent): PendingCallEvent {
         require(previous.callId == replacement.callId)
-        return if (replacement.events.isEmpty()) replacement.copy(events = previous.events) else replacement
+        return replacement.copy(
+            events = replacement.events.ifEmpty { previous.events },
+            sessionAudit = replacement.sessionAudit ?: previous.sessionAudit,
+            auditPolicyVersion = previous.auditPolicyVersion ?: replacement.auditPolicyVersion,
+            auditQuotaBytes = previous.auditQuotaBytes ?: replacement.auditQuotaBytes,
+        )
     }
 
     fun encode(event: PendingCallEvent): JSONObject = JSONObject()
@@ -54,6 +62,20 @@ object CallEventPayload {
         .put("result", event.result)
         .put("duration_seconds", event.durationSeconds)
         .put("events", encodeEvents(event.events))
+        .put("session_audit", event.sessionAudit ?: JSONObject.NULL)
+
+    fun decode(item: JSONObject): PendingCallEvent = PendingCallEvent(
+        callId = item.getString("call_id"),
+        startedAt = item.getString("started_at"),
+        caller = if (item.isNull("caller")) null else item.optString("caller").takeIf { it.isNotEmpty() },
+        policyDecision = item.getString("policy_decision"),
+        revisionId = item.optLong("revision_id", 0).takeIf { it > 0 },
+        menuPath = item.optJSONArray("menu_path")?.let { path -> List(path.length()) { path.getString(it) } } ?: emptyList(),
+        result = item.getString("result"),
+        durationSeconds = item.optInt("duration_seconds", 0),
+        events = decodeEvents(item.optJSONArray("events")),
+        sessionAudit = item.optJSONObject("session_audit"),
+    )
 
     fun encodeEvents(events: List<PendingCallSubEvent>): JSONArray = JSONArray().also { array ->
         require(events.size <= 128)

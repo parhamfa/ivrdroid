@@ -35,10 +35,12 @@ services:
       - database
 
   api:
-    image: ivrdroid-api:0.8.6
+    image: ivrdroid-api:${IVRDROID_RELEASE_TAG:-0.9.0}
     platform: linux/amd64
     build:
       context: ../server
+      args:
+        SOURCE_COMMIT: ${IVRDROID_SOURCE_COMMIT:-unknown}
     restart: unless-stopped
     depends_on:
       db:
@@ -50,6 +52,8 @@ services:
       IVRDROID_RECORDING_ROOT: /data/recordings
       IVRDROID_PUBLIC_BASE_URL: https://ivrdroid.rx1.ai
       IVRDROID_AUTO_CREATE_SCHEMA: "false"
+      IVRDROID_AUDIT_RECORDING_QUOTA_BYTES: ${IVRDROID_AUDIT_RECORDING_QUOTA_BYTES:-1073741824}
+      IVRDROID_AUDIT_RECORDING_RESERVE_BYTES: ${IVRDROID_AUDIT_RECORDING_RESERVE_BYTES:-536870912}
       IVRDROID_CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:?CF_ACCESS_TEAM_DOMAIN is required}
       IVRDROID_CF_ACCESS_AUDIENCE: ${CF_ACCESS_AUDIENCE:?CF_ACCESS_AUDIENCE is required}
       IVRDROID_CF_DEVICE_SERVICE_CLIENT_ID: ${CF_DEVICE_SERVICE_CLIENT_ID:?CF_DEVICE_SERVICE_CLIENT_ID is required}
@@ -85,10 +89,12 @@ services:
       - application
 
   web:
-    image: ivrdroid-web:0.8.6
+    image: ivrdroid-web:${IVRDROID_RELEASE_TAG:-0.9.0}
     platform: linux/amd64
     build:
       context: ../dashboard
+      args:
+        SOURCE_COMMIT: ${IVRDROID_SOURCE_COMMIT:-unknown}
     restart: unless-stopped
     depends_on:
       api:

@@ -4,6 +4,7 @@
 #include "conversation_handoff_protocol.h"
 #include "device_profile.h"
 #include "dtmf_detector.h"
+#include "session_audio.h"
 #include "external_call_policy.h"
 #include "helper_protocol.h"
 #include "menu_policy.h"
@@ -57,7 +58,11 @@ using ivrdroid::protocol::CurrentState;
 using ivrdroid::protocol::LastResult;
 
 constexpr char kLogTag[] = "IVRdroidHelper";
-constexpr char kHelperVersion[] = "0.8.3-dev";
+constexpr char kHelperVersion[] = "0.9.0";
+#ifndef IVRDROID_SOURCE_COMMIT
+#define IVRDROID_SOURCE_COMMIT "unknown"
+#endif
+constexpr char kSourceCommit[] = IVRDROID_SOURCE_COMMIT;
 
 constexpr char kBridgeDir[] =
     "/data/user/0/ai.rx1.ivrdroid/files/bridge";
@@ -217,6 +222,7 @@ volatile sig_atomic_t gStopRequested = 0;
 uid_t gAppUid = 0;
 const ivrdroid::DeviceProfile* gProfile = nullptr;
 std::string gBootId;
+std::string gAuditBlock;
 
 int64_t MonotonicMilliseconds();
 
@@ -1614,6 +1620,8 @@ bool InitializeRevisionState() {
             kHelperVersion)) {
         return false;
     }
+    WriteBridgeValue("/data/user/0/ai.rx1.ivrdroid/files/bridge/helper_source_commit",
+        "/data/user/0/ai.rx1.ivrdroid/files/bridge/.helper_source_commit.tmp", kSourceCommit);
     return true;
 }
 
@@ -1955,7 +1963,7 @@ bool PlayPrompt(const char* path) {
     pcm* output = pcm_open(
         gProfile->card,
         gProfile->playbackDevice,
-        PCM_OUT,
+        PCM_OUT | PCM_MONOTONIC,
         &config);
     if (output == nullptr || !pcm_is_ready(output)) {
         Log(
@@ -1975,6 +1983,8 @@ bool PlayPrompt(const char* path) {
         return false;
     }
 
+    ivrdroid::BeginAuditPrompt();
+    ivrdroid::AuditEvent("prompt", gAuditBlock, "play");
     bool success = true;
     uint32_t remaining = dataSize;
     int blocksUntilCallCheck = 1;
@@ -1993,6 +2003,7 @@ bool PlayPrompt(const char* path) {
             success = false;
             break;
         }
+        ivrdroid::TapAuditPrompt(output, reinterpret_cast<int16_t*>(buffer), frames);
         remaining -= static_cast<uint32_t>(count);
 
         if (--blocksUntilCallCheck == 0) {
@@ -2008,6 +2019,7 @@ bool PlayPrompt(const char* path) {
     if (success && !gStopRequested) pcm_wait(output, 2000);
     std::free(buffer);
     pcm_close(output);
+    ivrdroid::EndAuditPrompt();
     std::fclose(file);
     return success && remaining == 0 && !gStopRequested;
 }
@@ -2209,6 +2221,7 @@ PrivacyStartResult BeginPrivateSession(int guardianFd) {
         return PrivacyStartResult::ExternalPreempt;
     }
 
+    ivrdroid::ActivateSessionAudio();
     if (!NotifyGuardian(guardianFd, kGuardianIdle)) {
         return PrivacyStartResult::Failed;
     }
@@ -2338,17 +2351,17 @@ DtmfResult CaptureDtmfDigit(int guardianFd, uint32_t timeoutMilliseconds = 8000)
     config.period_count = kDtmfPeriodCount;
     config.format = PCM_FORMAT_S16_LE;
 
-    pcm* input = pcm_open(
+    ivrdroid::SessionCapture* input = ivrdroid::OpenSessionCapture(
         gProfile->card,
         gProfile->captureDevice,
         PCM_IN,
         &config);
-    if (input == nullptr || !pcm_is_ready(input)) {
+    if (input == nullptr || !ivrdroid::SessionCaptureReady(input)) {
         Log(
             ANDROID_LOG_ERROR,
             "Cannot open DTMF capture PCM: %s",
-            input == nullptr ? "null handle" : pcm_get_error(input));
-        if (input != nullptr) pcm_close(input);
+            input == nullptr ? "null handle" : ivrdroid::SessionCaptureError(input));
+        if (input != nullptr) ivrdroid::CloseSessionCapture(input);
         return {DtmfResultKind::CaptureError, 0};
     }
 
@@ -2370,14 +2383,14 @@ DtmfResult CaptureDtmfDigit(int guardianFd, uint32_t timeoutMilliseconds = 8000)
          frame < timeoutFrames && !gStopRequested;
          ++frame) {
         const int framesRead =
-            pcm_readi(input, samples.data(), kDtmfFrameCount);
+            ivrdroid::ReadSessionCapture(input, samples.data(), kDtmfFrameCount);
         if (framesRead != static_cast<int>(kDtmfFrameCount)) {
             Log(
                 ANDROID_LOG_ERROR,
                 "DTMF PCM read failed or returned %d frames: %s",
                 framesRead,
-                pcm_get_error(input));
-            pcm_close(input);
+                ivrdroid::SessionCaptureError(input));
+            ivrdroid::CloseSessionCapture(input);
             return {DtmfResultKind::CaptureError, 0};
         }
 
@@ -2398,13 +2411,14 @@ DtmfResult CaptureDtmfDigit(int guardianFd, uint32_t timeoutMilliseconds = 8000)
                 right.confidence,
                 left.dominance,
                 right.dominance);
-            pcm_close(input);
+            ivrdroid::AuditEvent("digit", gAuditBlock, std::string(1, digit));
+            ivrdroid::CloseSessionCapture(input);
             return {DtmfResultKind::Digit, digit};
         }
 
         if ((frame + 1) % kDtmfCallCheckFrames == 0 &&
             !IsAudioInCall()) {
-            pcm_close(input);
+            ivrdroid::CloseSessionCapture(input);
             const ivrdroid::CallDisposition disposition =
                 ReadLiveCallState();
             if (disposition == ivrdroid::CallDisposition::Idle) {
@@ -2420,9 +2434,10 @@ DtmfResult CaptureDtmfDigit(int guardianFd, uint32_t timeoutMilliseconds = 8000)
         }
     }
 
-    pcm_close(input);
+    ivrdroid::CloseSessionCapture(input);
     if (gStopRequested) return {DtmfResultKind::Stopped, 0};
     Log(ANDROID_LOG_INFO, "Caller DTMF wait timed out.");
+    ivrdroid::AuditEvent("timeout", gAuditBlock);
     return {DtmfResultKind::Timeout, 0};
 }
 
@@ -2512,7 +2527,7 @@ DtmfResult CaptureDtmfDigitWithPrompt(
     captureConfig.period_size = kDtmfFrameCount;
     captureConfig.period_count = kDtmfPeriodCount;
     captureConfig.format = PCM_FORMAT_S16_LE;
-    pcm* input = pcm_open(
+    ivrdroid::SessionCapture* input = ivrdroid::OpenSessionCapture(
         gProfile->card,
         gProfile->captureDevice,
         PCM_IN,
@@ -2528,8 +2543,9 @@ DtmfResult CaptureDtmfDigitWithPrompt(
                 ? ivrdroid::TerminateAndReapChildProcess(&playbackChild)
                 : false;
         }
+        if (terminatePlayback) ivrdroid::EndAuditPrompt();
         if (input != nullptr) {
-            pcm_close(input);
+            ivrdroid::CloseSessionCapture(input);
             input = nullptr;
         }
         const bool restored = !routeApplied ||
@@ -2539,11 +2555,11 @@ DtmfResult CaptureDtmfDigitWithPrompt(
         return childClean && restored && guardianIdle;
     };
 
-    if (input == nullptr || !pcm_is_ready(input) || pcm_start(input) != 0) {
+    if (input == nullptr || !ivrdroid::SessionCaptureReady(input) || ivrdroid::StartSessionCapture(input) != 0) {
         Log(
             ANDROID_LOG_ERROR,
             "Cannot start interruptible DTMF capture PCM: %s",
-            input == nullptr ? "null handle" : pcm_get_error(input));
+            input == nullptr ? "null handle" : ivrdroid::SessionCaptureError(input));
         cleanup(true);
         return {DtmfResultKind::CaptureError, 0};
     }
@@ -2593,13 +2609,13 @@ DtmfResult CaptureDtmfDigitWithPrompt(
 
     while (!gStopRequested) {
         const int framesRead =
-            pcm_readi(input, samples.data(), kDtmfFrameCount);
+            ivrdroid::ReadSessionCapture(input, samples.data(), kDtmfFrameCount);
         if (framesRead != static_cast<int>(kDtmfFrameCount)) {
             Log(
                 ANDROID_LOG_ERROR,
                 "Interruptible DTMF PCM read failed or returned %d frames: %s",
                 framesRead,
-                pcm_get_error(input));
+                ivrdroid::SessionCaptureError(input));
             cleanup(true);
             return {DtmfResultKind::CaptureError, 0};
         }
@@ -2625,6 +2641,7 @@ DtmfResult CaptureDtmfDigitWithPrompt(
                 right.confidence,
                 left.dominance,
                 right.dominance);
+            ivrdroid::AuditEvent(configuredDigits.count(digit) ? "digit" : "invalid", gAuditBlock, std::string(1, digit));
             if (attemptPolicy.ObserveDigit(digit) ==
                 ivrdroid::PromptDigitDecision::Accept) {
                 if (!cleanup(attemptPolicy.promptPlaying())) {
@@ -2680,6 +2697,7 @@ DtmfResult CaptureDtmfDigitWithPrompt(
                 return {DtmfResultKind::CaptureError, 0};
             }
             Log(ANDROID_LOG_INFO, "Caller DTMF wait timed out after prompt playback.");
+            ivrdroid::AuditEvent("timeout", gAuditBlock);
             return {DtmfResultKind::Timeout, 0};
         }
     }
@@ -2893,7 +2911,7 @@ bool PlayBuiltInRecordingBeep() {
     config.format = PCM_FORMAT_S16_LE;
     config.start_threshold = config.period_size;
     config.stop_threshold = config.period_size * config.period_count;
-    pcm* output = pcm_open(gProfile->card, gProfile->playbackDevice, PCM_OUT, &config);
+    pcm* output = pcm_open(gProfile->card, gProfile->playbackDevice, PCM_OUT | PCM_MONOTONIC, &config);
     if (output == nullptr || !pcm_is_ready(output)) {
         if (output != nullptr) pcm_close(output);
         return false;
@@ -2902,6 +2920,8 @@ bool PlayBuiltInRecordingBeep() {
     constexpr double pi = 3.14159265358979323846;
     std::vector<int16_t> samples(config.period_size * 2);
     uint32_t written = 0;
+    ivrdroid::BeginAuditPrompt();
+    ivrdroid::AuditEvent("prompt", gAuditBlock, "beep");
     bool success = true;
     while (written < totalFrames && !gStopRequested) {
         const uint32_t frames = std::min<uint32_t>(config.period_size, totalFrames - written);
@@ -2916,10 +2936,12 @@ bool PlayBuiltInRecordingBeep() {
             success = false;
             break;
         }
+        ivrdroid::TapAuditPrompt(output, samples.data(), frames);
         written += frames;
     }
     if (success && !gStopRequested) pcm_wait(output, 1000);
     pcm_close(output);
+    ivrdroid::EndAuditPrompt();
     return success && written == totalFrames && !gStopRequested;
 }
 
@@ -3629,6 +3651,7 @@ ExternalCallExecutionResult ExecuteExternalCall(
         return true;
     };
     WriteCurrentState(CurrentState::CallingOperator);
+    ivrdroid::AuditEvent("external_call", instruction.blockId, "dialing");
     if (!NotifyGuardian(guardianFd, kGuardianOwnedDialing) ||
         !PublishCallControlRequest(request)) {
         return {ExternalCallExecutionKind::Failed};
@@ -3640,7 +3663,7 @@ ExternalCallExecutionResult ExecuteExternalCall(
     captureConfig.period_size = kDtmfFrameCount;
     captureConfig.period_count = kDtmfPeriodCount;
     captureConfig.format = PCM_FORMAT_S16_LE;
-    pcm* input = nullptr;
+    ivrdroid::SessionCapture* input = nullptr;
     ConversationSegment segment;
     std::vector<ConversationFinalizer> finalizers;
     std::vector<int16_t> samples(kDtmfFrameCount * 2);
@@ -3659,24 +3682,24 @@ ExternalCallExecutionResult ExecuteExternalCall(
     const auto startRecorder = [&]() {
         if (input != nullptr) return true;
         if (!ConversationStorageAvailable()) return false;
-        input = pcm_open(
+        input = ivrdroid::OpenSessionCapture(
             gProfile->card,
             gProfile->captureDevice,
             PCM_IN,
             &captureConfig);
-        if (input == nullptr || !pcm_is_ready(input)) {
-            if (input != nullptr) pcm_close(input);
+        if (input == nullptr || !ivrdroid::SessionCaptureReady(input)) {
+            if (input != nullptr) ivrdroid::CloseSessionCapture(input);
             input = nullptr;
             RemoveConversationSegment(&segment);
             return false;
         }
-        const int framesRead = pcm_readi(
+        const int framesRead = ivrdroid::ReadSessionCapture(
             input,
             samples.data(),
             kDtmfFrameCount);
         if (framesRead != static_cast<int>(kDtmfFrameCount) ||
             !policy.MarkRecorderReady(MonotonicMilliseconds())) {
-            pcm_close(input);
+            ivrdroid::CloseSessionCapture(input);
             input = nullptr;
             return false;
         }
@@ -3710,6 +3733,7 @@ ExternalCallExecutionResult ExecuteExternalCall(
         }
         if (decision != ivrdroid::ExternalCallDecision::Duplicate &&
             decision != ivrdroid::ExternalCallDecision::IgnoredForeign) {
+            ivrdroid::AuditEvent("external_call", instruction.blockId, ivrdroid::call_control::ToString(status.kind));
             const char phase = policy.stage() == ivrdroid::ExternalCallStage::Conferenced
                 ? kGuardianOwnedConference
                 : kGuardianOwnedDialing;
@@ -3738,7 +3762,7 @@ ExternalCallExecutionResult ExecuteExternalCall(
             if (!recorderReady || input == nullptr ||
                 !ivrdroid::AllowsConversationPersistenceStart(policy.stage()) ||
                 !OpenConversationSegment(recordingUuid, 0, &segment) ||
-                pcm_readi(input, samples.data(), kDtmfFrameCount) !=
+                ivrdroid::ReadSessionCapture(input, samples.data(), kDtmfFrameCount) !=
                     static_cast<int>(kDtmfFrameCount) ||
                 !WriteConversationFrames(
                     &segment,
@@ -3826,7 +3850,7 @@ ExternalCallExecutionResult ExecuteExternalCall(
             usleep(50'000);
             continue;
         }
-        const int framesRead = pcm_readi(
+        const int framesRead = ivrdroid::ReadSessionCapture(
             input,
             samples.data(),
             kDtmfFrameCount);
@@ -3885,7 +3909,7 @@ ExternalCallExecutionResult ExecuteExternalCall(
                 finalPartial = true;
                 break;
             }
-            const int primeFrames = pcm_readi(
+            const int primeFrames = ivrdroid::ReadSessionCapture(
                 input,
                 samples.data(),
                 kDtmfFrameCount);
@@ -3929,7 +3953,7 @@ ExternalCallExecutionResult ExecuteExternalCall(
     }
 
     if (input != nullptr) {
-        pcm_close(input);
+        ivrdroid::CloseSessionCapture(input);
         input = nullptr;
     }
     if (conferenceStartedAt > 0) {
@@ -4110,10 +4134,10 @@ RecordingCaptureResult CaptureRecordingMessage(
     config.period_size = kDtmfFrameCount;
     config.period_count = kDtmfPeriodCount;
     config.format = PCM_FORMAT_S16_LE;
-    pcm* input = pcm_open(gProfile->card, gProfile->captureDevice, PCM_IN, &config);
-    if (input == nullptr || !pcm_is_ready(input) ||
+    ivrdroid::SessionCapture* input = ivrdroid::OpenSessionCapture(gProfile->card, gProfile->captureDevice, PCM_IN, &config);
+    if (input == nullptr || !ivrdroid::SessionCaptureReady(input) ||
         !NotifyGuardian(guardianFd, kGuardianRecording)) {
-        if (input != nullptr) pcm_close(input);
+        if (input != nullptr) ivrdroid::CloseSessionCapture(input);
         close(fd);
         unlink(temporary.c_str());
         return {RecordingCaptureKind::Failed, nullptr};
@@ -4121,7 +4145,7 @@ RecordingCaptureResult CaptureRecordingMessage(
 
     char capturedAt[32] = {};
     if (!CurrentUtcTimestamp(capturedAt, sizeof(capturedAt))) {
-        pcm_close(input);
+        ivrdroid::CloseSessionCapture(input);
         close(fd);
         unlink(temporary.c_str());
         return {RecordingCaptureKind::Failed, nullptr};
@@ -4149,7 +4173,7 @@ RecordingCaptureResult CaptureRecordingMessage(
         return true;
     };
     while (capturedFrames < maximumFrames && !gStopRequested) {
-        const int framesRead = pcm_readi(input, samples.data(), kDtmfFrameCount);
+        const int framesRead = ivrdroid::ReadSessionCapture(input, samples.data(), kDtmfFrameCount);
         if (framesRead != static_cast<int>(kDtmfFrameCount)) {
             writeOk = false;
             break;
@@ -4178,6 +4202,7 @@ RecordingCaptureResult CaptureRecordingMessage(
                     maximumFrames,
                     ivrdroid::RecordingCallEvent::Active) ==
                 ivrdroid::RecordingStopDecision::FinishKey) {
+                ivrdroid::AuditEvent("digit", instruction.blockId, std::string(1, digit));
                 pending.clear();
                 stopReason = "finish_key";
                 break;
@@ -4213,7 +4238,7 @@ RecordingCaptureResult CaptureRecordingMessage(
             break;
         }
     }
-    pcm_close(input);
+    ivrdroid::CloseSessionCapture(input);
 
     if (result == RecordingCaptureKind::Completed ||
         result == RecordingCaptureKind::HangupFinalized) {
@@ -4761,12 +4786,14 @@ void StopCallMonitor(CallMonitor* monitor) {
     CallMonitor* callMonitor,
     LastResult result,
     bool stopWorker) {
+    ivrdroid::StopSessionAudio("preempted");
     if (stopWorker) kill(workerPid, SIGKILL);
     CleanupPartialRecordings();
     StopCallMonitor(callMonitor);
     CloseMixerRoute(privacyRoute);
     const bool released = ReleaseSessionForPreemption(result);
     close(controlFd);
+    ivrdroid::DrainSessionAudioWorkers();
     _exit(released ? 0 : 1);
 }
 
@@ -4777,12 +4804,14 @@ void StopCallMonitor(CallMonitor* monitor) {
     CallMonitor* callMonitor,
     LastResult failureResult,
     bool stopWorker) {
+    ivrdroid::StopSessionAudio(failureResult == LastResult::RemoteHangup ? "caller_hangup" : "interrupted");
     if (stopWorker) kill(workerPid, SIGKILL);
     CleanupPartialRecordings();
     StopCallMonitor(callMonitor);
     CloseMixerRoute(privacyRoute);
     const bool recovered = RecoverAndEndFailedSession(failureResult);
     close(controlFd);
+    ivrdroid::DrainSessionAudioWorkers();
     _exit(recovered ? 0 : 1);
 }
 
@@ -4900,6 +4929,7 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
     };
 
     while (true) {
+        ivrdroid::SuperviseSessionAudioWorkers();
         const int64_t now = MonotonicMilliseconds();
         const int64_t nextDeadline = std::min(
             totalBudget.deadlineMilliseconds(),
@@ -5172,9 +5202,11 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
         }
 
         if (phase == kGuardianDone) {
+            ivrdroid::StopSessionAudio("session_complete");
             StopCallMonitor(&callMonitor);
             CloseMixerRoute(&privacyRoute);
             close(controlFd);
+            ivrdroid::DrainSessionAudioWorkers();
             _exit(0);
         }
         if (phase == kGuardianRemoteHangup) {
@@ -5345,6 +5377,7 @@ bool StartSessionGuardian(SessionGuardian* guardian) {
     }
     if (child == 0) {
         close(descriptors[1]);
+        ivrdroid::SpawnSessionAudioWorkers();
         GuardianProcess(descriptors[0], workerPid);
     }
 
@@ -5605,6 +5638,22 @@ void AppendRuntimeTrace(
     unsigned int* traceCount,
     const ivrdroid::RevisionInstruction& instruction,
     const std::string& event = "") {
+    const char* type = "prompt";
+    switch (instruction.type) {
+        case ivrdroid::RevisionInstructionType::PlayPrompt: type = "prompt"; break;
+        case ivrdroid::RevisionInstructionType::CollectDigit: type = event == "timeout" ? "timeout" : event == "invalid" ? "invalid" : "digit"; break;
+        case ivrdroid::RevisionInstructionType::ScheduleBranch: type = "schedule"; break;
+        case ivrdroid::RevisionInstructionType::ReturnToMenu: type = "return"; break;
+        case ivrdroid::RevisionInstructionType::RecordMessage: type = "voicemail"; break;
+        case ivrdroid::RevisionInstructionType::ExternalCall: type = "external_call"; break;
+        case ivrdroid::RevisionInstructionType::EndCall: type = "ended"; break;
+    }
+    // Playback and DTMF are timestamped at the audio boundary, not again in the trace.
+    if (instruction.type != ivrdroid::RevisionInstructionType::PlayPrompt &&
+        instruction.type != ivrdroid::RevisionInstructionType::EndCall &&
+        (instruction.type != ivrdroid::RevisionInstructionType::CollectDigit || event == "invalid")) {
+        ivrdroid::AuditEvent(type, instruction.blockId, event);
+    }
     constexpr unsigned int kMaximumTraceSteps = 64;
     if (*traceCount >= kMaximumTraceSteps) return;
     std::string token = instruction.blockId;
@@ -5656,6 +5705,7 @@ SessionOutcome RunConfiguredProgramV2(
         const ivrdroid::RevisionInstruction* instruction =
             config.FindInstruction(current);
         if (instruction == nullptr) return SessionOutcome::AudioFailure;
+        gAuditBlock = instruction->blockId;
 
         switch (instruction->type) {
             case ivrdroid::RevisionInstructionType::PlayPrompt: {
@@ -5767,6 +5817,7 @@ SessionOutcome RunConfiguredProgramV2(
                 break;
             }
             case ivrdroid::RevisionInstructionType::RecordMessage: {
+                ivrdroid::AuditEvent("voicemail", instruction->blockId, "start");
                 const RecordingCaptureResult recording = CaptureRecordingMessage(
                     callUuid,
                     revisionId,
@@ -6097,8 +6148,11 @@ bool ProcessOneCommand() {
     }
 
     Log(ANDROID_LOG_INFO, "Accepted START_MENU from app UID %u.", gAppUid);
+    gAuditBlock.clear();
+    ivrdroid::PrepareSessionAudio(request.callUuid, gAppUid, gProfile->card, gProfile->captureDevice);
     SessionGuardian guardian;
     if (!StartSessionGuardian(&guardian)) {
+        ivrdroid::ReleaseSessionAudio();
         Log(ANDROID_LOG_ERROR, "Could not start the session guardian.");
         WriteLastResult(LastResult::FailedAudio);
         WriteCurrentState(CurrentState::Error);
@@ -6134,8 +6188,12 @@ bool ProcessOneCommand() {
             break;
     }
 
+    ivrdroid::StopSessionAudio(outcome == SessionOutcome::Complete ? "session_complete" :
+        outcome == SessionOutcome::RemoteHangup ? "caller_hangup" : "interrupted");
     const bool guardianSucceeded =
         FinishSessionGuardian(&guardian, guardianResult);
+    ivrdroid::ReleaseSessionAudio();
+    ivrdroid::RecoverAuditRecordings(gAppUid);
     DiscardRequestQueuedWhileBusy();
     if (!guardianSucceeded) {
         Log(ANDROID_LOG_ERROR, "Session recovery did not complete cleanly.");
@@ -6341,6 +6399,7 @@ int Serve() {
         close(lockFd);
         return 16;
     }
+    ivrdroid::RecoverAuditRecordings(gAppUid);
     if (!WaitForSystemReady()) {
         unlink(kPidPath);
         close(lockFd);
@@ -6371,7 +6430,15 @@ int Serve() {
         gProfile->id);
 
     alignas(inotify_event) char events[4096] = {};
+    int64_t lastAuditRecovery = MonotonicMilliseconds();
     while (!gStopRequested) {
+        if (ReadLiveCallState() == ivrdroid::CallDisposition::Idle && ReadAudioModeState() == AudioModeState::Normal) {
+            ivrdroid::RefreshAuditPolicy(gAppUid);
+            if (MonotonicMilliseconds() - lastAuditRecovery >= 30000) {
+                ivrdroid::RecoverAuditRecordings(gAppUid);
+                lastAuditRecovery = MonotonicMilliseconds();
+            }
+        }
         const bool processed = ProcessOneCommand();
         if (gStopRequested) break;
         if (processed && !WaitForSystemReady()) break;
@@ -6454,6 +6521,10 @@ int main(int argc, char** argv) {
     signal(SIGTERM, HandleSignal);
     signal(SIGHUP, HandleSignal);
 
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+        std::printf("IVRdroid helper %s source=%s\n", kHelperVersion, kSourceCommit);
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--serve") == 0) {
         return Serve();
     }
@@ -6461,6 +6532,6 @@ int main(int argc, char** argv) {
         return SelfTest();
     }
 
-    std::fprintf(stderr, "usage: %s --serve | --self-test\n", argv[0]);
+    std::fprintf(stderr, "usage: %s --serve | --self-test | --version\n", argv[0]);
     return 2;
 }

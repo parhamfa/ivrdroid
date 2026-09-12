@@ -383,6 +383,7 @@ def _recording_response(request: Request, recording: Recording, call: CallRecord
         block_id=recording.block_id,
         sequence=recording.sequence,
         kind=recording.kind,
+        audit_metadata=recording.audit_metadata,
         operator_masked=mask_phone(operator) if operator else "",
         segment_count=recording.segment_count,
         caller=caller,
@@ -418,12 +419,19 @@ def list_recordings(
     unread: bool | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
+    kind: str | None = Query(default=None, pattern="^(voicemail|conversation|session_audit|all)$"),
     _: str = Depends(require_admin),
     session: Session = Depends(get_session),
 ) -> RecordingListResponse:
     _apply_retention(request, session)
     statement = select(Recording).where(Recording.status != "deleted")
     count_statement = select(func.count()).select_from(Recording).where(Recording.status != "deleted")
+    if kind is None:
+        statement = statement.where(Recording.kind != "session_audit")
+        count_statement = count_statement.where(Recording.kind != "session_audit")
+    elif kind != "all":
+        statement = statement.where(Recording.kind == kind)
+        count_statement = count_statement.where(Recording.kind == kind)
     if unread is True:
         statement = statement.where(Recording.listened_at.is_(None))
         count_statement = count_statement.where(Recording.listened_at.is_(None))
@@ -489,7 +497,7 @@ def _audio_response(
         raise HTTPException(status_code=404, detail="Recording not found")
     if recording.status != "ready":
         raise HTTPException(status_code=409, detail="Recording audio is not ready")
-    if recording.kind == "conversation":
+    if recording.kind in {"conversation", "session_audit"}:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".playback-",
             suffix=".mp3",
@@ -515,7 +523,7 @@ def _audio_response(
         }
         if download:
             headers["Content-Disposition"] = (
-                f'attachment; filename="conversation-{recording.id}.mp3"'
+                f'attachment; filename="{recording.kind}-{recording.id}.mp3"'
             )
         return FileResponse(
             temporary,

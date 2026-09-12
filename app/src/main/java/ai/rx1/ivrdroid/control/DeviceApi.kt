@@ -83,13 +83,28 @@ class DeviceApi(private val enrollment: Enrollment? = null) {
         null,
     )
 
-    fun uploadRecordingChunk(recording: PendingRecording, offset: Long, content: ByteArray): JSONObject {
+    fun auditJson(method: String, suffix: String, body: JSONObject? = null): JSONObject {
+        require(suffix.matches(Regex("(?:/[0-9a-f-]{36}(?:/segments/[0-9]{1,4})?(?:/complete)?)?")))
+        if (CallRuntimeState.isBusy()) error("Call started; audit upload paused.")
+        return authenticatedJson(method, "/api/device/v1/session-recordings$suffix", body)
+    }
+
+    fun uploadAuditChunk(segmentPath: String, offset: Long, content: ByteArray): JSONObject {
+        require(segmentPath.matches(Regex("/[0-9a-f-]{36}/segments/[0-9]{1,4}")))
+        return uploadChunk("/api/device/v1/session-recordings$segmentPath/content", offset, content)
+    }
+
+    fun uploadRecordingChunk(recording: PendingRecording, offset: Long, content: ByteArray): JSONObject = uploadChunk(
+        RecordingApiPaths.segment(recording)?.plus("/content")
+            ?: "/api/device/v1/recordings/${recording.recordingId}/content", offset, content,
+    )
+
+    private fun uploadChunk(path: String, offset: Long, content: ByteArray): JSONObject {
         require(offset >= 0 && content.isNotEmpty() && content.size <= 1024 * 1024)
         if (CallRuntimeState.isBusy()) error("Call started; synchronization paused.")
         val connection = open(
             enrollment!!.serverUrl,
-            RecordingApiPaths.segment(recording)?.plus("/content")
-                ?: "/api/device/v1/recordings/${recording.recordingId}/content",
+            path,
             "PUT",
             true,
         )

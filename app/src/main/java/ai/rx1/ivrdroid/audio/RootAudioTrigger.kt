@@ -139,11 +139,13 @@ object RootAudioTrigger {
                 HelperProtocol.MAXIMUM_SESSION_PATH_BYTES,
             ).split('>').take(64).filter { it.matches(LEGACY_TRACE) || it.matches(V2_TRACE) || it == "builtin" },
             helperVersion = readBoundedFile(File(directory, HELPER_VERSION_NAME)),
+            sourceCommit = readBoundedFile(File(directory, "helper_source_commit")),
             recordingCapable = capabilities.recordingCapable,
             runtimeVersions = capabilities.runtimeVersions,
             callControlCapable = capabilities.callControlCapable,
             conversationRecordingCapable = capabilities.conversationRecordingCapable,
             promptBargeInCapable = capabilities.promptBargeInCapable,
+            sessionAuditCapable = capabilities.sessionAuditCapable,
         )
     }
 

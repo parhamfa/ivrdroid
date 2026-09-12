@@ -7,6 +7,7 @@ import android.telecom.Call
 import android.telecom.InCallService
 import android.telecom.TelecomManager
 import android.util.Log
+import ai.rx1.ivrdroid.control.SessionAuditHandoffWorker
 import ai.rx1.ivrdroid.audio.RootAudioTrigger
 import ai.rx1.ivrdroid.telecom.external.AndroidTelecomControl
 import ai.rx1.ivrdroid.telecom.external.ExternalCallCoordinator
@@ -21,6 +22,7 @@ class PrivilegedInCallService : InCallService() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var telecom: AndroidTelecomControl
     private lateinit var coordinator: ExternalCallCoordinator
+    private lateinit var auditWorker: SessionAuditHandoffWorker
     private lateinit var handoffWorker: ConversationHandoffWorker
     private var running = false
     private val poll = object : Runnable {
@@ -48,6 +50,8 @@ class PrivilegedInCallService : InCallService() {
             coordinator.recordingHandoffFailed(identity, elapsedMs)
         }
         handoffWorker.start()
+        auditWorker = SessionAuditHandoffWorker(this)
+        auditWorker.start()
         instance = WeakReference(this)
         running = true
         handler.post(poll)
@@ -66,6 +70,7 @@ class PrivilegedInCallService : InCallService() {
     override fun onDestroy() {
         running = false
         handoffWorker.stopAfterFinalizerDrain()
+        auditWorker.stopAfterFinalizerDrain()
         handler.removeCallbacksAndMessages(null)
         telecom.close()
         if (instance?.get() === this) instance = null

@@ -1,6 +1,7 @@
 import type {
   AuditRecord,
   CallRecord,
+  SessionAuditSettings,
   Device,
   DraftConfiguration,
   FlowDiff,
@@ -115,6 +116,11 @@ export const api = {
   revokeDevice: (deviceId: string) =>
     request<Device>(`/api/admin/v1/devices/${deviceId}/revoke`, { method: "POST" }),
   calls: () => request<CallRecord[]>("/api/admin/v1/calls"),
+  call: (id: string) => request<CallRecord>(`/api/admin/v1/calls/${encodeURIComponent(id)}`),
+  sessionAuditSettings: () => request<SessionAuditSettings>("/api/admin/v1/audit-recording-settings"),
+  saveSessionAuditSettings: (enabled: boolean, localQuotaBytes: number) => request<SessionAuditSettings>("/api/admin/v1/audit-recording-settings", {
+    method: "PUT", body: JSON.stringify({ enabled, local_quota_bytes: localQuotaBytes }),
+  }),
   recordings: (unread = false, page = 1, pageSize = 50) => {
     const query = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
     if (unread) query.set("unread", "true");

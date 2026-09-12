@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from .audit_settings import acknowledge_policy, router as audit_settings_router, signed_policy, validate_call_report
+from .session_audit_api import router as session_audit_router
+from .release import VERSION, SOURCE_COMMIT
+
 import asyncio
 import base64
 import json
@@ -228,7 +232,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="IVRdroid API",
-        version="4.0.0",
+        version=VERSION,
         docs_url=None if configured.environment == "production" else "/docs",
         redoc_url=None,
         lifespan=lifespan,
@@ -248,11 +252,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(ntfy_settings_router)
     app.include_router(recording_device_router)
     app.include_router(conversation_recording_device_router)
+    app.include_router(audit_settings_router)
+    app.include_router(session_audit_router)
 
     @app.get("/health")
     def health(session: Session = Depends(get_session)) -> dict:
         session.execute(select(1))
-        return {"status": "ok", "service": "ivrdroid-api"}
+        return {"status": "ok", "service": "ivrdroid-api", "version": VERSION, "source_commit": SOURCE_COMMIT}
 
     @app.get("/source", include_in_schema=False)
     def source() -> RedirectResponse:
@@ -808,6 +814,40 @@ def revoke_device(
     return _device_document(device)
 
 
+def call_audit_summary(request: Request, call: CallRecord, recording: Recording | None, *, include_events: bool = False) -> dict | None:
+    from .recording_api import _recording_response
+    report = dict((recording.audit_metadata if recording else call.session_audit) or {})
+    if not report and recording is None:
+        return None
+    if not include_events:
+        report.pop("events", None)
+    if recording is not None:
+        metadata = _recording_response(request, recording, call).model_dump(mode="json")
+        metadata.pop("audit_metadata", None)
+        report.update(state=recording.status, recording=metadata)
+    return report
+
+
+@admin_router.get("/calls/{call_id}")
+def call_detail(call_id: str, request: Request, _: str = Depends(require_admin), session: Session = Depends(get_session)) -> dict:
+    from .recording_api import _recording_response
+    call = session.get(CallRecord, call_id)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Call not found")
+    caller = request.app.state.cipher.decrypt(call.caller_encrypted) if call.caller_encrypted else None
+    recordings = session.scalars(select(Recording).where(Recording.call_id == call.id, Recording.kind != "session_audit")).all()
+    return {
+        "id": call.id, "device_id": call.device_id, "started_at": call.started_at,
+        "caller": caller, "caller_masked": mask_phone(caller), "policy_decision": call.policy_decision,
+        "revision_id": call.revision_id, "menu_path": call.menu_path, "result": call.result,
+        "duration_seconds": call.duration_seconds, "events": call.events,
+        "session_audit": call_audit_summary(request, call, session.scalar(select(Recording).where(Recording.call_id == call.id, Recording.kind == "session_audit")), include_events=True),
+        "recording_count": sum(r.status == "ready" for r in recordings),
+        "pending_recording_count": sum(r.status in {"uploading", "processing"} for r in recordings),
+        "recordings": [_recording_response(request, r, call).model_dump(mode="json") for r in recordings],
+    }
+
+
 @admin_router.get("/calls", response_model=list[CallResponse])
 def list_calls(
     request: Request,
@@ -828,10 +868,11 @@ def list_calls(
                     Recording.status.in_(["uploading", "processing"]).cast(Integer),
                 ),
             )
-            .where(Recording.call_id.in_(call_ids), Recording.status != "deleted")
+            .where(Recording.call_id.in_(call_ids), Recording.status != "deleted", Recording.kind != "session_audit")
             .group_by(Recording.call_id),
         ):
             counts[call_id] = (int(total or 0), int(pending or 0))
+    audit_recordings = {r.call_id: r for r in session.scalars(select(Recording).where(Recording.call_id.in_(call_ids), Recording.kind == "session_audit"))}
     response: list[CallResponse] = []
     for call in calls:
         caller = None
@@ -850,6 +891,7 @@ def list_calls(
                 result=call.result,
                 duration_seconds=call.duration_seconds,
                 events=call.events or [],
+                session_audit=call_audit_summary(request, call, audit_recordings.get(call.id)),
                 recording_count=counts.get(call.id, (0, 0))[0],
                 pending_recording_count=counts.get(call.id, (0, 0))[1],
             ),
@@ -972,6 +1014,7 @@ def sync_device(
     device: Device = Depends(require_device),
     session: Session = Depends(get_session),
 ) -> DeviceSyncResponse:
+    acknowledge_policy(session, device, body.status)
     device.app_version = body.app_version
     device.helper_version = body.helper_version
     device.status = body.status.model_dump(mode="json")
@@ -980,6 +1023,7 @@ def sync_device(
     session.commit()
     background_tasks.add_task(run_ntfy_watch, request.app)
     return DeviceSyncResponse(
+        audit_policy=signed_policy(request, session),
         server_time=utcnow(),
         desired_revision_id=device.desired_revision_id,
         active_revision_id=device.active_revision_id,
@@ -1079,6 +1123,8 @@ def upload_events(
     accepted: list[str] = []
     pending_notifications: list[tuple[str, dict]] = []
     for call in body.calls:
+        validate_call_report(session, call.session_audit, call.result, device.id)
+        audit_document = call.session_audit.model_dump(mode="json") if call.session_audit else None
         event_documents = [event.model_dump(mode="json") for event in call.events]
         existing = session.get(CallRecord, call.call_id)
         notify = False
@@ -1090,8 +1136,15 @@ def upload_events(
                 existing.result = call.result
                 existing.duration_seconds = call.duration_seconds
                 existing.events = event_documents
+                existing.session_audit = audit_document
                 existing.received_at = utcnow()
                 notify = True
+            elif audit_document is not None and existing.session_audit is None:
+                # A durable audit finalizer may finish after the terminal call event.
+                validate_call_report(session, call.session_audit, existing.result, device.id)
+                existing.session_audit = audit_document
+            elif audit_document is not None and existing.session_audit != audit_document:
+                raise HTTPException(status_code=409, detail="A terminal audit report cannot be replaced")
             accepted.append(call.call_id)
         else:
             caller_encrypted = request.app.state.cipher.encrypt(call.caller) if call.caller else None
@@ -1108,6 +1161,7 @@ def upload_events(
                     result=call.result,
                     duration_seconds=call.duration_seconds,
                     events=event_documents,
+                    session_audit=audit_document,
                 ),
             )
             accepted.append(call.call_id)

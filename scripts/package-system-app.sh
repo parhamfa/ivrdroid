@@ -29,4 +29,7 @@ unzip -p "$PACKAGE" customize.sh | cmp - "$REPO_DIR/app/magisk/customize.sh"
 unzip -p "$PACKAGE" \
     system/etc/permissions/privapp-permissions-ai.rx1.ivrdroid.xml \
     | cmp - "$REPO_DIR/app/magisk/privapp-permissions-ai.rx1.ivrdroid.xml"
+unzip -p "$PACKAGE" \
+    system/etc/sysconfig/ai.rx1.ivrdroid.xml \
+    | cmp - "$REPO_DIR/app/magisk/sysconfig-ai.rx1.ivrdroid.xml"
 shasum -a 256 "$APK" "$PACKAGE"

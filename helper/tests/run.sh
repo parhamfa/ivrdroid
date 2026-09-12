@@ -22,6 +22,10 @@ compile_test() {
 }
 
 compile_test \
+    audit_policy_test \
+    "$HELPER_DIR/src/audit_policy.cpp" \
+    "$TEST_DIR/audit_policy_test.cpp"
+compile_test \
     call_control_protocol_test \
     "$HELPER_DIR/src/call_control_protocol.cpp" \
     "$TEST_DIR/call_control_protocol_test.cpp"
@@ -96,6 +100,7 @@ compile_test \
     "$HELPER_DIR/src/device_profile.cpp" \
     "$TEST_DIR/device_profile_test.cpp"
 
+"$BUILD_DIR/audit_policy_test"
 "$BUILD_DIR/call_control_protocol_test" \
     "$HELPER_DIR/../app/src/test/resources/call_control/dial_v1.txt" \
     "$HELPER_DIR/../app/src/test/resources/call_control/recorder_ready_v1.txt" \

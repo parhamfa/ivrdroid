@@ -9,11 +9,14 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    CheckConstraint,
+    Index,
     Integer,
     JSON,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -130,7 +133,26 @@ class CallRecord(Base):
     result: Mapped[str] = mapped_column(String(64), nullable=False)
     duration_seconds: Mapped[int] = mapped_column(Integer, default=0)
     events: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    session_audit: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SessionAuditPolicy(Base):
+    __tablename__ = "session_audit_policies"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    local_quota_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_by: Mapped[str] = mapped_column(String(320), nullable=False)
+
+
+class DeviceAuditPolicyAcknowledgement(Base):
+    __tablename__ = "device_audit_policy_acknowledgements"
+
+    device_id: Mapped[str] = mapped_column(ForeignKey("devices.id"), primary_key=True)
+    policy_version: Mapped[int] = mapped_column(ForeignKey("session_audit_policies.version"), primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class RecordingRetentionPolicy(Base):
@@ -147,15 +169,21 @@ class Recording(Base):
     __tablename__ = "recordings"
     __table_args__ = (
         UniqueConstraint("device_id", "call_id", "sequence", name="uq_recording_call_sequence"),
+        Index("uq_session_audit_call", "device_id", "call_id", unique=True,
+              postgresql_where=text("kind = 'session_audit'"), sqlite_where=text("kind = 'session_audit'")),
+        CheckConstraint("(kind = 'session_audit' AND block_id IS NULL) OR "
+                        "(kind IN ('voicemail', 'conversation') AND block_id IS NOT NULL AND revision_id IS NOT NULL)",
+                        name="ck_recording_identity"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     device_id: Mapped[str] = mapped_column(ForeignKey("devices.id"), nullable=False, index=True)
     call_id: Mapped[str] = mapped_column(ForeignKey("call_records.id"), nullable=False, index=True)
-    revision_id: Mapped[int] = mapped_column(ForeignKey("revisions.id"), nullable=False)
-    block_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    revision_id: Mapped[int | None] = mapped_column(ForeignKey("revisions.id"))
+    block_id: Mapped[str | None] = mapped_column(String(36))
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     kind: Mapped[str] = mapped_column(String(24), nullable=False, default="voicemail", index=True)
+    audit_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     operator_encrypted: Mapped[str | None] = mapped_column(Text)
     operator_last4: Mapped[str] = mapped_column(String(4), nullable=False, default="")
     segment_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

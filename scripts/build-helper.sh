@@ -33,6 +33,7 @@ cmake \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
     -DANDROID_ABI=arm64-v8a \
     -DANDROID_PLATFORM=android-23 \
+    -DIVRDROID_SOURCE_COMMIT="${IVRDROID_SOURCE_COMMIT:-unknown}" \
     -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD_DIR" --parallel
 

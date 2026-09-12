@@ -57,6 +57,7 @@ target_compile_options(ivrdroid_dtmf PRIVATE
 )
 
 add_library(ivrdroid_core STATIC
+    src/audit_policy.cpp
     src/call_control_protocol.cpp
     src/call_safety_policy.cpp
     src/child_process.cpp
@@ -86,8 +87,14 @@ target_compile_options(ivrdroid_core PRIVATE
 
 add_executable(ivrdroid-helper
     src/main.cpp
+    src/session_audio.cpp
 )
 
+set(IVRDROID_SOURCE_COMMIT "unknown" CACHE STRING "Release source commit")
+if(NOT IVRDROID_SOURCE_COMMIT MATCHES "^([0-9a-f]+|unknown)$")
+    message(FATAL_ERROR "Invalid source commit")
+endif()
+target_compile_definitions(ivrdroid-helper PRIVATE IVRDROID_SOURCE_COMMIT="${IVRDROID_SOURCE_COMMIT}")
 target_compile_options(ivrdroid-helper PRIVATE
     -Wall
     -Wextra
@@ -102,3 +109,13 @@ target_link_libraries(ivrdroid-helper PRIVATE
     log
     tinyalsa
 )
+
+option(IVRDROID_BUILD_AUDIO_HARNESS "Build an isolated synthetic PCM acceptance harness" OFF)
+if(IVRDROID_BUILD_AUDIO_HARNESS)
+    add_executable(ivrdroid-audio-harness tests/session_audio_harness.cpp)
+    target_include_directories(ivrdroid-audio-harness PRIVATE third_party/tinyalsa/include)
+    target_compile_definitions(ivrdroid-audio-harness PRIVATE
+        IVRDROID_AUDIT_BRIDGE="/data/local/tmp/ivrdroid-session-audit-tests")
+    target_compile_options(ivrdroid-audio-harness PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_link_libraries(ivrdroid-audio-harness PRIVATE ivrdroid_core)
+endif()

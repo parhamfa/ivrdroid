@@ -20,6 +20,9 @@ RUN pip install --no-cache-dir . \
     && chmod 0700 /data/recordings \
     && chmod 0755 /usr/local/bin/ivrdroid-entrypoint
 
+ARG SOURCE_COMMIT=unknown
+ENV IVRDROID_SOURCE_COMMIT=${SOURCE_COMMIT}
+LABEL org.opencontainers.image.version="0.9.0" org.opencontainers.image.revision=${SOURCE_COMMIT}
 EXPOSE 8000
 ENTRYPOINT ["ivrdroid-entrypoint"]
 CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=172.16.0.0/12"]

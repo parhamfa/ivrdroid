@@ -11,12 +11,15 @@ android {
         applicationId = "ai.rx1.ivrdroid"
         minSdk = 29
         targetSdk = 35
-        versionCode = 17
-        versionName = "0.8.6-dev"
+        versionCode = 18
+        versionName = "0.9.0"
 
         buildConfigField("String", "CONTROL_PLANE_URL", "\"https://ivrdroid.rx1.ai\"")
         buildConfigField("String", "CONFIG_SIGNING_PUBLIC_KEY_B64", "\"fz+JZNn34uWdo408TosUYVS162AusewBxkg2ip8Cnnw=\"")
-        testInstrumentationRunner = "android.app.Instrumentation"
+        val sourceCommit = providers.environmentVariable("IVRDROID_SOURCE_COMMIT").orNull
+            ?.takeIf { it.matches(Regex("[0-9a-f]{40}")) } ?: "unknown"
+        buildConfigField("String", "SOURCE_COMMIT", "\"$sourceCommit\"")
+        testInstrumentationRunner = "ai.rx1.ivrdroid.control.SessionAuditAcceptanceInstrumentation"
     }
 
     buildTypes {

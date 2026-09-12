@@ -7,6 +7,7 @@ import type { Recording } from "../types";
 
 function stopReason(reason: Recording["stop_reason"]): string {
   return {
+    session_complete: "Session complete", preempted: "Preempted", capture_failure: "Capture failure", storage_full: "Storage full", interrupted: "Interrupted", writer_failure: "Recording failure",
     finish_key: "Finish key",
     maximum_duration: "Time limit",
     caller_hangup: "Caller hung up",
@@ -15,7 +16,7 @@ function stopReason(reason: Recording["stop_reason"]): string {
   }[reason];
 }
 
-function recordingKind(recording: Recording): "voicemail" | "conversation" {
+function recordingKind(recording: Recording): "voicemail" | "conversation" | "session_audit" {
   return recording.kind ?? "voicemail";
 }
 

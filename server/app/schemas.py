@@ -561,6 +561,14 @@ class DeviceStatus(StrictModel):
     external_call_control_capable: bool = False
     conversation_recording_capable: bool = False
     prompt_barge_in_capable: bool = False
+    session_audit_capable: bool = False
+    audit_policy_version: int = Field(default=0, ge=0)
+    audit_enabled: bool = False
+    audit_spool_bytes: int = Field(default=0, ge=0)
+    audit_spool_count: int = Field(default=0, ge=0)
+    audit_last_error: str | None = Field(default=None, max_length=160)
+    helper_source_commit: str = Field(default="unknown", max_length=40)
+    source_commit: str = Field(default="unknown", max_length=40)
     call_control_protocol_version: int | None = Field(default=None, ge=1, le=2_147_483_647)
     call_control_state: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,79}$")
     call_control_recovery_pending: bool = False
@@ -593,6 +601,7 @@ class DeviceSyncRequest(StrictModel):
 
 
 class DeviceSyncResponse(StrictModel):
+    audit_policy: dict | None = None
     server_time: datetime
     desired_revision_id: int | None
     active_revision_id: int | None
@@ -649,7 +658,42 @@ class LegacyCallSubEvent(StrictModel):
 CallSubEvent = ExternalCallSubEvent | LegacyCallSubEvent
 
 
+class SessionAuditEvent(StrictModel):
+    offset_ms: int = Field(ge=0, le=86_400_000)
+    type: Literal["answered", "prompt", "digit", "timeout", "invalid", "schedule", "return", "voicemail", "external_call", "ended", "gap"]
+    block_id: str | None = Field(default=None, pattern=BLOCK_ID_PATTERN)
+    detail: str = Field(default="", max_length=80, pattern=r"^[A-Za-z0-9_ .:#/*-]*$")
+
+    @field_validator("detail")
+    @classmethod
+    def no_phone_number(cls, value: str) -> str:
+        if len("".join(c for c in value if c.isdigit())) >= 8:
+            raise ValueError("Audit events must not contain phone numbers")
+        return value
+
+
+class SessionAuditReport(StrictModel):
+    recording_id: UUID | None = None
+    policy_version: int = Field(ge=0)
+    state: Literal["disabled", "pending_upload", "unavailable"]
+    captured_at: datetime | None = None
+    duration_ms: int = Field(default=0, ge=0, le=86_400_000)
+    partial: bool = False
+    stop_reason: str = Field(default="", pattern=r"^[a-z_]{0,32}$")
+    events: list[SessionAuditEvent] = Field(default_factory=list, max_length=4096)
+
+    @model_validator(mode="after")
+    def valid_report(self):
+        if self.state == "pending_upload" and (self.recording_id is None or self.captured_at is None or self.duration_ms <= 0):
+            raise ValueError("Pending audio requires an identity, timestamp, and duration")
+        offsets = [item.offset_ms for item in self.events]
+        if offsets != sorted(offsets) or any(value > self.duration_ms + 1000 for value in offsets):
+            raise ValueError("Audit timeline is outside recording coverage or out of order")
+        return self
+
+
 class CallEventInput(StrictModel):
+    session_audit: SessionAuditReport | None = None
     call_id: str = Field(min_length=8, max_length=80)
     started_at: datetime
     caller: str | None = Field(default=None, pattern=r"^\+[1-9][0-9]{7,14}$")
@@ -679,6 +723,7 @@ class DeviceResponse(StrictModel):
 
 
 class CallResponse(StrictModel):
+    session_audit: dict | None = None
     id: str
     device_id: str
     started_at: datetime
@@ -751,6 +796,29 @@ class ConversationRecordingCompleteRequest(StrictModel):
     segment_count: int = Field(ge=1, le=65_536)
 
 
+class SessionAuditRecordingCreateRequest(StrictModel):
+    recording_id: UUID
+    call_id: UUID
+    policy_version: int = Field(ge=1)
+    captured_at: datetime
+
+
+class SessionAuditSegmentCreateRequest(SessionAuditRecordingCreateRequest):
+    kind: Literal["session_audit"]
+    segment_index: int = Field(ge=0, le=5759)
+    duration_ms: int = Field(gt=0, le=15_000)
+    stop_reason: Literal["segment_boundary", "session_complete", "caller_hangup", "preempted", "capture_failure", "storage_full", "interrupted", "writer_failure"]
+    expected_size_bytes: int = Field(gt=44, le=3 * 1024**2)
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    partial: bool = False
+
+    @model_validator(mode="after")
+    def valid_segment(self):
+        if self.partial != (self.stop_reason not in {"segment_boundary", "session_complete", "caller_hangup"}):
+            raise ValueError("Partial coverage must match termination reason")
+        return self
+
+
 class ConversationRecordingUploadResponse(StrictModel):
     id: str
     status: Literal["uploading", "processing", "ready", "deleted", "failed"]
@@ -782,10 +850,11 @@ class RecordingResponse(StrictModel):
     id: str
     call_id: str
     device_id: str
-    revision_id: int
-    block_id: str
+    revision_id: int | None
+    block_id: str | None
     sequence: int
-    kind: Literal["voicemail", "conversation"] = "voicemail"
+    kind: Literal["voicemail", "conversation", "session_audit"] = "voicemail"
+    audit_metadata: dict | None = None
     operator_masked: str = ""
     segment_count: int = 0
     caller: str | None

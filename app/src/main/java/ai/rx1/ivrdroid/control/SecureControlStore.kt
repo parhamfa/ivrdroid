@@ -134,6 +134,9 @@ object SecureControlStore {
                             result = item.getString("result"),
                             durationSeconds = item.optInt("duration_seconds", 0),
                             events = CallEventPayload.decodeEvents(item.optJSONArray("events")),
+                            sessionAudit = item.optJSONObject("session_audit"),
+                            auditPolicyVersion = item.optLong("_audit_policy_version", 0).takeIf { it > 0 },
+                            auditQuotaBytes = item.optLong("_audit_quota_bytes", 0).takeIf { it > 0 },
                         ),
                     )
                 }
@@ -144,7 +147,9 @@ object SecureControlStore {
     private fun writeEvents(context: Context, events: List<PendingCallEvent>) {
         val array = JSONArray()
         events.forEach { event ->
-            array.put(CallEventPayload.encode(event).put("caller", event.caller ?: ""))
+            array.put(CallEventPayload.encode(event).put("caller", event.caller ?: "")
+                .put("_audit_policy_version", event.auditPolicyVersion ?: JSONObject.NULL)
+                .put("_audit_quota_bytes", event.auditQuotaBytes ?: JSONObject.NULL))
         }
         encrypt(context, KEY_EVENTS, array.toString())
     }

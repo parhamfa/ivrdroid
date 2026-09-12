@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<config>
+    <!-- Keep IVRdroid off Doze/App Standby so the idle sync path can run without a 15-minute
+         maintenance window. This is a power-save exemption only; it does not relax restricted
+         networking. -->
+    <allow-in-power-save package="ai.rx1.ivrdroid" />
+</config>

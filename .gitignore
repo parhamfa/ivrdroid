@@ -18,7 +18,7 @@ captures/
 /server/**/__pycache__/
 /server/var/
 /server/*.db
-/dashboard/node_modules/
+/dashboard/node_modules
 /dashboard/dist/
 /dashboard/*.tsbuildinfo
 /dashboard/vite.config.js

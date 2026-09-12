@@ -12,6 +12,7 @@ import android.telecom.VideoProfile
 import android.util.Log
 import ai.rx1.ivrdroid.audio.RootAudioTrigger
 import ai.rx1.ivrdroid.control.PendingCallEvent
+import ai.rx1.ivrdroid.control.SessionAuditSettings
 import ai.rx1.ivrdroid.control.SecureControlStore
 import ai.rx1.ivrdroid.telecom.external.OwnedCallRegistry
 import ai.rx1.ivrdroid.telecom.external.TelecomCallKey
@@ -182,9 +183,8 @@ class GatedCallScreeningService : CallScreeningService() {
         menuPath: List<String>,
     ) {
         val revision = RootAudioTrigger.readState(this).activeRevision
-        SecureControlStore.enqueueCall(
-            this,
-            PendingCallEvent(
+        val audit = SessionAuditSettings.applied(this)
+        val event = PendingCallEvent(
                 callId = callId,
                 startedAt = startedAt.toString(),
                 caller = decision.canonicalCaller,
@@ -193,8 +193,10 @@ class GatedCallScreeningService : CallScreeningService() {
                 menuPath = menuPath,
                 result = result.take(64),
                 durationSeconds = duration,
-            ),
-        )
+                auditPolicyVersion = audit.version.takeIf { audit.enabled && result != "STOCK_DIALER" },
+                auditQuotaBytes = audit.quotaBytes.takeIf { audit.enabled && result != "STOCK_DIALER" },
+            )
+        SecureControlStore.enqueueCall(this, event)
     }
 
     @Suppress("DEPRECATION")

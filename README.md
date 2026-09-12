@@ -6,6 +6,14 @@ a narrowly scoped native helper for the audited cellular audio path.
 
 The Android application ID is `ai.rx1.ivrdroid`.
 
+## Full-session auditing in 0.9.0
+
+Optional full-session recording covers answered IVR calls, including built-in fallback,
+voicemail and operator conversations. Settings controls it independently of flow publication;
+Call history provides playback and a seekable event timeline. Capture is shared, but audit
+persistence and failure handling are isolated from existing recordings. See
+[docs/SESSION_AUDIT.md](docs/SESSION_AUDIT.md) for durability, quotas and verification.
+
 ## V4 external call scope
 
 V4 adds a signed `external_call` flow step that holds the owned caller, dials one configured
@@ -18,7 +26,7 @@ test matrix.
 ## V3 voicemail foundation
 
 V3 adds explicit voicemail to the web-controlled appliance without turning it into a general
-PBX or a whole-call recorder:
+PBX; full-session auditing is a separate, optional layer:
 
 - Caller policy modes: IVR disabled, allowlist only, accept all, and accept all except a
   blocklist. Hidden or unparseable callers are separately configurable and default to the stock
@@ -48,8 +56,8 @@ PBX or a whole-call recorder:
 The control plane is a React/Vite dashboard and FastAPI/PostgreSQL service deployed as the
 separate `ivrdroid` Compose project. Only the web proxy is published, on
 `127.0.0.1:3200`; the API and database remain on internal Docker networks. The intended public
-origin is `https://ivrdroid.rx1.ai`. Production runs on `hetzner`; OpenLiteSpeed proxies the
-public vhost to the loopback-only web port. The retired old-mac tunnel is not part of this path.
+origin is `https://ivrdroid.rx1.ai`. Production runs on `old-mac` under `/Users/parhamfatemi/Services/ivrdroid/deploy`.
+The existing Cloudflare Tunnel connects the public host to the loopback-only web port.
 
 This release supports one Samsung SM-T585. The identifiers and APIs are fleet-shaped, but the
 server deliberately rejects enrollment of a second active tablet.
@@ -64,8 +72,8 @@ The native helper keeps the previously audited privacy and recovery model:
 - A V4.1 collector may opt in to continuous capture during its menu prompt. Only configured
   digits stop playback; other keys are ignored until playback finishes, when the full timeout
   begins.
-- Captured PCM is inspected in memory for DTMF and discarded except while an explicit signed
-  `record_message` instruction is active.
+- Core consumers inspect original captured PCM. Explicit voicemail and operator recording
+  retain their existing behavior; optional session auditing persists a separate mixed copy.
 - During that instruction only, the audited 48 kHz stereo PCM16 caller path is written to an
   owner-restricted temporary WAV. The finish tone is trimmed, failed/partial captures are
   deleted, and finalized files are atomically handed to the app.
@@ -75,12 +83,8 @@ The native helper keeps the previously audited privacy and recovery model:
 - Emergency, additional, replaced, or unverified calls fail closed and are yielded back to
   Android without an unsafe global hangup.
 
-A consented physical call proved the caller-only capture boundary, finish-key trimming, safe
-`MODE_NORMAL` restoration, acknowledged upload, and dashboard playback without ambient capture
-or prompt bleed. Its first server-normalized MP3 was unacceptably quiet; server 0.7.1 corrected
-the mono selection and loudness normalization, and the caller accepted the reprocessed dashboard
-playback. Production readiness remains blocked on one fresh consented call proving that a newly
-uploaded message automatically receives the corrected normalization end to end.
+Dated carrier acceptance evidence lives in [docs/VERIFICATION.md](docs/VERIFICATION.md).
+A successful build or synthetic harness is not proof of a working physical call path.
 
 ## Build and validation
 
@@ -143,60 +147,15 @@ npm run build
   intentionally ignored.
 - `docs/ARCHITECTURE.md`: trust boundaries and control/data flow.
 - `docs/EXTERNAL_CALL_V4.md`: the V4 conference contract, safety model, and rollout gate.
-- `docs/DEPLOYMENT.md`: Hetzner, OpenLiteSpeed, tablet, backup, and scoped rollback runbook.
+- `docs/DEPLOYMENT.md`: old-mac, tablet, backup, immutable release and scoped rollback runbook.
 - `docs/VERIFICATION.md`: dated build and live-device evidence; it does not treat unrun live-call
   scenarios as passed.
 
-## Safe tablet rollout
+## Production rollout
 
-1. Preserve the installed APK/helper, current helper hashes, Hetzner deployment configuration,
-   database, OpenLiteSpeed vhost/proxy state, and neighboring service health.
-2. Deploy and verify the loopback-only control plane behind the existing OpenLiteSpeed proxy.
-3. Install the APK and its narrowly scoped system-app module, reboot, then open the app so it
-   creates the expanded owner-only bridge. Keep restricted-networking mode enabled.
-4. Install the disabled helper module, run its non-mutating self-test, then enable it only on the
-   audited SM-T585 profile.
-5. Create a ten-minute pairing code in the dashboard and enter it on the tablet.
-6. Preserve the currently active signed V2 revision. Run migration `0003_voicemail_recordings`,
-   install V3-capable app/helper artifacts, and verify the tablet reports runtime V3 plus
-   recording capability before publishing any V3 revision. Activation must still occur only
-   while idle and be acknowledged by the real tablet.
-7. Exercise every caller-policy mode, unknown-number behavior, open/closed schedules, every DTMF
-   branch, invalid input, timeout, local kill switch, server outage, tamper rejection, and
-   recovery to `MODE_NORMAL`.
-8. Confirm a nonmatching caller remains with the stock dialer, ordinary flow steps create no
-   audio files, and only a consented explicit recording segment produces a message. Treat caller
-   speech quality as unverified until the physical-call gate above passes.
-
-Caller-ID policy reduces accidental interference; it is not authentication and caller ID can be
-spoofed.
-
-## Compatibility
-
-The first profile is narrowly pinned to:
-
-- Samsung SM-T585 (`gtaxllte`)
-- LineageOS 19.1
-- Android 12 / API 32
-- the exact fingerprint, display ID, PCM topology, mixer controls, and Telecom transaction
-  recorded for the audited tablet
-
-The helper refuses to serve after a ROM identity change. Another model, build, or update needs a
-fresh audio and Telecom audit.
-
-## License
-
-Copyright (C) 2026 Parham Fatemi.
-
-Unless a file or directory carries a different notice, project-authored source code and
-documentation are licensed under the GNU Affero General Public License version 3 only
-(`AGPL-3.0-only`). Modified versions that are conveyed must remain under the AGPL, and users who
-interact with a modified version over a network must be offered its Corresponding Source as
-required by section 13. See [LICENSE](LICENSE).
-
-Third-party components retain their own licenses. Vendored TinyALSA remains under the BSD terms
-in `helper/third_party/tinyalsa/NOTICE`. The synthesized WAV files under `helper/prompts/` are
-temporary test fixtures and are not granted under the project AGPL license.
-
-Before a public release, replace synthesized test prompts with publication-cleared recordings,
-automate the remaining device fault suite, and add explicitly audited device profiles.
+The authorized release target is old-mac and the enrolled SM-T585. Preserve the existing app
+signing identity, enrollment, active revision and all media. Deploy the additive backend first
+with auditing off, then the APK, persistent privileged overlay and helper while idle. Verify
+post-reboot synchronization before enabling controlled physical acceptance calls. Tag only the
+accepted deployed commit. Follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md); do not re-enroll an
+already enrolled tablet or downgrade the database during a routine rollback.

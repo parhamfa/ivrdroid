@@ -7,7 +7,7 @@
 namespace ivrdroid::protocol {
 
 inline constexpr char kCapabilities[] =
-    "runtime=1,2,3,4;recording=1;call_control=1;conversation_recording=1;prompt_barge_in=1";
+    "runtime=1,2,3,4;recording=1;call_control=1;conversation_recording=1;prompt_barge_in=1;session_audit=1";
 
 enum class Command {
     StartMenu,

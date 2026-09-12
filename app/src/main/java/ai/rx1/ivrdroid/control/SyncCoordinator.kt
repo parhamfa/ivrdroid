@@ -23,10 +23,15 @@ object SyncCoordinator {
         val api = DeviceApi(enrollment)
         var desiredRevision: Long? = null
         return try {
-            RecordingSpool.reconcile(application)
-            uploadPendingEvents(application, api)
-            uploadPendingRecordings(application, api)
+            // Control synchronization takes priority over the recording data plane.
+            SessionAuditSettings.restore(application)
+            runCatching { SessionAuditSpool.publishCapacity(application) }
             val response = api.sync(buildSyncRequest(application, initialHelper))
+            response.optJSONObject("audit_policy")?.let { policy ->
+                SessionAuditSettings.apply(application, policy)
+                // Publish the applied-policy acknowledgement before sending call metadata.
+                api.sync(buildSyncRequest(application, RootAudioTrigger.readState(application)))
+            }
             desiredRevision = response.optLong("desired_revision_id", 0).takeIf { it > 0 }
             if (desiredRevision != null && desiredRevision != initialHelper.activeRevision) {
                 val manifestHash = response.getString("manifest_sha256")
@@ -54,9 +59,16 @@ object SyncCoordinator {
                 SecureControlStore.saveActiveManifest(application, verified.manifest)
                 api.acknowledge(desiredRevision, "activated")
             }
+            val failures = mutableListOf<String>()
+            runCatching { RecordingSpool.reconcile(application) }.onFailure { failures.add("Recording handoff is pending.") }
+            runCatching { SessionAuditSpool.reconcile(application) }.onFailure { failures.add("Audit handoff is pending.") }
             uploadPendingEvents(application, api)
-            uploadPendingRecordings(application, api)
-            SecureControlStore.updateSyncStatus(application, null)
+            // Existing voicemail/operator uploads always get the first opportunity.
+            runCatching { uploadPendingRecordings(application, api) }.onFailure { failures.add("Recording upload is pending.") }
+            if (!CallRuntimeState.isBusy()) {
+                runCatching { SessionAuditSpool.uploadPending(application, api) }.onFailure { failures.add("Audit upload is pending.") }
+            }
+            SecureControlStore.updateSyncStatus(application, failures.takeIf { it.isNotEmpty() }?.joinToString(" "))
             SyncResult.Success(RootAudioTrigger.readState(application).activeRevision)
         } catch (error: Exception) {
             val message = (error.message ?: "Synchronization failed.").take(500)
@@ -104,6 +116,7 @@ object SyncCoordinator {
             helper.current == "WAITING_FOR_CALL" || helper.current == "ARMING_PRIVACY" -> "ringing"
             else -> "unknown"
         }
+        val auditPolicy = SessionAuditSettings.applied(context)
         val status = JSONObject()
             .put("helper_state", helper.current.take(80))
             .put("helper_result", helper.lastResult.take(80))
@@ -116,6 +129,14 @@ object SyncCoordinator {
             .put("external_call_control_capable", external.externalCallControlCapable)
             .put("conversation_recording_capable", external.conversationRecordingCapable)
             .put("prompt_barge_in_capable", helper.promptBargeInCapable)
+            .put("session_audit_capable", helper.sessionAuditCapable)
+            .put("audit_policy_version", auditPolicy.version)
+            .put("audit_enabled", auditPolicy.enabled)
+            .put("source_commit", BuildConfig.SOURCE_COMMIT)
+            .put("helper_source_commit", helper.sourceCommit.take(40))
+            .put("audit_spool_bytes", SessionAuditSpool.usageBytes(context))
+            .put("audit_spool_count", SessionAuditSpool.count(context))
+            .put("audit_last_error", SessionAuditSpool.lastError(context) ?: JSONObject.NULL)
             .put(
                 "call_control_protocol_version",
                 external.protocolVersion ?: JSONObject.NULL,
@@ -149,10 +170,12 @@ object SyncCoordinator {
     }
 
     private fun uploadPendingEvents(context: Context, api: DeviceApi) {
-        val events = SecureControlStore.pendingCalls(context)
+        val events = SecureControlStore.pendingCalls(context).filter { SessionAuditSpool.hasBinding(context, it) }
         if (events.isEmpty()) return
         events.chunked(100).forEach { batch ->
-            SecureControlStore.acknowledgeCalls(context, api.uploadEvents(batch))
+            val accepted = api.uploadEvents(batch)
+            SessionAuditSpool.acknowledgeCalls(context, batch, accepted)
+            SecureControlStore.acknowledgeCalls(context, accepted)
         }
     }
 

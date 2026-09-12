@@ -59,3 +59,23 @@ it("filters unlistened session audio without including historical calls", async 
   expect(screen.queryByRole("cell", { name: "Not recorded" })).toBeNull();
   expect(screen.getByRole("button", { name: /Listen to session from/ })).toBeTruthy();
 });
+
+it("keeps operator transitions seekable while collapsing repeated heartbeats", async () => {
+  vi.mocked(api.call).mockResolvedValue({ ...call, session_audit: { ...call.session_audit!, events: [
+    { offset_ms: 1000, type: "external_call", block_id: "operator", detail: "ACK" },
+    { offset_ms: 2000, type: "external_call", block_id: "operator", detail: "DIALING" },
+    { offset_ms: 3000, type: "external_call", block_id: "operator", detail: "DIALING" },
+    { offset_ms: 4000, type: "external_call", block_id: "operator", detail: "NOT_CONNECTED" },
+    { offset_ms: 5000, type: "external_call", block_id: "operator", detail: "DIALING" },
+  ] } });
+  render(<CallsPage />);
+  fireEvent.click(await screen.findByRole("button", { name: /Listen to session from/ }));
+  const audio = await screen.findByLabelText("Full session recording") as HTMLAudioElement;
+  Object.defineProperty(audio, "readyState", { value: 1 });
+  expect(screen.queryByRole("button", { name: "Seek to 00:01.000 Operator call" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Seek to 00:03.000 Operator call" })).toBeNull();
+  expect(screen.getAllByText("Dialing operator")).toHaveLength(2);
+  fireEvent.click(screen.getByRole("button", { name: "Seek to 00:04.000 Operator call" }));
+  expect(audio.currentTime).toBe(4);
+  expect(screen.getByText("Operator did not connect")).toBeTruthy();
+});

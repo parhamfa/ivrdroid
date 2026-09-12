@@ -1,4 +1,4 @@
-import type { CallRecord } from "../types";
+import type { CallRecord, SessionAuditEvent } from "../types";
 
 export function sessionAudioStatus(call: CallRecord): string {
   if (call.result === "STOCK_DIALER") return "Not applicable";
@@ -21,4 +21,26 @@ export function audioMatches(call: CallRecord, filter: string): boolean {
 export function eventTime(milliseconds: number): string {
   const seconds = Math.floor(milliseconds / 1000);
   return `${Math.floor(seconds / 60).toString().padStart(2, "0")}:${(seconds % 60).toString().padStart(2, "0")}.${Math.floor(milliseconds % 1000).toString().padStart(3, "0")}`;
+}
+
+// Older devices can report the same operator state on every heartbeat.
+export function timelineEvents(events: SessionAuditEvent[]): SessionAuditEvent[] {
+  const result: SessionAuditEvent[] = [];
+  for (const event of events) {
+    if (event.type === "external_call" && event.detail === "ACK") continue;
+    const previous = result.at(-1);
+    if (event.type === "external_call" && previous?.type === event.type &&
+        previous.block_id === event.block_id && previous.detail?.toLowerCase() === event.detail?.toLowerCase()) continue;
+    result.push(event);
+  }
+  return result;
+}
+
+export function eventDetail(event: SessionAuditEvent): string {
+  const detail = event.detail?.replaceAll("_", " ").replaceAll("-", " ").toLowerCase() ?? "";
+  if (event.type !== "external_call") return detail;
+  return ({ "caller held": "Caller on hold", "dialing": "Dialing operator",
+    "operator answered": "Operator answered", "merging": "Connecting both calls",
+    "conferenced": "Conversation started", "completed": "Conversation ended",
+    "not connected": "Operator did not connect", "system failure": "Connection failed" } as Record<string, string>)[detail] ?? detail;
 }

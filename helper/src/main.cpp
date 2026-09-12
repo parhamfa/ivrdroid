@@ -3678,6 +3678,7 @@ ExternalCallExecutionResult ExecuteExternalCall(
     bool finalPartial = false;
     int64_t conferenceStartedAt = 0;
     int64_t conferenceMilliseconds = 0;
+    auto lastAuditStatus = ivrdroid::call_control::StatusKind::Invalid;
 
     const auto startRecorder = [&]() {
         if (input != nullptr) return true;
@@ -3733,7 +3734,11 @@ ExternalCallExecutionResult ExecuteExternalCall(
         }
         if (decision != ivrdroid::ExternalCallDecision::Duplicate &&
             decision != ivrdroid::ExternalCallDecision::IgnoredForeign) {
-            ivrdroid::AuditEvent("external_call", instruction.blockId, ivrdroid::call_control::ToString(status.kind));
+            // Status heartbeats keep the guardian alive; the audit records transitions.
+            if (status.kind != lastAuditStatus) {
+                ivrdroid::AuditEvent("external_call", instruction.blockId, ivrdroid::call_control::ToString(status.kind));
+                lastAuditStatus = status.kind;
+            }
             const char phase = policy.stage() == ivrdroid::ExternalCallStage::Conferenced
                 ? kGuardianOwnedConference
                 : kGuardianOwnedDialing;

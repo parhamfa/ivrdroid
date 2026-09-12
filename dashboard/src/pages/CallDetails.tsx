@@ -4,7 +4,7 @@ import { api } from "../api";
 import { Button, Drawer, ErrorState, Loading, formatDate, formatDuration } from "../components/ui";
 import { useRemote } from "../hooks";
 import type { CallRecord, Recording, SessionAuditEvent } from "../types";
-import { eventTime, sessionAudioStatus } from "./callAudit";
+import { eventDetail, eventTime, sessionAudioStatus, timelineEvents } from "./callAudit";
 
 const eventLabels: Record<SessionAuditEvent["type"], string> = {
   answered: "Call answered", prompt: "Prompt", digit: "Menu input", timeout: "No input",
@@ -23,6 +23,7 @@ export function CallDetails({ id, autoPlay, onClose, onChange }: {
   const call = remote.data;
   const audit = call?.session_audit;
   const recording = audit?.recording;
+  const timeline = timelineEvents(audit?.events ?? []);
   const playable = audit?.state === "ready" && Boolean(recording?.playback_url);
 
   const update = (value: CallRecord) => { remote.setData(value); onChange(value); };
@@ -75,11 +76,11 @@ export function CallDetails({ id, autoPlay, onClose, onChange }: {
             <Button variant="ghost" disabled={busy} onClick={() => void remove()} aria-label="Delete session audio"><Trash2 size={16} /></Button>
           </div>
         </> : <p className="inspector-note">{sessionAudioStatus(call)}{audit?.state === "deleted" ? " · Audio was deleted; call history remains." : !audit ? " · This call has no session recording." : ""}</p>}
-        {(audit?.events ?? []).length ? <>
+        {timeline.length ? <>
           <h4>Session timeline</h4>
-          <ol className="session-timeline">{(audit?.events ?? []).map((event, index) => <li key={`${event.offset_ms}-${index}`}>
+          <ol className="session-timeline">{timeline.map((event, index) => <li key={`${event.offset_ms}-${index}`}>
             <button type="button" disabled={!playable} onClick={() => seek(event.offset_ms)} aria-label={`Seek to ${eventTime(event.offset_ms)} ${eventLabels[event.type]}`}>
-              <time>{eventTime(event.offset_ms)}</time><span>{eventLabels[event.type]}{event.detail ? <small>{event.detail.replaceAll("_", " ")}</small> : null}</span>
+              <time>{eventTime(event.offset_ms)}</time><span>{eventLabels[event.type]}{event.detail ? <small>{eventDetail(event)}</small> : null}</span>
             </button>
           </li>)}</ol>
         </> : <p className="inspector-note">No timestamped events were recorded for this call.</p>}

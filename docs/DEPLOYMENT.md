@@ -58,6 +58,8 @@ version required by existing media. Do not print credentials or copy them into b
    networking enabled. The helper ZIP installs disabled; run its self-test before enabling.
    Reboot as needed, then verify active/system APK hashes, helper binary hash, version codes,
    runtime commits, permissions, role, enrollment, active IVR revision and post-boot sync.
+   Verify the runtime `READ_PHONE_STATE` grant added for audit recovery's Telecom idle check;
+   the app's existing phone-permission setup requests it. Without it recovery fails closed.
 10. Run the isolated native/Android acceptance harnesses while idle. Enable auditing for the
     controlled physical-call matrix. Verify setting → applied acknowledgement → full capture
     → encrypted upload acknowledgement → authenticated production playback → clean idle state.

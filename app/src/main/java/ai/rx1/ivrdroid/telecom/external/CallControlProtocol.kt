@@ -65,8 +65,8 @@ data class CallControlStatusRecord(
 )
 
 object CallControlProtocol {
-    const val VERSION = 1
-    const val PREFIX = "IVRDROID_CALL_CONTROL_V1"
+    const val VERSION = 2
+    const val PREFIX = "IVRDROID_CALL_CONTROL_V2"
     const val MAXIMUM_RECORD_BYTES = 512
     private val phoneNumber = Regex("\\+?[0-9]{8,15}")
     private val reason = Regex("(?:-|[A-Z][A-Z0-9_]{0,63})")

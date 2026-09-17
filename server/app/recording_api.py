@@ -10,13 +10,14 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from .auth import require_admin, require_admin_write, require_device
 from .crypto import mask_phone
 from .database import get_session
 from .models import (
     CallRecord,
+    ContinuousRecording,
     Device,
     Recording,
     RecordingRetentionPolicy,
@@ -84,6 +85,8 @@ def _get_owned_recording(
         raise HTTPException(status_code=404, detail="Recording not found")
     if recording.device_id != device.id:
         raise HTTPException(status_code=403, detail="Recording belongs to another device")
+    if recording.source_format != "legacy_wav":
+        raise HTTPException(status_code=409, detail="Use the continuous recording API for this recording")
     return recording
 
 
@@ -155,6 +158,8 @@ def create_recording(
     call_id = str(body.call_id)
     existing = session.get(Recording, recording_id)
     if existing is not None:
+        if existing.source_format != "legacy_wav":
+            raise HTTPException(status_code=409, detail="Use the continuous recording API for this recording")
         if existing.device_id != device.id:
             raise HTTPException(status_code=409, detail="Recording ID belongs to another device")
         existing_upload = session.get(RecordingUpload, recording_id)
@@ -375,6 +380,12 @@ def _recording_response(request: Request, recording: Recording, call: CallRecord
         else None
     )
     available = recording.status == "ready"
+    session = object_session(recording)
+    receipt = session.get(ContinuousRecording, recording.id) if session is not None else None
+    upload = session.get(RecordingUpload, recording.id) if session is not None else None
+    state = receipt.state if receipt else (
+        "active_call" if call.result == "IN_PROGRESS" else "awaiting_device_recovery"
+    ) if recording.status == "uploading" else recording.status
     return RecordingResponse(
         id=recording.id,
         call_id=recording.call_id,
@@ -393,6 +404,12 @@ def _recording_response(request: Request, recording: Recording, call: CallRecord
         stop_reason=recording.stop_reason,
         status=recording.status,
         listened_at=recording.listened_at,
+        source_format=recording.source_format,
+        partial=recording.partial,
+        processing_error=recording.processing_error,
+        processing_state=state,
+        upload_offset=upload.upload_offset if upload else None,
+        source_size_bytes=recording.source_size_bytes,
         deleted_at=recording.deleted_at,
         playback_url=f"/api/admin/v1/recordings/{recording.id}/audio" if available else None,
         download_url=f"/api/admin/v1/recordings/{recording.id}/download" if available else None,

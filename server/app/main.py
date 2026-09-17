@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from .audit_settings import acknowledge_policy, router as audit_settings_router, signed_policy, validate_call_report
+from .call_safety_settings import acknowledge_call_safety_policy, router as call_safety_settings_router, signed_call_safety_policy
+from .continuous_recording_api import router as continuous_recording_router
+from .recording_recovery import router as recording_recovery_router
+from .continuous_recording_worker import process_next as process_next_continuous_recording
 from .session_audit_api import router as session_audit_router
 from .release import VERSION, SOURCE_COMMIT
 
@@ -200,6 +204,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except Exception:
                 LOGGER.exception("Scheduled ntfy watch failed")
 
+    async def continuous_recording_loop(application: FastAPI) -> None:
+        while True:
+            await asyncio.sleep(2)
+            try:
+                await asyncio.to_thread(process_next_continuous_recording, application)
+            except Exception:
+                LOGGER.exception("Continuous recording worker failed")
+
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         if configured.auto_create_schema:
@@ -220,15 +232,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         maintain_recordings()
         maintenance = asyncio.create_task(recording_maintenance_loop())
         watch = asyncio.create_task(ntfy_watch_loop(application))
+        continuous = asyncio.create_task(continuous_recording_loop(application))
         try:
             yield
         finally:
             maintenance.cancel()
             watch.cancel()
+            continuous.cancel()
             with suppress(asyncio.CancelledError):
                 await maintenance
             with suppress(asyncio.CancelledError):
                 await watch
+            with suppress(asyncio.CancelledError):
+                await continuous
 
     app = FastAPI(
         title="IVRdroid API",
@@ -253,6 +269,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(recording_device_router)
     app.include_router(conversation_recording_device_router)
     app.include_router(audit_settings_router)
+    app.include_router(call_safety_settings_router)
+    app.include_router(continuous_recording_router)
+    app.include_router(recording_recovery_router)
     app.include_router(session_audit_router)
 
     @app.get("/health")
@@ -1015,6 +1034,7 @@ def sync_device(
     session: Session = Depends(get_session),
 ) -> DeviceSyncResponse:
     acknowledge_policy(session, device, body.status)
+    acknowledge_call_safety_policy(session, device, body.status)
     device.app_version = body.app_version
     device.helper_version = body.helper_version
     device.status = body.status.model_dump(mode="json")
@@ -1024,6 +1044,7 @@ def sync_device(
     background_tasks.add_task(run_ntfy_watch, request.app)
     return DeviceSyncResponse(
         audit_policy=signed_policy(request, session),
+        call_safety_policy=signed_call_safety_policy(request, session),
         server_time=utcnow(),
         desired_revision_id=device.desired_revision_id,
         active_revision_id=device.active_revision_id,

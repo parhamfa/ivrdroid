@@ -25,7 +25,7 @@ args.output.mkdir(parents=True, mode=0o700)
 archive = subprocess.check_output(['git', 'archive', base, 'server'], cwd=root)
 with tarfile.open(fileobj=io.BytesIO(archive)) as source:
     source.extractall(args.output, filter='data')
-paths = ['app/models.py', 'app/schemas.py', 'app/recording_api.py', 'alembic/versions/0006_session_audit.py']
+paths = ['app/models.py', 'app/schemas.py', 'app/recording_api.py', 'app/recording_service.py', 'alembic/versions/0006_session_audit.py', 'alembic/versions/0007_call_safety.py', 'alembic/versions/0008_continuous_recordings.py']
 for path in paths:
     target = args.output / 'server' / path
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -33,9 +33,10 @@ for path in paths:
 main = args.output / 'server/app/main.py'
 code = main.read_text()
 needle = '.where(Recording.call_id.in_(call_ids), Recording.status != "deleted")'
-if needle not in code:
+replacement = '.where(Recording.call_id.in_(call_ids), Recording.status != "deleted", Recording.kind != "session_audit")'
+if needle not in code and replacement not in code:
     raise SystemExit('Prior call-count query changed; review the compatibility patch.')
-main.write_text(code.replace(needle, '.where(Recording.call_id.in_(call_ids), Recording.status != "deleted", Recording.kind != "session_audit")'))
+main.write_text(code.replace(needle, replacement))
 dockerfile = args.output / 'server/Dockerfile'
 code = dockerfile.read_text()
 lines = code.splitlines()

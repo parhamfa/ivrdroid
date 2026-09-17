@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { api } from "../api";
 import type { CallRecord, Recording } from "../types";
 import { CallsPage } from "./CallsPage";
+import { callOutcome } from "./callAudit";
 
 vi.mock("../api", () => ({ api: { calls: vi.fn(), call: vi.fn(), setRecordingListened: vi.fn(), deleteRecording: vi.fn() } }));
 const recording: Recording = { id: "audio-1", call_id: "call-1", device_id: "tablet", revision_id: null, block_id: null,
@@ -78,4 +79,28 @@ it("keeps operator transitions seekable while collapsing repeated heartbeats", a
   fireEvent.click(screen.getByRole("button", { name: "Seek to 00:04.000 Operator call" }));
   expect(audio.currentTime).toBe(4);
   expect(screen.getByText("Operator did not connect")).toBeTruthy();
+});
+
+it("shows the interruption as well as the final hangup, including outcome filtering", async () => {
+  const interrupted = { ...call, events: [
+    { event: "external_call", block_id: "operator", status: "CONFERENCED" },
+    { event: "external_call", block_id: "operator", status: "SYSTEM_FAILURE", reason: "HELPER_CANCELLED" },
+  ] };
+  vi.mocked(api.calls).mockResolvedValue([interrupted, { ...call, id: "normal" }]);
+  vi.mocked(api.call).mockResolvedValue(interrupted);
+  const outcome = "Conversation interrupted by system failure · Caller hung up";
+  render(<CallsPage />);
+  await screen.findByRole("cell", { name: outcome });
+  fireEvent.change(screen.getByLabelText("Call outcome filter"), { target: { value: outcome } });
+  expect(screen.queryByRole("cell", { name: "Caller hung up" })).toBeNull();
+  fireEvent.click(screen.getByRole("cell", { name: outcome }));
+  expect(await screen.findByText("Final disconnect")).toBeTruthy();
+  expect(screen.getByText("Caller hung up", { selector: "dd" })).toBeTruthy();
+});
+
+it("does not call a later dialing failure an interrupted conversation", () => {
+  const events = ["CONFERENCED", "COMPLETED", "DIALING", "SYSTEM_FAILURE"].map((status) => ({
+    event: "external_call", block_id: "operator", status,
+  }));
+  expect(callOutcome({ ...call, events })).toBe("System failure during call · Caller hung up");
 });

@@ -18,6 +18,11 @@ void StopSessionAudio(const char* reason);
 void DrainSessionAudioWorkers();
 void SuperviseSessionAudioWorkers();
 void ReleaseSessionAudio();
+struct ConversationWriter;
+ConversationWriter* StartContinuousConversation(const std::string& recordingId, const std::string& callId,
+    uint64_t revisionId, const std::string& blockId);
+bool ContinuousConversationHealthy(ConversationWriter* writer);
+void StopContinuousConversation(ConversationWriter* writer, const char* reason, bool partial);
 void AuditEvent(const char* type, const std::string& block = "", const std::string& detail = "");
 void BeginAuditPrompt();
 void TapAuditPrompt(pcm* output, const int16_t* samples, unsigned int frames);

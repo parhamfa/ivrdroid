@@ -48,7 +48,7 @@ internal object SessionAuditFiles {
     fun decrypt(file: File, aad: String, maximum: Long): ByteArray = RecordingEnvelope.decrypt(key(), aad, read(file, maximum + RecordingEnvelope.OVERHEAD_BYTES))
 
     @Synchronized
-    private fun key(): SecretKey {
+    internal fun key(): SecretKey {
         val alias = "ivrdroid-session-audit-spool-v1"
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey(alias, null) as? SecretKey)?.let { return it }

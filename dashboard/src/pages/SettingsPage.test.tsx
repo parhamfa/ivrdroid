@@ -10,6 +10,8 @@ vi.mock("../api", () => ({
     recordingSettings: vi.fn(),
     sessionAuditSettings: vi.fn(),
     saveSessionAuditSettings: vi.fn(),
+    callSafetySettings: vi.fn(),
+    saveCallSafetySettings: vi.fn(),
     ntfySettings: vi.fn(),
     saveNtfySettings: vi.fn(),
     testNtfySettings: vi.fn(),
@@ -65,6 +67,7 @@ const ntfy: NtfySettings = {
 };
 
 beforeEach(() => {
+  vi.mocked(api.callSafetySettings).mockResolvedValue({ document: { kind: "call_safety_policy", schema_version: 1, version: 0, maximum_call_duration_seconds: 3600 }, sha256: "", signature_b64: "", devices: [] });
   vi.mocked(api.sessionAuditSettings).mockResolvedValue({ document: { kind: "session_audit_policy", version: 0, enabled: false, local_quota_bytes: 1024 ** 3 }, sha256: "", signature_b64: "", server_quota_bytes: 1024 ** 3, devices: [] });
   vi.mocked(api.draft).mockResolvedValue(structuredClone(draft));
   vi.mocked(api.recordingSettings).mockResolvedValue({ ...operational });
@@ -91,6 +94,22 @@ afterEach(() => {
 });
 
 describe("recording settings", () => {
+  it("validates the whole-call limit without changing the separate voicemail duration", async () => {
+    vi.mocked(api.saveCallSafetySettings).mockResolvedValue({ document: { kind: "call_safety_policy", schema_version: 1, version: 1, maximum_call_duration_seconds: 7200 }, sha256: "", signature_b64: "", devices: [] });
+    render(<SettingsPage />);
+    const input = await screen.findByLabelText("Maximum call duration (minutes)");
+    expect((input as HTMLInputElement).value).toBe("60");
+    const save = screen.getByRole("button", { name: "Save call limit" });
+    for (const value of ["", "0", "1441", "1.5"]) {
+      fireEvent.change(input, { target: { value } });
+      expect((save as HTMLButtonElement).disabled).toBe(true);
+    }
+    fireEvent.change(input, { target: { value: "120" } });
+    fireEvent.click(save);
+    await waitFor(() => expect(api.saveCallSafetySettings).toHaveBeenCalledWith(120));
+    expect(api.saveDraft).not.toHaveBeenCalled();
+    expect(await screen.findByText(/this limit takes effect for subsequent calls/i)).toBeTruthy();
+  });
   it("shows prompt-interruption capability separately from general V4 readiness", async () => {
     vi.mocked(api.devices).mockResolvedValue([{
       id: "device-1",

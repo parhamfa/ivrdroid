@@ -562,6 +562,16 @@ class DeviceStatus(StrictModel):
     conversation_recording_capable: bool = False
     prompt_barge_in_capable: bool = False
     session_audit_capable: bool = False
+    continuous_recording_capable: bool = False
+    call_safety_capable: bool = False
+    call_safety_policy_version: int | None = Field(default=None, ge=0)
+    maximum_call_duration_seconds: int | None = Field(default=None, ge=60, le=86400)
+    call_safety_last_error: str | None = Field(default=None, max_length=160)
+    local_recovery_state: str | None = Field(default=None, max_length=80)
+    telecom_recovery_state: str | None = Field(default=None, max_length=80)
+    telecom_recovery_duration_ms: int | None = Field(default=None, ge=0)
+    telecom_recovery_phase: str | None = Field(default=None, max_length=80)
+    helper_supervisor_state: str | None = Field(default=None, max_length=80)
     audit_policy_version: int = Field(default=0, ge=0)
     audit_enabled: bool = False
     audit_spool_bytes: int = Field(default=0, ge=0)
@@ -602,6 +612,7 @@ class DeviceSyncRequest(StrictModel):
 
 class DeviceSyncResponse(StrictModel):
     audit_policy: dict | None = None
+    call_safety_policy: dict | None = None
     server_time: datetime
     desired_revision_id: int | None
     active_revision_id: int | None
@@ -628,6 +639,7 @@ class ExternalCallSubEvent(StrictModel):
         "COMPLETED",
         "NOT_CONNECTED",
         "SYSTEM_FAILURE",
+        "RECORDING_FAILURE",
     ]
     block_id: str = Field(pattern=BLOCK_ID_PATTERN)
     reason: str = Field(pattern=r"^(?:-|[A-Z][A-Z0-9_]{0,63})$")
@@ -863,6 +875,12 @@ class RecordingResponse(StrictModel):
     duration_ms: int
     stop_reason: str
     status: str
+    source_format: str = "legacy_wav"
+    partial: bool = False
+    processing_error: str | None = None
+    processing_state: str | None = None
+    upload_offset: int | None = None
+    source_size_bytes: int | None = None
     listened_at: datetime | None
     deleted_at: datetime | None
     playback_url: str | None

@@ -16,17 +16,29 @@ object SyncCoordinator {
     @Synchronized
     fun synchronize(context: Context): SyncResult {
         val application = context.applicationContext
+        ai.rx1.ivrdroid.telecom.LocalCallSession.reconcile(application)
+        // Local recovery is independent of enrollment, connectivity and server availability.
+        runCatching { ContinuousRecordingSpool.recover(application) }
         val enrollment = SecureControlStore.enrollment(application) ?: return SyncResult.NotEnrolled
-        if (CallRuntimeState.isBusy()) return SyncResult.Busy
         val initialHelper = RootAudioTrigger.readState(application)
-        if (!initialHelper.isIdle) return SyncResult.Busy
         val api = DeviceApi(enrollment)
+        if (CallRuntimeState.isBusy() || !initialHelper.isIdle) {
+            // Recovery is local and already running. A metadata-only heartbeat
+            // can report its readiness or a disabled supervisor without moving
+            // audio, changing a call's policy snapshot, or waiting on the network.
+            runCatching { api.sync(buildSyncRequest(application, initialHelper)) }
+            return SyncResult.Busy
+        }
         var desiredRevision: Long? = null
         return try {
             // Control synchronization takes priority over the recording data plane.
             SessionAuditSettings.restore(application)
+            CallSafetySettings.restore(application)
             runCatching { SessionAuditSpool.publishCapacity(application) }
+            runCatching { ContinuousRecordingSpool.reconcile(application) }
+            runCatching { SessionAuditSpool.reconcile(application) }
             val response = api.sync(buildSyncRequest(application, initialHelper))
+            response.optJSONObject("call_safety_policy")?.let { CallSafetySettings.apply(application, it) }
             response.optJSONObject("audit_policy")?.let { policy ->
                 SessionAuditSettings.apply(application, policy)
                 // Publish the applied-policy acknowledgement before sending call metadata.
@@ -63,8 +75,15 @@ object SyncCoordinator {
             runCatching { RecordingSpool.reconcile(application) }.onFailure { failures.add("Recording handoff is pending.") }
             runCatching { SessionAuditSpool.reconcile(application) }.onFailure { failures.add("Audit handoff is pending.") }
             uploadPendingEvents(application, api)
+            runCatching { ContinuousRecordingSpool.uploadPending(application, api) }.onFailure {
+                failures.add("Continuous recording upload is pending: ${it.message?.take(160)}")
+                RecordingFailureJournal.capture(application, "continuous_upload", error = it)
+            }
             // Existing voicemail/operator uploads always get the first opportunity.
-            runCatching { uploadPendingRecordings(application, api) }.onFailure { failures.add("Recording upload is pending.") }
+            runCatching { uploadPendingRecordings(application, api) }.onFailure {
+                failures.add("Recording upload is pending.")
+                RecordingFailureJournal.capture(application, "upload", error = it)
+            }
             if (!CallRuntimeState.isBusy()) {
                 runCatching { SessionAuditSpool.uploadPending(application, api) }.onFailure { failures.add("Audit upload is pending.") }
             }
@@ -117,6 +136,9 @@ object SyncCoordinator {
             else -> "unknown"
         }
         val auditPolicy = SessionAuditSettings.applied(context)
+        val callSafety = CallSafetySettings.applied(context)
+        val continuousAudit = ContinuousRecordingSpool.pendingUsage(context, "session_audit")
+        val continuousConversation = ContinuousRecordingSpool.pendingUsage(context, "conversation")
         val status = JSONObject()
             .put("helper_state", helper.current.take(80))
             .put("helper_result", helper.lastResult.take(80))
@@ -131,11 +153,24 @@ object SyncCoordinator {
             .put("prompt_barge_in_capable", helper.promptBargeInCapable)
             .put("session_audit_capable", helper.sessionAuditCapable)
             .put("audit_policy_version", auditPolicy.version)
+            .put("call_safety_capable", CallSafetySettings.capable(context))
+            .put("call_safety_policy_version", callSafety?.version ?: JSONObject.NULL)
+            .put("maximum_call_duration_seconds", callSafety?.maximumSeconds ?: JSONObject.NULL)
+            .put("continuous_recording_capable", CallSafetySettings.capable(context))
+            .put("local_recovery_state", ai.rx1.ivrdroid.telecom.LocalCallSession.readiness)
+            .put("telecom_recovery_state", ExternalCallRuntimeStatus.recovery.readiness)
+            .put("telecom_recovery_duration_ms", ExternalCallRuntimeStatus.recovery.durationMs)
+            .put("telecom_recovery_phase", ExternalCallRuntimeStatus.recovery.phase)
+            .put("helper_supervisor_state", runCatching {
+                String(SessionAuditFiles.read(java.io.File(context.filesDir, "bridge/helper-supervisor"), 160), Charsets.US_ASCII)
+                    .trim().split(' ').takeIf { it.size == 5 && it[0] == "SUP1" }?.get(1)
+                    ?.takeIf { it.matches(Regex("[A-Z_]{1,40}")) }
+            }.getOrNull() ?: "UNKNOWN")
             .put("audit_enabled", auditPolicy.enabled)
             .put("source_commit", BuildConfig.SOURCE_COMMIT)
             .put("helper_source_commit", helper.sourceCommit.take(40))
-            .put("audit_spool_bytes", SessionAuditSpool.usageBytes(context))
-            .put("audit_spool_count", SessionAuditSpool.count(context))
+            .put("audit_spool_bytes", SessionAuditSpool.usageBytes(context) + continuousAudit.first)
+            .put("audit_spool_count", (SessionAuditSpool.pendingIds(context) + continuousAudit.second).size)
             .put("audit_last_error", SessionAuditSpool.lastError(context) ?: JSONObject.NULL)
             .put(
                 "call_control_protocol_version",
@@ -143,12 +178,12 @@ object SyncCoordinator {
             )
             .put("call_control_state", ExternalCallRuntimeStatus.state(context))
             .put("call_control_recovery_pending", ExternalCallRuntimeStatus.recoveryPending(context))
-            .put("recording_spool_bytes", RecordingSpool.usageBytes(context))
-            .put("recording_spool_count", RecordingSpool.pending(context).size)
+            .put("recording_spool_bytes", RecordingSpool.usageBytes(context) + continuousConversation.first)
+            .put("recording_spool_count", RecordingSpool.pending(context).size + continuousConversation.second.size)
             .put("voicemail_spool_bytes", RecordingSpool.voicemailUsageBytes(context))
             .put("voicemail_spool_count", RecordingSpool.voicemailCount(context))
-            .put("conversation_spool_bytes", RecordingSpool.conversationUsageBytes(context))
-            .put("conversation_spool_count", RecordingSpool.conversationCount(context))
+            .put("conversation_spool_bytes", RecordingSpool.conversationUsageBytes(context) + continuousConversation.first)
+            .put("conversation_spool_count", RecordingSpool.conversationCount(context) + continuousConversation.second.size)
             .put("recording_filesystem_free_bytes", context.filesDir.usableSpace.coerceAtLeast(0))
         BootWifiRecoveryStore.latest(context)?.let { report ->
             status.put(

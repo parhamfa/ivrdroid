@@ -4,7 +4,7 @@ import { api } from "../api";
 import { Button, Drawer, ErrorState, Loading, formatDate, formatDuration } from "../components/ui";
 import { useRemote } from "../hooks";
 import type { CallRecord, Recording, SessionAuditEvent } from "../types";
-import { eventDetail, eventTime, sessionAudioStatus, timelineEvents } from "./callAudit";
+import { callOutcome, finalDisconnect, recordingStatus, recordingProgress, eventDetail, eventTime, sessionAudioStatus, timelineEvents } from "./callAudit";
 
 const eventLabels: Record<SessionAuditEvent["type"], string> = {
   answered: "Call answered", prompt: "Prompt", digit: "Menu input", timeout: "No input",
@@ -76,6 +76,7 @@ export function CallDetails({ id, autoPlay, onClose, onChange }: {
             <Button variant="ghost" disabled={busy} onClick={() => void remove()} aria-label="Delete session audio"><Trash2 size={16} /></Button>
           </div>
         </> : <p className="inspector-note">{sessionAudioStatus(call)}{audit?.state === "deleted" ? " · Audio was deleted; call history remains." : !audit ? " · This call has no session recording." : ""}</p>}
+        {recording && !playable ? <p className="inspector-note">{recordingProgress(recording)}</p> : null}
         {timeline.length ? <>
           <h4>Session timeline</h4>
           <ol className="session-timeline">{timeline.map((event, index) => <li key={`${event.offset_ms}-${index}`}>
@@ -85,9 +86,10 @@ export function CallDetails({ id, autoPlay, onClose, onChange }: {
           </li>)}</ol>
         </> : <p className="inspector-note">No timestamped events were recorded for this call.</p>}
       </section>
-      <dl className="detail-list"><div><dt>Caller</dt><dd>{call.caller ?? call.caller_masked}</dd></div><div><dt>Policy</dt><dd>{call.policy_decision}</dd></div><div><dt>Revision</dt><dd>{call.revision_id ?? "Built-in fallback"}</dd></div><div><dt>Result</dt><dd>{call.result}</dd></div><div><dt>Call duration</dt><dd>{formatDuration(call.duration_seconds)}</dd></div></dl>
+      <dl className="detail-list"><div><dt>Caller</dt><dd>{call.caller ?? call.caller_masked}</dd></div><div><dt>Policy</dt><dd>{call.policy_decision}</dd></div><div><dt>Revision</dt><dd>{call.revision_id ?? "Built-in fallback"}</dd></div><div><dt>Outcome</dt><dd>{callOutcome(call)}</dd></div><div><dt>Final disconnect</dt><dd>{finalDisconnect(call)}</dd></div><div><dt>Call duration</dt><dd>{formatDuration(call.duration_seconds)}</dd></div></dl>
       <h3>Voicemail &amp; conversations</h3>
-      {call.recordings?.filter((item) => item.status !== "deleted").length ? <ul className="call-recordings">{call.recordings.filter((item) => item.status !== "deleted").map((item: Recording) => <li key={item.id}><a href={`/voicemail?recording=${encodeURIComponent(item.id)}`}>{item.kind === "conversation" ? "Operator conversation" : "Voicemail"} · {formatDuration(item.duration_ms / 1000)}</a><span>{item.status === "ready" ? "Ready" : "Pending upload"}</span></li>)}</ul> : <p className="inspector-note">No voicemail or operator recordings for this call.</p>}
+      {call.events.some((event) => event.status === "RECORDING_FAILURE") ? <p className="session-audio__partial">Conversation recording failed or ended early. Any surviving audio is listed below; call outcome and final disconnect are reported separately.</p> : null}
+      {call.recordings?.filter((item) => item.status !== "deleted").length ? <ul className="call-recordings">{call.recordings.filter((item) => item.status !== "deleted").map((item: Recording) => <li key={item.id}><a href={`/voicemail?recording=${encodeURIComponent(item.id)}`}>{item.kind === "conversation" ? "Operator conversation" : "Voicemail"} · {formatDuration(item.duration_ms / 1000)}</a><span>{recordingStatus(item)}</span></li>)}</ul> : <p className="inspector-note">No voicemail or operator recordings for this call.</p>}
       <details><summary>Execution trace and events</summary><ol className="event-list">{call.menu_path.map((step, index) => <li key={index}>{step.split("|").slice(1).join(" · ") || step}</li>)}</ol><pre className="event-json">{JSON.stringify(call.events, null, 2)}</pre></details>
     </> : null}
   </Drawer>;

@@ -25,6 +25,16 @@ compile_test \
     audit_policy_test \
     "$HELPER_DIR/src/audit_policy.cpp" \
     "$TEST_DIR/audit_policy_test.cpp"
+compile_test continuous_recording_test \
+    "$HELPER_DIR/src/continuous_recording.cpp" \
+    "$HELPER_DIR/src/call_control_protocol.cpp" \
+    "$TEST_DIR/continuous_recording_test.cpp"
+"$BUILD_DIR/continuous_recording_test"
+compile_test call_lifetime_policy_test \
+    "$HELPER_DIR/src/call_lifetime_policy.cpp" \
+    "$HELPER_DIR/src/call_control_protocol.cpp" \
+    "$TEST_DIR/call_lifetime_policy_test.cpp"
+"$BUILD_DIR/call_lifetime_policy_test"
 compile_test \
     call_control_protocol_test \
     "$HELPER_DIR/src/call_control_protocol.cpp" \
@@ -102,20 +112,20 @@ compile_test \
 
 "$BUILD_DIR/audit_policy_test"
 "$BUILD_DIR/call_control_protocol_test" \
-    "$HELPER_DIR/../app/src/test/resources/call_control/dial_v1.txt" \
-    "$HELPER_DIR/../app/src/test/resources/call_control/recorder_ready_v1.txt" \
-    "$HELPER_DIR/../app/src/test/resources/call_control/cancel_v1.txt" \
-    "$HELPER_DIR/../app/src/test/resources/call_control/status_v1.txt" \
-    "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_cancel_v1.txt" \
-    "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_not_connected_v1.txt"
+    "$HELPER_DIR/../app/src/test/resources/call_control/dial_v2.txt" \
+    "$HELPER_DIR/../app/src/test/resources/call_control/recorder_ready_v2.txt" \
+    "$HELPER_DIR/../app/src/test/resources/call_control/cancel_v2.txt" \
+    "$HELPER_DIR/../app/src/test/resources/call_control/status_v2.txt" \
+    "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_cancel_v2.txt" \
+    "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_not_connected_v2.txt"
 "$BUILD_DIR/call_safety_policy_test"
 "$BUILD_DIR/child_process_test"
 "$BUILD_DIR/conversation_handoff_protocol_test" \
     "$HELPER_DIR/../app/src/test/resources/call_control/conversation_handoff_v1.txt"
 "$BUILD_DIR/dtmf_detector_test"
 "$BUILD_DIR/external_call_policy_test" \
-    "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_cancel_v1.txt" \
-    "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_not_connected_v1.txt"
+    "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_cancel_v2.txt" \
+    "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_not_connected_v2.txt"
 "$BUILD_DIR/menu_policy_test"
 "$BUILD_DIR/mixer_route_policy_test"
 "$BUILD_DIR/protocol_test"

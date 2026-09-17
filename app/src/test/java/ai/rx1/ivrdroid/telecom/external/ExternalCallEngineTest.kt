@@ -13,6 +13,25 @@ class ExternalCallEngineTest {
     private val config = ExternalCallConfig(sessionId, 91, blockId, "03136644636", 30_000, bootId)
 
     @Test
+    fun confirmedConversationRecoversAcrossAllControllerOutagesWithoutRepeatingActions() {
+        for (outage in listOf(1000L, 3000L, 10000L, 40000L, 130000L)) {
+            val fixture = Fixture()
+            fixture.beginAndDial()
+            fixture.telecom.addOperator(TelecomCallState.ACTIVE)
+            fixture.engine.reconcile(2000)
+            fixture.engine.recorderReady(2100)
+            fixture.telecom.conference = "conference"
+            fixture.engine.reconcile(2200)
+            val snapshot = requireNotNull(fixture.engine.snapshot())
+            fixture.telecom.actions.clear()
+            val recovered = ExternalCallEngine(fixture.telecom, fixture.observer, snapshot)
+            recovered.recover(bootId, 2200 + outage, independentlyReconciled = true)
+            assertEquals(ExternalCallPhase.CONFERENCED, recovered.snapshot()?.phase)
+            assertTrue(fixture.telecom.actions.isEmpty())
+        }
+    }
+
+    @Test
     fun successfulAnswerRecordingGateMergeAndOperatorHangup() {
         val fixture = Fixture()
         fixture.beginAndDial()
@@ -70,7 +89,7 @@ class ExternalCallEngineTest {
     }
 
     @Test
-    fun terminalHandoffFailureCorrectsCompletedHistoryToSystemFailure() {
+    fun lateRecordingFailurePreservesCompletedCallOutcome() {
         val fixture = Fixture()
         fixture.beginAndDial()
         fixture.telecom.addOperator(TelecomCallState.ACTIVE)
@@ -86,10 +105,34 @@ class ExternalCallEngineTest {
         fixture.engine.reconcile(4_100)
         assertEquals(ExternalCallPhase.COMPLETED, fixture.engine.snapshot()?.phase)
 
-        fixture.engine.recordingHandoffFailed(3_100)
+        fixture.engine.recordingHandoffFailed(42_100)
 
-        assertEquals(ExternalCallPhase.SYSTEM_FAILURE, fixture.engine.snapshot()?.phase)
-        assertEquals(CallControlStatus.SYSTEM_FAILURE to "RECORDING_FAILURE", fixture.observer.statuses.last())
+        assertEquals(ExternalCallPhase.COMPLETED, fixture.engine.snapshot()?.phase)
+        assertEquals(CallControlStatus.COMPLETED to "OPERATOR_HANGUP", fixture.observer.statuses.last())
+        assertEquals(0, fixture.telecom.actionCount("disconnect:operator"))
+    }
+
+    @Test
+    fun recordingFailureDuringConversationDoesNotDisconnectOrPlayFailureBranch() {
+        val fixture = Fixture()
+        fixture.beginAndDial()
+        fixture.telecom.addOperator(TelecomCallState.ACTIVE)
+        fixture.engine.reconcile(2_000)
+        fixture.engine.recorderReady(2_100)
+        fixture.telecom.conference = "conference"
+        fixture.engine.reconcile(2_200)
+        val established = fixture.engine.snapshot()
+
+        fixture.engine.recordingHandoffFailed(192_400)
+        fixture.engine.reconcile(192_500)
+        fixture.engine.recordingHandoffFailed(220_400)
+        fixture.engine.reconcile(400_000)
+
+        assertEquals(established, fixture.engine.snapshot())
+        assertEquals(CallControlStatus.CONFERENCED to "-", fixture.observer.statuses.last())
+        assertEquals(0, fixture.telecom.actionCount("disconnect:operator"))
+        assertEquals(0, fixture.telecom.actionCount("disconnect:caller"))
+        assertEquals(0, fixture.telecom.actionCount("unhold:caller"))
     }
 
     @Test

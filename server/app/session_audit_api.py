@@ -83,6 +83,8 @@ def _owned_recording(session: Session, recording_id: str, device: Device) -> Rec
         raise HTTPException(status_code=403, detail="Session audit recording belongs to another device")
     if recording.kind != "session_audit":
         raise HTTPException(status_code=409, detail="Recording ID belongs to another recording kind")
+    if recording.source_format != "legacy_wav":
+        raise HTTPException(status_code=409, detail="Use the continuous recording API for this recording")
     return recording
 
 
@@ -165,6 +167,8 @@ def create_session_recording(
         raise HTTPException(status_code=422, detail="Audit timestamp is outside its call")
     existing = session.get(Recording, recording_id)
     if existing is not None:
+        if existing.source_format != "legacy_wav":
+            raise HTTPException(status_code=409, detail="Use the continuous recording API for this recording")
         if existing.device_id != device.id or existing.kind != "session_audit" or existing.call_id != call_id:
             raise HTTPException(status_code=409, detail="Recording identity was reused")
         return _recording_response(existing)
@@ -408,6 +412,8 @@ def complete_session_recording(
         raise HTTPException(status_code=403, detail="Session audit recording belongs to another device")
     if recording.kind != "session_audit":
         raise HTTPException(status_code=409, detail="Recording ID belongs to another recording kind")
+    if recording.source_format != "legacy_wav":
+        raise HTTPException(status_code=409, detail="Use the continuous recording API for this recording")
     if recording.status in {"ready", "deleted"}:
         return _recording_response(recording)
     if recording.status != "uploading":

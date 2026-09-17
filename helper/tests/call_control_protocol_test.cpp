@@ -13,13 +13,13 @@ constexpr char kBlock[] = "22222222-2222-4222-8222-222222222222";
 constexpr char kBoot[] = "33333333-3333-4333-8333-333333333333";
 
 std::string Dial() {
-    return std::string("IVRDROID_CALL_CONTROL_V1 DIAL ") + kSession +
+    return std::string("IVRDROID_CALL_CONTROL_V2 DIAL ") + kSession +
         " 17 " + kBlock + " 1 " + kBoot +
         " 12345 +982112345678 30000\n";
 }
 
 std::string StatusWire(const char* phase, uint64_t sequence, const char* reason = "-") {
-    return std::string("IVRDROID_CALL_CONTROL_V1 ") + phase + " " + kSession +
+    return std::string("IVRDROID_CALL_CONTROL_V2 ") + phase + " " + kSession +
         " 17 " + kBlock + " " + std::to_string(sequence) + " " + kBoot +
         " 42000 " + reason + "\n";
 }
@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     ready.sequence = 2;
     ready.elapsedMilliseconds = 12'400;
     const std::string readyWire = std::string(
-        "IVRDROID_CALL_CONTROL_V1 RECORDER_READY ") + kSession + " 17 " +
+        "IVRDROID_CALL_CONTROL_V2 RECORDER_READY ") + kSession + " 17 " +
         kBlock + " 2 " + kBoot + " 12400\n";
     assert(EncodeRequest(ready) == readyWire);
     assert(ParseRequest(readyWire).kind == RequestKind::RecorderReady);
@@ -68,11 +68,11 @@ int main(int argc, char** argv) {
     cancel.reason = "HELPER_CANCELLED";
     assert(ParseRequest(EncodeRequest(cancel)).kind == RequestKind::Cancel);
     assert(EncodeRequest(cancel) == std::string(
-        "IVRDROID_CALL_CONTROL_V1 CANCEL ") + kSession + " 17 " + kBlock +
+        "IVRDROID_CALL_CONTROL_V2 CANCEL ") + kSession + " 17 " + kBlock +
         " 3 " + kBoot + " 13000 HELPER_CANCELLED\n");
     cancel.reason = "ANSWER_TIMEOUT";
     assert(EncodeRequest(cancel) == std::string(
-        "IVRDROID_CALL_CONTROL_V1 CANCEL ") + kSession + " 17 " + kBlock +
+        "IVRDROID_CALL_CONTROL_V2 CANCEL ") + kSession + " 17 " + kBlock +
         " 3 " + kBoot + " 13000 ANSWER_TIMEOUT\n");
     const Request answerTimeoutCancel = ParseRequest(EncodeRequest(cancel));
     assert(answerTimeoutCancel.kind == RequestKind::Cancel);
@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
     cancel.reason = "-";
     assert(EncodeRequest(cancel).empty());
     assert(ParseRequest(std::string(
-        "IVRDROID_CALL_CONTROL_V1 CANCEL ") + kSession + " 17 " + kBlock +
+        "IVRDROID_CALL_CONTROL_V2 CANCEL ") + kSession + " 17 " + kBlock +
         " 3 " + kBoot + " 13000\n").kind == RequestKind::Invalid);
 
     const char* phases[] = {

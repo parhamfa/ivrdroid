@@ -15,6 +15,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.util.UUID
+import java.io.RandomAccessFile
 
 /** Actual Android Keystore and disk handoff, isolated from enrollment, media and call history. */
 class SessionAuditAcceptanceInstrumentation : Instrumentation() {
@@ -86,6 +87,34 @@ class SessionAuditAcceptanceInstrumentation : Instrumentation() {
             check(CallRuntimeState.isBusy() && File(rejected, "abort").exists())
             check(!File(files, "session-audit-spool/$limited/00000.audio").exists())
             output.putString("failure_isolation", "PASS: audit quota failure requests partial audit only; call state preserved")
+            val continuousId = UUID.randomUUID().toString()
+            val continuousInbox = SessionAuditFiles.directory(File(files, "bridge/continuous-recordings/$continuousId"))
+            val source = File(continuousInbox, "audio.pcm")
+            val sourceBytes = 16L * 1024 * 1024
+            val buffer = ByteArray(65536) { it.toByte() }
+            source.outputStream().use { stream -> repeat((sourceBytes / buffer.size).toInt()) { stream.write(buffer) } }
+            android.system.Os.chmod(source.absolutePath, 0b110000000)
+            // Different boot identity establishes an interrupted writer; the original
+            // recording/call identities and capture time must survive recovery.
+            val capture = "PCM1 conversation $continuousId $id ${UUID.randomUUID()} 21 ${UUID.randomUUID()} 0 1789200000000 1000 2147483000 1 ${sourceBytes / 4}\n"
+            SessionAuditFiles.write(File(continuousInbox, "continuous.context"), capture.toByteArray())
+            CallRuntimeState.setBusy(true)
+            ContinuousRecordingSpool.recover(isolated)
+            check(File(continuousInbox, "continuous.sealed").readText() == "interrupted 1\n")
+            check(runCatching { ContinuousRecordingSpool.reconcile(isolated) }.isFailure && source.exists())
+            CallRuntimeState.setBusy(false)
+            val processingStarted = android.os.SystemClock.elapsedRealtime()
+            ContinuousRecordingSpool.reconcile(isolated)
+            val continuousEncrypted = File(files, "continuous-recording-spool/$continuousId/audio.enc")
+            check(continuousEncrypted.isFile && !source.exists())
+            ContinuousRecordingEnvelope.Reader(SessionAuditFiles.key(), "conversation:$continuousId", continuousEncrypted).use {
+                check(it.verify().size == sourceBytes)
+                check(it.read(65532, 16).contentEquals(ByteArray(16) { offset -> ((65532 + offset) % 256).toByte() }))
+            }
+            output.putString("continuous_recovery", "PASS: reboot prefix, busy pause, Android Keystore encryption, durable plaintext removal, bounded seeking; 16 MiB processing_ms=${android.os.SystemClock.elapsedRealtime() - processingStarted}")
+            RandomAccessFile(continuousEncrypted, "rw").use { it.setLength(it.length() - 1) }
+            check(runCatching { ContinuousRecordingEnvelope.Reader(SessionAuditFiles.key(), "conversation:$continuousId", continuousEncrypted).close() }.isFailure)
+            output.putString("continuous_truncation", "PASS: truncated authenticated container is rejected")
             output.putString("stream", "Session audit Android disk and encryption acceptance passed.\n")
             result = Activity.RESULT_OK
         } catch (error: Throwable) {

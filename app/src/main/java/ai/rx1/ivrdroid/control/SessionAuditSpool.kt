@@ -48,6 +48,7 @@ object SessionAuditSpool {
     fun usageBytes(context: Context): Long = directories(context).sumOf { folder -> folder.listFiles().orEmpty().filter(File::isFile).sumOf(File::length) }
     @Synchronized
     fun count(context: Context): Int = directories(context).size
+    fun pendingIds(context: Context): Set<String> = directories(context).map { it.name }.toSet()
     fun lastError(context: Context): String? = context.getSharedPreferences("session-audit-status", Context.MODE_PRIVATE).getString("error", null)
     private fun error(context: Context, value: String?) {
         context.getSharedPreferences("session-audit-status", Context.MODE_PRIVATE).edit().putString("error", value).apply()
@@ -113,7 +114,8 @@ object SessionAuditSpool {
                     val report = SessionAuditProtocol.validateReport(incoming.name,
                         JSONObject(String(SessionAuditFiles.read(reportFile, MAX_REPORT), Charsets.UTF_8)))
                     require(report.getLong("policy_version") == policyVersion)
-                    if (report.getString("state") == "pending_upload") {
+                    val continuous = File(incoming, "continuous.context").exists()
+                    if (report.getString("state") == "pending_upload" && !continuous) {
                         val count = ((report.getLong("duration_ms") + 14_999) / 15_000).toInt()
                         for (index in 0 until count) {
                             require(File(folder, "%05d.meta".format(index)).exists())
@@ -121,6 +123,10 @@ object SessionAuditSpool {
                         }
                     }
                     writeJson(folder, "report.meta", report)
+                    if (continuous) {
+                        SessionAuditFiles.write(File(folder, "continuous"), byteArrayOf(1))
+                        return@forEach // ContinuousRecordingSpool owns the PCM and its encrypted copy.
+                    }
                     // report.json is the writer's final publication. Earlier partial tails are
                     // outside its durable coverage and may be removed only after this commit.
                     incoming.listFiles().orEmpty().forEach { file -> require(file.isFile && !java.nio.file.Files.isSymbolicLink(file.toPath())); require(file.delete()) }
@@ -181,10 +187,21 @@ object SessionAuditSpool {
     fun hasBinding(context: Context, event: PendingCallEvent): Boolean = event.auditPolicyVersion == null ||
         File(root(context), "${event.callId}/call.meta").isFile
 
+    fun continuousMetadataAcknowledged(context: Context, id: String): Boolean =
+        File(root(context), "$id/metadata.ack").isFile && File(root(context), "$id/continuous").isFile
+
+    @Synchronized
+    fun acknowledgeContinuous(context: Context, id: String) {
+        SessionAuditProtocol.canonicalId(id)
+        val folder = File(root(context), id)
+        if (folder.isDirectory && File(folder, "continuous").isFile) remove(folder)
+    }
+
     fun uploadPending(context: Context, api: DeviceApi) {
         // Do not hold the spool monitor across network IO: an incoming call's handoff stays local.
         val ready = synchronized(this) { directories(context).filter { File(it, "metadata.ack").exists() && File(it, "report.meta").exists() } }
         ready.forEach { folder ->
+            if (File(folder, "continuous").exists()) return@forEach
             require(!CallRuntimeState.isBusy()) { "Call started; audit upload paused." }
             val id = folder.name
             val report = readJson(folder, "report.meta")

@@ -127,7 +127,7 @@ def _require_v4_device_capabilities(
             4 in versions
             and status.get("external_call_control_capable") is True
             and status.get("conversation_recording_capable") is True
-            and status.get("call_control_protocol_version") == 1
+            and status.get("call_control_protocol_version") in {1, 2}
             and (
                 not prompt_barge_in_required
                 or status.get("prompt_barge_in_capable") is True

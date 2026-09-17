@@ -2,12 +2,14 @@ package ai.rx1.ivrdroid.control
 
 import android.content.Context
 import android.os.Process
+import android.os.SystemClock
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.system.Os
 import android.system.OsConstants
 import ai.rx1.ivrdroid.audio.RootAudioTrigger
 import ai.rx1.ivrdroid.telecom.external.ExternalCallAuditStore
+import ai.rx1.ivrdroid.telecom.CallRuntimeState
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
@@ -56,6 +58,7 @@ object ConversationCaptureBoundary {
 }
 
 object RecordingSpool {
+    private class DeferredForCall : Exception("Recording processing deferred until the call ends.")
     private const val KEY_ALIAS = "ivrdroid-recording-spool-v1"
     private const val MAXIMUM_VOICEMAIL_BYTES = 512L * 1024L * 1024L
     private const val MAXIMUM_CONVERSATION_BYTES = 4L * 1024L * 1024L * 1024L
@@ -70,7 +73,7 @@ object RecordingSpool {
 
     @Synchronized
     fun reconcile(context: Context) {
-        reconcileInternal(context, onlyStorageKey = null)
+        try { reconcileInternal(context, onlyStorageKey = null) } catch (_: DeferredForCall) { }
     }
 
     /**
@@ -82,6 +85,7 @@ object RecordingSpool {
         context: Context,
         fallbackIdentity: ConversationHandoffIdentity,
     ): ConversationHandoffResult? {
+        if (CallRuntimeState.isBusy()) return null
         val inbox = inbox(context)
         val candidate = inbox.listFiles { file ->
             file.name.endsWith(".json") && conversationStorageKey.matches(file.name.removeSuffix(".json"))
@@ -114,7 +118,10 @@ object RecordingSpool {
                 true,
                 "-",
             )
-        } catch (_: Exception) {
+        } catch (_: DeferredForCall) {
+            null
+        } catch (error: Exception) {
+            RecordingFailureJournal.capture(context, "handoff", fallbackIdentity.callId, key, error = error)
             ConversationHandoffResult(
                 fallbackIdentity,
                 recordingId,
@@ -126,6 +133,7 @@ object RecordingSpool {
     }
 
     private fun reconcileInternal(context: Context, onlyStorageKey: String?) {
+        if (CallRuntimeState.isBusy()) throw DeferredForCall()
         val inbox = inbox(context)
         val spool = spool(context)
         val acknowledgedPattern = Regex("^\\.(${storageKey.pattern})\\.(?:audio|meta)\\.acked\\.tmp$")
@@ -164,6 +172,7 @@ object RecordingSpool {
             .orEmpty()
             .sortedBy { it.name }
             .forEach { receiptFile ->
+                if (CallRuntimeState.isBusy()) throw DeferredForCall()
                 val key = receiptFile.name.removeSuffix(".json")
                 val source = File(inbox, "$key.wav")
                 val audioFinal = File(spool, "$key.audio")
@@ -171,14 +180,21 @@ object RecordingSpool {
                 val audioExisted = audioFinal.exists()
                 val metadataExisted = metadataFinal.exists()
                 var handoffDurable = false
+                var validated = false
+                var callId: String? = null
+                var stage = "validate"
+                val started = SystemClock.elapsedRealtime()
                 try {
                     require(storageKey.matches(key))
                     requireSafeInbound(receiptFile, MAXIMUM_RECEIPT_BYTES)
                     requireSafeInbound(source, MAXIMUM_RECORDING_BYTES)
                     val receipt = JSONObject(receiptFile.readText(Charsets.UTF_8))
                     val pending = parseReceipt(receipt, source)
+                    callId = pending.callId
                     require(pending.storageKey() == key)
                     requireSignedRecordingStep(context, pending)
+                    validated = true
+                    stage = "recover_encrypted_copy"
                     val receiptBytes = receipt.toString().toByteArray(Charsets.UTF_8)
                     if (audioFinal.exists()) {
                         requireSafeSpool(audioFinal)
@@ -199,6 +215,7 @@ object RecordingSpool {
                     } else {
                         MAXIMUM_VOICEMAIL_BYTES
                     }
+                    stage = "capacity"
                     require(usageBytes(context, pending.kind) + additionalBytes <= maximumKindBytes) {
                         "Encrypted ${pending.kind} spool is full."
                     }
@@ -209,9 +226,11 @@ object RecordingSpool {
                     }
 
                     if (!audioFinal.exists()) {
+                        stage = "encrypt_audio"
                         encryptFile(source, File(spool, ".$key.audio.tmp"), audioFinal, key)
                     }
                     if (!metadataFinal.exists()) {
+                        stage = "encrypt_metadata"
                         encryptBytes(
                             receiptBytes,
                             File(spool, ".$key.meta.tmp"),
@@ -219,12 +238,14 @@ object RecordingSpool {
                             "$key:meta",
                         )
                     }
+                    stage = "commit_encrypted_pair"
                     requireSafeSpool(audioFinal)
                     requireSafeSpool(metadataFinal)
                     syncDirectory(spool)
                     handoffDurable = true
-                    require(source.delete())
-                    require(receiptFile.delete())
+                    stage = "remove_plaintext"
+                    require(!source.exists() || source.delete())
+                    require(!receiptFile.exists() || receiptFile.delete())
                     syncDirectory(inbox)
                     if (pending.kind == "conversation" && pending.stopReason != "segment_boundary") {
                         ExternalCallAuditStore.releaseConferenceEvidence(
@@ -235,16 +256,25 @@ object RecordingSpool {
                         )
                     }
                 } catch (error: Exception) {
-                    // An unauthenticated or malformed handoff must not leave caller PCM exposed.
+                    if (error !is DeferredForCall) {
+                        RecordingFailureJournal.capture(context, stage, callId, key,
+                            durationMs = SystemClock.elapsedRealtime() - started,
+                            sourceBytes = source.length(), freeBytes = spool.usableSpace, error = error)
+                    }
                     File(spool, ".$key.audio.tmp").delete()
                     File(spool, ".$key.meta.tmp").delete()
                     if (!handoffDurable && !audioExisted) audioFinal.delete()
                     if (!handoffDurable && !metadataExisted) metadataFinal.delete()
-                    source.delete()
-                    receiptFile.delete()
+                    // Reject untrusted PCM. Keep a validated private pair for a later retry
+                    // after a transient encryption/storage failure; it remains quota bounded.
+                    if (!validated || handoffDurable) {
+                        source.delete()
+                        receiptFile.delete()
+                    }
                     syncDirectory(spool)
                     syncDirectory(inbox)
-                    throw IllegalStateException("Recording handoff was rejected safely.", error)
+                    if (error is DeferredForCall) throw error
+                    throw IllegalStateException("Recording save failed at $stage.", error)
                 }
             }
         if (onlyStorageKey == null) {
@@ -478,9 +508,12 @@ object RecordingSpool {
     }
 
     private fun encryptFile(source: File, temporary: File, destination: File, aad: String) {
-        val encrypted = RecordingEnvelope.encrypt(secretKey(), aad, source.readBytes())
         FileOutputStream(temporary).use { raw ->
-            raw.write(encrypted)
+            FileInputStream(source).use { input ->
+                RecordingEnvelope.encryptStream(secretKey(), aad, input, raw) {
+                    if (CallRuntimeState.isBusy()) throw DeferredForCall()
+                }
+            }
             raw.fd.sync()
         }
         Os.chmod(temporary.absolutePath, 0b110000000)

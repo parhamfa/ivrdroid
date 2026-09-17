@@ -82,7 +82,7 @@ object SecureControlStore {
         val calls = readEvents(context)
         val index = calls.indexOfFirst { it.callId == callId }
         if (index < 0) return
-        val bounded = (calls[index].events + event).takeLast(128)
+        val bounded = (calls[index].events + event).distinct().takeLast(128)
         calls[index] = calls[index].copy(events = bounded)
         writeEvents(context, calls)
     }

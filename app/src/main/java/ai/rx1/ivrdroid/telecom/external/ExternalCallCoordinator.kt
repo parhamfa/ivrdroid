@@ -2,6 +2,7 @@ package ai.rx1.ivrdroid.telecom.external
 
 import android.content.Context
 import android.os.SystemClock
+import android.util.Log
 import ai.rx1.ivrdroid.audio.RootAudioTrigger
 import ai.rx1.ivrdroid.control.ConversationHandoffIdentity
 import ai.rx1.ivrdroid.control.SecureControlStore
@@ -20,10 +21,19 @@ class ExternalCallCoordinator(
     private var sequence = 0L
     private var lastPublishedElapsedMs = -1L
     private var bridgeHealthy = true
+    private var pendingConferenceEvidence: ExternalCallSessionSnapshot? = null
+    private var nextEvidenceRetryElapsedMs = 0L
+    private val recoveryBarrier = TelecomRecoveryBarrier()
+    private val recoveryStartedElapsedMs = SystemClock.elapsedRealtime()
+    var readiness: TelecomReadiness = TelecomReadiness.WAITING_NATIVE
+        private set
 
     @Synchronized
     fun tick(nowElapsedMs: Long = SystemClock.elapsedRealtime()) {
-        if (!initialized) recover(nowElapsedMs)
+        if (!initialized) {
+            recover(nowElapsedMs)
+            if (!initialized) return
+        }
         val request = CallControlBridge.readRequest(appContext)
         if (request != null && request != lastRequest) {
             lastRequest = request
@@ -34,13 +44,19 @@ class ExternalCallCoordinator(
             }
         }
         engine?.reconcile(nowElapsedMs)
+        pendingConferenceEvidence?.takeIf { nowElapsedMs >= nextEvidenceRetryElapsedMs }?.let {
+            nextEvidenceRetryElapsedMs = nowElapsedMs + 5_000
+            if (ExternalCallAuditStore.capture(appContext, it, CallControlStatus.CONFERENCED, "-")) {
+                pendingConferenceEvidence = null
+            }
+        }
         val snapshot = engine?.snapshot()
         if (snapshot != null && !snapshot.terminal &&
             lastStatus != null && nowElapsedMs - lastPublishedElapsedMs >= HEARTBEAT_MS
         ) {
             publishStatus(lastStatus!!, lastReason, snapshot, nowElapsedMs, audit = false)
         }
-        if (!bridgeHealthy && snapshot?.terminal == false) {
+        if (!bridgeHealthy && snapshot?.terminal == false && !snapshot.preservesEstablishedConversation()) {
             engine?.cancel("HELPER_CANCELLED", nowElapsedMs)
         }
     }
@@ -55,16 +71,29 @@ class ExternalCallCoordinator(
 
     override fun onSnapshot(snapshot: ExternalCallSessionSnapshot) {
         runCatching { journal.save(snapshot) }.onFailure { bridgeHealthy = false }
+        if (!snapshot.terminal) CallRecoveryBridge.publishOwnership(appContext, snapshot, telecom.calls())
+    }
+
+    override fun onRecordingFailure(snapshot: ExternalCallSessionSnapshot, nowElapsedMs: Long) {
+        // The recording worker already saved the exception outside the call-control lock.
+        // Never perform storage work or change Telecom state from this notification.
+        Log.w("IVRdroidCall", "Recording failure at $nowElapsedMs; preserving ${snapshot.phase}")
     }
 
     private fun recover(nowElapsedMs: Long) {
-        initialized = true
-        val recovered = journal.load() ?: return
+        val recovered = journal.load()
         val bootId = BootIdentity.current()
+        readiness = recoveryBarrier.observe(CallRecoveryBridge.snapshot(appContext), telecom.calls(), bootId,
+            recovered?.takeUnless { it.terminal }?.config?.sessionId, nowElapsedMs)
+        ExternalCallRuntimeStatus.recovery = ControllerRecoveryStatus(readiness.name,
+            nowElapsedMs - recoveryStartedElapsedMs, recovered?.phase?.name ?: "IDLE", recoveryStartedElapsedMs)
+        if (readiness != TelecomReadiness.READY) return
+        if (recovered == null) { initialized = true; return }
         if (bootId == null || recovered.config.bootId != bootId) {
             // A Telecom call identifier is valid only within its originating boot. Never mutate
             // current calls using a prior-boot journal.
             journal.clear()
+            initialized = true
             return
         }
         if (!matchesActiveSignedInstruction(recovered.config)) {
@@ -79,8 +108,16 @@ class ExternalCallCoordinator(
             )
             journal.save(failed)
             publishStatus(CallControlStatus.SYSTEM_FAILURE, failed.reason, failed, nowElapsedMs, audit = true)
+            initialized = true
             return
         }
+        if (!recovered.terminal && (!CallRecoveryBridge.publishOwnership(appContext, recovered, telecom.calls()) ||
+            !CallRecoveryBridge.attached(appContext, recovered))) {
+            readiness = TelecomReadiness.WAITING_HANDSHAKE
+            ExternalCallRuntimeStatus.recovery = ExternalCallRuntimeStatus.recovery.copy(readiness = readiness.name)
+            return
+        }
+        initialized = true
         engine = ExternalCallEngine(telecom, this, recovered)
         CallControlBridge.readStatus(appContext)?.takeIf {
             it.sessionId == recovered.config.sessionId && it.revisionId == recovered.config.revisionId &&
@@ -92,7 +129,7 @@ class ExternalCallCoordinator(
             lastReason = it.reason
             lastPublishedElapsedMs = it.elapsedMs
         }
-        engine?.recover(bootId, nowElapsedMs)
+        engine?.recover(bootId, nowElapsedMs, independentlyReconciled = true)
     }
 
     private fun handleDial(request: CallControlRequest.Dial, nowElapsedMs: Long) {
@@ -164,7 +201,7 @@ class ExternalCallCoordinator(
         lastReason = "-"
         engine = ExternalCallEngine(telecom, this)
         engine?.begin(config, callerId, nowElapsedMs, request.sequence, request.elapsedMs)
-        if (!bridgeHealthy && engine?.snapshot()?.terminal == false) {
+        if (!bridgeHealthy && engine?.snapshot()?.let { !it.terminal && !it.preservesEstablishedConversation() } == true) {
             engine?.cancel("HELPER_CANCELLED", nowElapsedMs)
         }
     }
@@ -255,8 +292,11 @@ class ExternalCallCoordinator(
         if (conferenceEvidenceCommitted &&
             !ExternalCallAuditStore.capture(appContext, snapshot, status, reason)
         ) {
-            bridgeHealthy = false
-            return
+            // A durable audit receipt is required to publish audio, but is not
+            // permission to keep talking. Retry it without disconnecting people.
+            pendingConferenceEvidence = snapshot
+            nextEvidenceRetryElapsedMs = nowElapsedMs + 5_000
+            Log.e("IVRdroidCall", "Conference audit storage unavailable; preserving the established call")
         }
         val existing = CallControlBridge.readStatus(appContext)
         if (existing != null && existing.sessionId == snapshot.config.sessionId &&
@@ -279,14 +319,6 @@ class ExternalCallCoordinator(
             lastPublishedElapsedMs = nowElapsedMs
         } else {
             bridgeHealthy = false
-            if (conferenceEvidenceCommitted) {
-                ExternalCallAuditStore.releaseConferenceEvidence(
-                    appContext,
-                    snapshot.config.sessionId,
-                    snapshot.config.revisionId,
-                    snapshot.config.blockId,
-                )
-            }
         }
         lastStatus = status
         lastReason = reason
@@ -321,6 +353,9 @@ class ExternalCallCoordinator(
                 it.config.blockId,
             ),
             it.config.bootId,
+            callActive = !it.terminal || telecom.calls().any { call ->
+                call.state != TelecomCallState.DISCONNECTED
+            },
         )
     }
 
@@ -346,7 +381,11 @@ class ExternalCallCoordinator(
     }
 }
 
+internal fun ExternalCallSessionSnapshot.preservesEstablishedConversation(): Boolean =
+    phase == ExternalCallPhase.CONFERENCED || phase == ExternalCallPhase.RETURNING_CALLER
+
 object ExternalCallRuntimeStatus {
+    @Volatile var recovery = ControllerRecoveryStatus("NOT_BOUND", 0, "UNKNOWN", 0)
     fun state(context: Context): String = CallControlBridge.readStatus(context)?.status?.name ?: "UNAVAILABLE"
 
     fun recoveryPending(context: Context): Boolean {
@@ -354,3 +393,5 @@ object ExternalCallRuntimeStatus {
         return snapshot.config.bootId == BootIdentity.current() && !snapshot.terminal
     }
 }
+
+data class ControllerRecoveryStatus(val readiness: String, val durationMs: Long, val phase: String, val startedElapsedMs: Long)

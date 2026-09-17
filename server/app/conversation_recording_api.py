@@ -85,6 +85,8 @@ def _owned_recording(session: Session, recording_id: str, device: Device) -> Rec
         raise HTTPException(status_code=403, detail="Conversation recording belongs to another device")
     if recording.kind != "conversation":
         raise HTTPException(status_code=409, detail="Recording ID belongs to voicemail")
+    if recording.source_format != "legacy_wav":
+        raise HTTPException(status_code=409, detail="Use the continuous recording API for this recording")
     return recording
 
 
@@ -172,6 +174,8 @@ def create_conversation_recording(
     call_id = str(body.call_id)
     existing = session.get(Recording, recording_id)
     if existing is not None:
+        if existing.source_format != "legacy_wav":
+            raise HTTPException(status_code=409, detail="Use the continuous recording API for this recording")
         if existing.device_id != device.id:
             raise HTTPException(status_code=409, detail="Recording ID belongs to another device")
         same = (
@@ -473,6 +477,8 @@ def complete_conversation_recording(
         raise HTTPException(status_code=403, detail="Conversation recording belongs to another device")
     if recording.kind != "conversation":
         raise HTTPException(status_code=409, detail="Recording ID belongs to voicemail")
+    if recording.source_format != "legacy_wav":
+        raise HTTPException(status_code=409, detail="Use the continuous recording API for this recording")
     if recording.status in {"ready", "deleted"}:
         return _recording_response(recording)
     if recording.status != "uploading":
@@ -525,4 +531,3 @@ def complete_conversation_recording(
         caller_masked=mask_phone(caller) if caller else None,
     )
     return _recording_response(recording)
-

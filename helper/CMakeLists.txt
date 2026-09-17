@@ -60,6 +60,8 @@ add_library(ivrdroid_core STATIC
     src/audit_policy.cpp
     src/call_control_protocol.cpp
     src/call_safety_policy.cpp
+    src/call_lifetime_policy.cpp
+    src/continuous_recording.cpp
     src/child_process.cpp
     src/conversation_handoff_protocol.cpp
     src/device_profile.cpp

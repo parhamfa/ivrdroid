@@ -60,7 +60,7 @@ class HelperProtocolTest {
     @Test
     fun parsesPromptBargeInCapabilityWithoutExpandingRuntimeVersions() {
         val parsed = HelperCapabilityProtocol.parse(
-            "runtime=1,2,3,4,5;recording=1;call_control=1;" +
+            "runtime=1,2,3,4,5;recording=1;call_control=2;" +
                 "conversation_recording=1;prompt_barge_in=1",
         )
         assertEquals(setOf(1, 2, 3, 4), parsed.runtimeVersions)

@@ -18,7 +18,7 @@ data class SessionAuditPolicy(val version: Long = 0, val enabled: Boolean = fals
 
 /** This policy has its own signature and version sequence, independent of flow publication. */
 object SessionAuditProtocol {
-    val terminalReasons = setOf("session_complete", "caller_hangup", "preempted", "capture_failure", "storage_full", "interrupted", "writer_failure")
+    val terminalReasons = setOf("session_complete", "caller_hangup", "preempted", "capture_failure", "storage_full", "interrupted", "writer_failure", "buffer_overrun", "max_call_duration")
     private val eventTypes = setOf("answered", "prompt", "digit", "timeout", "invalid", "schedule", "return", "voicemail", "external_call", "ended", "gap")
 
     fun verifyPolicy(envelope: JSONObject, keyB64: String = BuildConfig.CONFIG_SIGNING_PUBLIC_KEY_B64): SessionAuditPolicy {
@@ -51,7 +51,7 @@ object SessionAuditProtocol {
         if (!report.isNull("captured_at")) Instant.parse(report.getString("captured_at"))
         else require(state == "unavailable")
         val reason = report.getString("stop_reason").also { require(it in terminalReasons) }
-        require(report.getBoolean("partial") == (reason !in setOf("session_complete", "caller_hangup")))
+        require(report.getBoolean("partial") == (reason !in setOf("session_complete", "caller_hangup", "max_call_duration")))
         val events = report.getJSONArray("events").also { require(it.length() <= 4096) }
         for (index in 0 until events.length()) {
             val event = events.getJSONObject(index)

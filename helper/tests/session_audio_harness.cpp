@@ -40,14 +40,15 @@ const std::string id = "23d4b16c-f15b-4de4-9444-d08265e194ab";
 const std::string bridge = IVRDROID_AUDIT_BRIDGE;
 const uid_t testUid = geteuid() == 0 ? 2000 : getuid();
 std::string folder() { return bridge + "/session-audit/" + id; }
-void start() {
+void start(bool auditing = true) {
     ivrdroid::ReleaseSessionAudio();
     std::filesystem::remove_all(bridge);
     std::filesystem::create_directories(bridge);
     fake->opens = 0; fake->active = 0; fake->failAfter = 0; fake->reads = 0; fake->queued = 0;
     ivrdroid::appUid = testUid;
-    assert(ivrdroid::AtomicFile(bridge + "/audit-policy", "version=1\nenabled=1\nquota=1073741824\n"));
+    assert(ivrdroid::AtomicFile(bridge + "/audit-policy", std::string("version=1\nenabled=") + (auditing ? "1" : "0") + "\nquota=1073741824\n"));
     assert(ivrdroid::AtomicFile(bridge + "/audit-capacity", "0\n"));
+    assert(ivrdroid::AtomicFile(bridge + "/continuous-capacity", "PCM1 0 0 0\n"));
     ivrdroid::RefreshAuditPolicy(testUid);
     ivrdroid::PrepareSessionAudio(id, testUid, 0, 0);
     ivrdroid::SpawnSessionAudioWorkers();
@@ -55,7 +56,7 @@ void start() {
     assert(ivrdroid::shared && ivrdroid::shared->ready.load());
 }
 void waitFrames(uint64_t frames) {
-    const int64_t deadline = ivrdroid::ClockNs(CLOCK_MONOTONIC) + 30'000'000'000LL;
+    const int64_t deadline = ivrdroid::ClockNs(CLOCK_MONOTONIC) + 400'000'000'000LL;
     while (ivrdroid::shared->produced.load() < frames) {
         assert(ivrdroid::ClockNs(CLOCK_MONOTONIC) < deadline); usleep(2000);
     }
@@ -68,15 +69,21 @@ std::string finish(const char* reason) {
     return ivrdroid::ReadFile(folder() + "/report.json", 1024 * 1024);
 }
 int16_t sample(const std::string& path, size_t frame) {
-    std::ifstream input(path, std::ios::binary); input.seekg(44 + frame * 4);
+    std::ifstream input(path, std::ios::binary); input.seekg(frame * 4);
     int16_t value = 0; input.read(reinterpret_cast<char*>(&value), sizeof(value)); assert(input.good()); return value;
 }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool longRun = argc == 2 && std::string(argv[1]) == "--long";
     void* state = mmap(nullptr, sizeof(FakeState), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     assert(state != MAP_FAILED); fake = new (state) FakeState();
     start();
+    const std::string conversationId = "923d4b16-cf15-4de4-9444-d08265e194ab";
+    const std::string blockId = "22222222-2222-4222-8222-222222222222";
+    const std::string conversationFolder = bridge + "/continuous-recordings/" + conversationId;
+    auto* conversation = ivrdroid::StartContinuousConversation(conversationId, id, 21, blockId);
+    assert(conversation);
     pcm_config config {}; config.channels = 2; config.rate = 48000;
     auto* consumer = ivrdroid::OpenSessionCapture(0, 0, PCM_IN, &config);
     assert(ivrdroid::SessionCaptureReady(consumer));
@@ -98,21 +105,28 @@ int main() {
     const int64_t base = ivrdroid::shared->baseNs.load();
     assert(ivrdroid::ReadSessionCapture(consumer, carrier, 1200) == 1200 && carrier[0] == 1000);
     ivrdroid::CloseSessionCapture(consumer);
-    waitFrames(650);
+    waitFrames(longRun ? 14500 : 650);
+    assert(ivrdroid::ContinuousConversationHealthy(conversation));
+    const pid_t conversationPid = conversation->pid;
+    ivrdroid::StopContinuousConversation(conversation, "caller_hangup", false);
+    int conversationStatus = 0;
+    assert(waitpid(conversationPid, &conversationStatus, 0) == conversationPid && WIFEXITED(conversationStatus) && WEXITSTATUS(conversationStatus) == 0);
     auto report = finish("caller_hangup");
     assert(report.find("\"partial\":false") != std::string::npos);
-    assert(std::filesystem::exists(folder() + "/00000.json"));
-    assert(std::filesystem::exists(folder() + "/00001.json"));
-    assert(sample(folder() + "/00000.wav", (promptAt - base + 5'000'000) * 48000 / 1'000'000'000LL) == 1500);
-    assert(sample(folder() + "/00000.wav", (promptEnd - base + 30'000'000) * 48000 / 1'000'000'000LL) == 1000);
-    std::cout << "PASS: one capture, independent original PCM, rendered prompt interruption, 15s rotation\n";
+    assert(std::filesystem::exists(folder() + "/continuous.sealed"));
+    assert(!std::filesystem::exists(folder() + "/00000.wav"));
+    assert(sample(folder() + "/audio.pcm", (promptAt - base + 5'000'000) * 48000 / 1'000'000'000LL) == 1500);
+    assert(sample(folder() + "/audio.pcm", (promptEnd - base + 30'000'000) * 48000 / 1'000'000'000LL) == 1000);
+    assert(sample(conversationFolder + "/audio.pcm", 4800) == 1000);
+    if (longRun) assert(std::filesystem::file_size(conversationFolder + "/audio.pcm") > 360ULL * 192000);
+    std::cout << "PASS: both continuous writers, independent PCM, rendered prompt interruption, no timed rotation" << std::endl;
 
     start(); waitFrames(95); // 2.375s: only completed one-second checkpoints are recoverable.
     kill(ivrdroid::writerPid, SIGKILL); waitpid(ivrdroid::writerPid, nullptr, 0); ivrdroid::writerPid = -1;
     report = finish("interrupted");
     assert(report.find("\"duration_ms\":2000") != std::string::npos);
     assert(report.find("\"partial\":true") != std::string::npos);
-    assert(std::filesystem::file_size(folder() + "/00000.wav") == 44 + 2000 * 192);
+    assert(std::filesystem::file_size(folder() + "/audio.pcm") == 2000 * 192);
     std::cout << "PASS: interrupted writer recovers only the last durable checkpoint\n";
 
     start(); waitFrames(40);
@@ -138,11 +152,35 @@ int main() {
     std::cout << "PASS: audit handoff failure preserves call capture and marks partial coverage\n";
 
     start();
-    assert(ivrdroid::AtomicFile(bridge + "/audit-capacity", "1073741824\n"));
+    assert(ivrdroid::AtomicFile(bridge + "/continuous-capacity", "PCM1 0 1073741824 0\n"));
     waitFrames(40);
     report = finish("caller_hangup");
     assert(report.find("storage_full") != std::string::npos);
     std::cout << "PASS: audit quota preserves recording headroom\n";
+
+    start(); waitFrames(50);
+    kill(ivrdroid::writerPid, SIGSTOP);
+    waitFrames(210);
+    consumer = ivrdroid::OpenSessionCapture(0, 0, PCM_IN, &config);
+    assert(ivrdroid::ReadSessionCapture(consumer, carrier, 1200) == 1200 && carrier[0] == 1000);
+    ivrdroid::CloseSessionCapture(consumer);
+    kill(ivrdroid::writerPid, SIGCONT);
+    waitFrames(230);
+    report = finish("caller_hangup");
+    assert(report.find("buffer_overrun") != std::string::npos && report.find("\"partial\":true") != std::string::npos);
+    std::cout << "PASS: blocked audit writer leaves capture running and retains a partial prefix\n";
+
+    start(false);
+    conversation = ivrdroid::StartContinuousConversation(conversationId, id, 21, blockId);
+    assert(conversation && ivrdroid::writerPid <= 0);
+    waitFrames(100);
+    const pid_t independentPid = conversation->pid;
+    ivrdroid::StopContinuousConversation(conversation, "operator_hangup", false);
+    assert(waitpid(independentPid, &conversationStatus, 0) == independentPid && WIFEXITED(conversationStatus) && WEXITSTATUS(conversationStatus) == 0);
+    finish("caller_hangup");
+    assert(std::filesystem::file_size(conversationFolder + "/audio.pcm") > 192000);
+    assert(!std::filesystem::exists(folder() + "/audio.pcm"));
+    std::cout << "PASS: conversation recording remains available with whole-call auditing disabled\n";
     std::filesystem::remove_all(bridge);
     munmap(state, sizeof(FakeState));
 }

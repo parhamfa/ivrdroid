@@ -80,11 +80,12 @@ emergency call retains the existing fail-closed preemption behavior.
 The helper/app bridge is an owner-only, atomic, one-line protocol. Requests contain the session,
 revision, block, boot identity, sequence/timing data, and desired state. The app resolves and
 validates the phone number and timeout against the encrypted active signed V4 manifest instead of
-trusting IPC. Status is refreshed once per second; owned multi-call phases fail closed after three
-seconds without a controller or recorder heartbeat.
+trusting IPC. Status is refreshed once per second. During an established conversation, the native
+guardian independently verifies the owned conference while the app recovers. A recording failure
+cannot terminate that conversation. Bridge version 2 includes a recovery readiness handshake.
 
 The normal 20-minute guardian remains active except during a healthy owned conference with fresh
-heartbeats, healthy recording, and the private speaker/microphone state. Physical tablet speaker
+heartbeats and the private speaker/microphone state. Physical tablet speaker
 and microphone stay disabled; only the two carrier legs should be audible in the recording.
 
 ## Conversation recording
@@ -93,17 +94,31 @@ The helper opens 48 kHz stereo PCM16 when the operator becomes active and retain
 in-memory pre-roll. Durable audio begins only after the conference parent is verified. A failed
 merge discards the pre-merge audio.
 
-Durable PCM rotates every 180 seconds without closing the capture path. Each fsynced segment and
-receipt is handed to Android for immediate encryption into the separate conversation spool. The
-spool reserves 512 MiB free device space and is capped at 4 GiB. A recorder or storage failure
-retains any valid partial audio, disconnects only the operator, restores the caller, and takes
-System failure.
+Both recorders now write continuous raw PCM files with one-second durable checkpoints. Checkpoints
+do not close or split files. App encryption and upload are not prerequisites for continuing the
+conversation. There is no ten-second recording acknowledgment deadline. The combined private
+inbox and encrypted conversation spool retain their quota and filesystem reserve, with additional
+space reserved for processing. Capture/storage errors retain valid partial audio while the established
+conversation continues. They cannot disconnect either leg, select System failure, or rewrite a
+completed call's outcome. Genuine call-control, ownership, privacy, and guardian failures retain
+their existing cleanup behavior. Recording availability is not a prerequisite for the merge.
 
-General synchronization remains paused during a live call. Afterward the app uploads call history
-first, then idempotent ordered conversation segments. The server accepts them only for the matching
-signed V4 revision and `external_call` block, verifies hashes/order/durations, assembles with
-bounded memory, creates one encrypted stereo MP3, and removes source segments only after durable
-completion. The Recordings page presents the logical conversation, not its physical segments.
+After the caller's IVR session ends, the app encrypts the private files using a bounded streaming
+buffer into one authenticated-record container, then uploads one logical recording. A new call
+pauses encryption at buffer boundaries and retains completed encrypted records for resume.
+Transient save failures retain validated private input for retry; malformed or unauthorized input
+is rejected. See [CALL_CONTINUITY.md](CALL_CONTINUITY.md) for durability and the separate call limit.
+
+Recording diagnostics retain original exceptions, operation stage, duration, file size and free
+space in the private `recording-diagnostics/failures.json` journal (64 entries, at most 1 MiB).
+Native capture and finalizer failures have separate private latest-error receipts in `bridge`.
+Call history displays failures during the conversation separately from the final caller hangup,
+and replayed terminal states reuse their original timestamp instead of creating a new incident.
+
+During a live call only lightweight status synchronization continues. Afterward the app uploads
+call history, then resumes continuous audio by byte offset. The server accepts audio only for the
+matching signed V4 revision and `external_call` block, verifies coverage/size/hash, and durably queues
+bounded processing into encrypted stereo MP3. Legacy segments remain accepted during migration.
 
 Voicemail and conversations share the existing automatic/manual retention policy and 5 GiB server
 quota. Logs, audit records, call events, and capability status never include the full operator
@@ -116,7 +131,7 @@ Every active device must report all of the following before a V4 draft can publi
 - `runtime_versions` contains `4`;
 - `external_call_control_capable` is true;
 - `conversation_recording_capable` is true;
-- `call_control_protocol_version` is `1`.
+- `call_control_protocol_version` is `1` (legacy) or `2` (continuous recording and recovery).
 
 The dashboard may author and save V4 while a device is not ready, but publication is rejected.
 
@@ -133,6 +148,11 @@ The dashboard may author and save V4 while a device is not ready, but publicatio
 5. Publish a bounded V4 test flow only after readiness is acknowledged.
 6. Test successful merge, no-answer timeout, busy/rejection, operator-first hangup, caller-first
    hangup, screen-off operation, controller restart/rebind, and recording failure.
+   For the continuity change, use the matching app and helper together: an older helper still
+   expects live encryption acknowledgments. On an isolated acceptance call lasting more than six
+   minutes, delay saving past ten seconds, exercise both checkpoint boundaries, and inject a
+   recording write/storage failure. Neither leg may disconnect or hear a failure prompt because
+   of the recorder. Verify partial status, retries, both voices, and the real final hangup afterward.
 7. Have caller and operator speak different phrases. Dashboard playback must contain both remote
    voices and no tablet microphone, prompt, or ambient leakage.
 8. Keep the prior signed V3 revision immediately activatable until every physical case passes.

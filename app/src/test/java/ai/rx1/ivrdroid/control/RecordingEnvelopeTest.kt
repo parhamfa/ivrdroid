@@ -5,10 +5,24 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Test
 import javax.crypto.spec.SecretKeySpec
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 
 class RecordingEnvelopeTest {
     private val key = SecretKeySpec(ByteArray(32) { it.toByte() }, "AES")
     private val audio = "caller speech that must remain private".toByteArray()
+
+    @Test
+    fun streamingEncryptionIsCompatibleAcrossBufferBoundaries() {
+        val nonce = ByteArray(12) { (it + 1).toByte() }
+        for (length in listOf(1, 65535, 65536, 65537, 3 * 65536 + 11)) {
+            val samples = ByteArray(length) { (it % 251).toByte() }
+            val output = ByteArrayOutputStream()
+            RecordingEnvelope.encryptStream(key, "recording-id", ByteArrayInputStream(samples), output, nonce)
+            assertArrayEquals(RecordingEnvelope.encrypt(key, "recording-id", samples, nonce), output.toByteArray())
+            assertArrayEquals(samples, RecordingEnvelope.decrypt(key, "recording-id", output.toByteArray()))
+        }
+    }
 
     @Test
     fun encryptedSpoolEnvelopeRecoversAfterRestartWithoutExposingPlaintext() {

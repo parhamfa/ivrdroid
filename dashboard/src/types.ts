@@ -252,7 +252,7 @@ export interface RevisionDetail {
   legacy: boolean;
 }
 
-export type RecordingStopReason = "finish_key" | "maximum_duration" | "caller_hangup" | "operator_hangup" | "recording_failure" | "session_complete" | "preempted" | "capture_failure" | "storage_full" | "interrupted" | "writer_failure";
+export type RecordingStopReason = "finish_key" | "maximum_duration" | "caller_hangup" | "operator_hangup" | "recording_failure" | "session_complete" | "preempted" | "capture_failure" | "storage_full" | "interrupted" | "writer_failure" | "buffer_overrun" | "max_call_duration" | "completed";
 
 export interface Recording {
   id: string;
@@ -270,6 +270,12 @@ export interface Recording {
   duration_ms: number;
   stop_reason: RecordingStopReason;
   status: "uploading" | "processing" | "ready" | "failed" | "deleted";
+  partial?: boolean;
+  source_format?: string;
+  processing_error?: string | null;
+  processing_state?: string | null;
+  upload_offset?: number | null;
+  source_size_bytes?: number | null;
   listened_at: string | null;
   deleted_at: string | null;
   playback_url: string | null;
@@ -366,4 +372,11 @@ export interface SessionAuditSettings {
   signature_b64: string;
   server_quota_bytes: number;
   devices: Array<{ id: string; name: string; capable: boolean; applied_version: number; enabled: boolean; spool_bytes: number; spool_count: number; last_error: string | null }>;
+}
+
+export interface CallSafetySettings {
+  document: { kind: "call_safety_policy"; schema_version: 1; version: number; maximum_call_duration_seconds: number };
+  sha256: string;
+  signature_b64: string;
+  devices: Array<{ id: string; name: string; capable: boolean; applied_version: number | null; maximum_call_duration_seconds: number | null; last_error: string | null }>;
 }

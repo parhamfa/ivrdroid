@@ -20,9 +20,8 @@ For a UUID-correlated `START_MENU` request it:
    owner-only temporary WAV until the configured finish key, hard maximum, or caller hangup;
 9. trims the buffered finish tone, atomically hands a finalized WAV plus bounded receipt to the
    app, and deletes partial audio on capture/privacy/preemption failure;
-10. for a signed V4 `external_call`, requests an app-owned outgoing leg, opens recorder pre-roll
-    before permitting merge, discards all pre-conference audio, and durably rotates verified
-    conference audio into at-most-180-second segments;
+10. for a signed V4 `external_call`, requests an app-owned outgoing leg and records verified
+    conference audio to one continuous PCM file in an independent writer process;
 11. follows the compiled success, not-connected, system-failure, or unavailable branch, while a
     caller-first hangup always terminates without taking a flow branch;
 12. ends only the owned call through the Telecom binder transaction pinned to this ROM;
@@ -48,8 +47,8 @@ numbers, or menu targets.
 The app-private bridge exposes a mode-0700 `recordings/` inbox and a bounded capacity file. The
 helper accepts only canonical UUID filenames, rejects symlinks, wrong ownership, and group/other
 permissions, keeps voicemail under its 512 MiB limit, and requires V2 capacity telemetry before
-using the separate 4 GiB conversation budget. A projected conversation segment must also leave
-at least 512 MiB free according to both the app and `statvfs`. Legacy `START_MENU\n` remains
+using the separate 4 GiB conversation budget. Continuous writers enforce growing byte budgets,
+the filesystem reserve and processing workspace at least once per second. Legacy `START_MENU\n` remains
 accepted for V1/V2 rollback; recording and external calls require
 `START_MENU <canonical-call-uuid>\n`.
 
@@ -61,15 +60,15 @@ Every direction uses atomic replacement, ASCII, exactly one trailing LF, and at 
 Helper-to-app requests are:
 
 ```text
-IVRDROID_CALL_CONTROL_V1 DIAL <call_uuid> <revision_id> <block_uuid> <request_seq> <boot_uuid> <elapsed_ms> <phone> <answer_timeout_ms>\n
-IVRDROID_CALL_CONTROL_V1 RECORDER_READY <call_uuid> <revision_id> <block_uuid> <request_seq> <boot_uuid> <elapsed_ms>\n
-IVRDROID_CALL_CONTROL_V1 CANCEL <call_uuid> <revision_id> <block_uuid> <request_seq> <boot_uuid> <elapsed_ms> <reason>\n
+IVRDROID_CALL_CONTROL_V2 DIAL <call_uuid> <revision_id> <block_uuid> <request_seq> <boot_uuid> <elapsed_ms> <phone> <answer_timeout_ms>\n
+IVRDROID_CALL_CONTROL_V2 RECORDER_READY <call_uuid> <revision_id> <block_uuid> <request_seq> <boot_uuid> <elapsed_ms>\n
+IVRDROID_CALL_CONTROL_V2 CANCEL <call_uuid> <revision_id> <block_uuid> <request_seq> <boot_uuid> <elapsed_ms> <reason>\n
 ```
 
 App-to-helper status is:
 
 ```text
-IVRDROID_CALL_CONTROL_V1 <phase> <call_uuid> <revision_id> <block_uuid> <seq> <boot_uuid> <elapsed_ms> <reason>\n
+IVRDROID_CALL_CONTROL_V2 <phase> <call_uuid> <revision_id> <block_uuid> <seq> <boot_uuid> <elapsed_ms> <reason>\n
 ```
 
 `phase` is `ACK`, `CALLER_HELD`, `DIALING`, `OPERATOR_ANSWERED`, `MERGING`, `CONFERENCED`,
@@ -99,22 +98,25 @@ Capacity V2 is exactly:
 IVRDROID_RECORDING_CAPACITY_V2 <voicemail_bytes> <voicemail_count> <conversation_bytes> <conversation_count> <filesystem_free_bytes>\n
 ```
 
-Conversation files use `<recording_uuid>.<five-digit-segment-index>.wav` with a matching receipt.
+### Legacy recording compatibility
+
+Legacy conversation files use `<recording_uuid>.<five-digit-segment-index>.wav` with a matching receipt.
 Receipts have `version:2`, `kind:"conversation"`, the shared logical `recording_id`, call/revision/
 block correlation, equal `sequence` and `segment_index`, UTC capture time, duration, byte size,
 SHA-256, and `partial`. Stop reasons are `segment_boundary`, `operator_hangup`, `caller_hangup`,
 or `recording_failure`; only `recording_failure` has `partial:true`.
 
-The app must durably encrypt and delete each plaintext WAV/receipt pair before acknowledging it:
+The legacy app protocol acknowledges durably encrypted WAV/receipt pairs:
 
 ```text
 IVRDROID_CONVERSATION_HANDOFF_V1 <call_uuid> <revision_id> <block_uuid> <recording_uuid> <segment_index> <boot_uuid> <elapsed_ms> <OK|FAILED> <reason>\n
 ```
 
 `segment_index` is the ordered stream sequence (starting at zero), elapsed time cannot decrease,
-`OK` requires reason `-`, and `FAILED` requires a bounded uppercase reason. The helper continues
-capturing the next segment while waiting, but cancels and selects system failure if an exact ACK is
-not received within ten seconds. The final segment is not considered durable until its ACK arrives.
+`OK` requires reason `-`, and `FAILED` requires a bounded uppercase reason. Version 0.10.0 no longer
+uses this acknowledgment or timed rotation for new conversation recordings. Both recorders use
+`audio.pcm`, `continuous.context`, and `continuous.sealed`; see
+[the continuity contract](../docs/CALL_CONTINUITY.md) for recovery, encryption and upload behavior.
 
 TinyALSA is vendored at commit `9fab97ca07184371ecad81154d1dadb09d0fa7cf` under its BSD license.
 See `third_party/tinyalsa/NOTICE`.

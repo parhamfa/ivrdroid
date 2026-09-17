@@ -439,9 +439,25 @@ int main(int argc, char** argv) {
     assert(dial.kind == ivrdroid::call_control::RequestKind::Dial);
     assert(dial.sessionUuid == kSession);
     assert(ivrdroid::call_control::EncodeRequest(dial) ==
-        std::string("IVRDROID_CALL_CONTROL_V1 DIAL ") + kSession + " 17 " +
+        std::string("IVRDROID_CALL_CONTROL_V2 DIAL ") + kSession + " 17 " +
         kBlock + " 1 " + kBoot + " 12345 +982112345678 30000\n");
 
+    for (const int outage : {1, 3, 10, 40, 130}) {
+        auto recovery = Policy();
+        recovery.Observe(Status(StatusKind::OperatorAnswered, 1), 1100);
+        assert(recovery.MarkRecorderReady(1101));
+        recovery.Observe(Status(StatusKind::Merging, 2), 1200);
+        recovery.Observe(Status(StatusKind::Conferenced, 3), 1300);
+        // No app callbacks, status heartbeat, recording ACK or network response.
+        for (int64_t now = 1400; now <= 1400 + outage * 1000; now += 500) {
+            recovery.ConfirmIndependentConference(now);
+            assert(recovery.CheckDeadline(now) == ExternalCallDecision::Conferenced);
+        }
+        const int64_t resumed = 1400 + outage * 1000;
+        assert(recovery.Observe(Status(StatusKind::Conferenced, 4, resumed), resumed) == ExternalCallDecision::Conferenced);
+        // If independent evidence also disappears, old proof is insufficient.
+        assert(recovery.CheckDeadline(resumed + 4000) == ExternalCallDecision::ControlTimeout);
+    }
     std::cout << "External-call policy tests passed." << std::endl;
     return 0;
 }

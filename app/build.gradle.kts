@@ -11,8 +11,8 @@ android {
         applicationId = "ai.rx1.ivrdroid"
         minSdk = 29
         targetSdk = 35
-        versionCode = 18
-        versionName = "0.9.0"
+        versionCode = 19
+        versionName = "0.10.0"
 
         buildConfigField("String", "CONTROL_PLANE_URL", "\"https://ivrdroid.rx1.ai\"")
         buildConfigField("String", "CONFIG_SIGNING_PUBLIC_KEY_B64", "\"fz+JZNn34uWdo408TosUYVS162AusewBxkg2ip8Cnnw=\"")
@@ -57,4 +57,8 @@ dependencies {
     implementation("net.i2p.crypto:eddsa:0.3.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+}
+
+tasks.withType<Test>().configureEach {
+    maxHeapSize = providers.gradleProperty("ivrdroidTestHeap").getOrElse("512m")
 }

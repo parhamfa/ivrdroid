@@ -92,7 +92,8 @@ ExternalCallDecision ExternalCallPolicy::Observe(
     if (status.kind == StatusKind::Invalid || !Correlates(status)) {
         return ExternalCallDecision::IgnoredForeign;
     }
-    if (nowMilliseconds >= heartbeatDeadlineMilliseconds_) {
+    if (nowMilliseconds >= heartbeatDeadlineMilliseconds_ && !(stage_ == ExternalCallStage::Conferenced &&
+        independentConferenceAt_ >= 0 && nowMilliseconds >= independentConferenceAt_ && nowMilliseconds - independentConferenceAt_ <= 2000)) {
         stage_ = ExternalCallStage::Terminal;
         return ExternalCallDecision::ControlTimeout;
     }
@@ -320,7 +321,8 @@ ExternalCallerSafeDecision ExternalCallerSafePolicy::Observe(
 ExternalCallDecision ExternalCallPolicy::CheckDeadline(
     int64_t nowMilliseconds) const {
     if (terminal()) return ExternalCallDecision::ProtocolFailure;
-    if (nowMilliseconds >= heartbeatDeadlineMilliseconds_) {
+    if (nowMilliseconds >= heartbeatDeadlineMilliseconds_ && !(stage_ == ExternalCallStage::Conferenced &&
+        independentConferenceAt_ >= 0 && nowMilliseconds >= independentConferenceAt_ && nowMilliseconds - independentConferenceAt_ <= 2000)) {
         return ExternalCallDecision::ControlTimeout;
     }
     if (answerDeadlineMilliseconds_ == 0 &&

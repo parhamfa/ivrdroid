@@ -149,6 +149,41 @@ int main() {
         ivrdroid::ClassifyCallDisposition(impossible) ==
         CallDisposition::Unknown);
 
-    std::cout << "Telecom guard tests passed." << std::endl;
+    const ivrdroid::OwnedCallTopology owned {"TC@a", "TC@b", "TC@c"};
+    auto conference = ivrdroid::ParseTelecomCallSnapshot(
+        "mCalls:\n"
+        " [Call id=TC@a, state=ACTIVE, childs(0), has_parent(true)]\n"
+        " [Call id=TC@b, state=ON_HOLD, childs(0), has_parent(true)]\n"
+        " [Call id=TC@c, state=ACTIVE, childs(2), has_parent(false)]\n"
+        "mCallAudioManager:\n");
+    assert(ivrdroid::MatchesOwnedConference(conference, owned));
+    ivrdroid::OwnedCallTopology awaitingParent {owned.caller, owned.operatorCall, {}};
+    assert(ivrdroid::ResolveOwnedConference(conference, &awaitingParent));
+    assert(awaitingParent.conference == owned.conference);
+    ivrdroid::OwnedCallTopology missingOperator {owned.caller, {}, {}};
+    assert(!ivrdroid::ResolveOwnedConference(conference, &missingOperator));
+    const auto wire = ivrdroid::FormatNativeCallSnapshot(conference, "boot", "session", 5000, 1);
+    ivrdroid::TelecomCallSnapshot recovered {};
+    assert(ivrdroid::ParseNativeCallSnapshot(wire, "boot", "session", 5100, &recovered));
+    assert(ivrdroid::MatchesOwnedConference(recovered, owned));
+    assert(!ivrdroid::ParseNativeCallSnapshot(wire, "boot", "session", 7100, &recovered));
+    assert(!ivrdroid::ParseNativeCallSnapshot(wire, "other-boot", "session", 5100, &recovered));
+    for (int index = 0; index < 3; ++index) {
+        auto incomplete = conference;
+        incomplete.calls.erase(incomplete.calls.begin() + index); --incomplete.liveCallCount;
+        assert(!ivrdroid::MatchesOwnedConference(incomplete, owned));
+        assert(ivrdroid::ContainsOnlyOwnedCalls(incomplete, owned));
+    }
+    auto foreign = conference; foreign.calls[1].id = "TC@unrelated";
+    assert(!ivrdroid::ContainsOnlyOwnedCalls(foreign, owned));
+    awaitingParent.conference.clear();
+    assert(!ivrdroid::ResolveOwnedConference(foreign, &awaitingParent));
+    auto unsafe = conference; unsafe.emergencyCallPresent = true;
+    assert(!ivrdroid::ContainsOnlyOwnedCalls(unsafe, owned));
+    unsafe = conference; unsafe.calls[2].children = 1;
+    assert(!ivrdroid::MatchesOwnedConference(unsafe, owned));
+    unsafe = conference; unsafe.calls[0].parentKnown = false;
+    assert(!ivrdroid::MatchesOwnedConference(unsafe, owned));
+    std::cout << "Telecom guard ownership, topology and freshness tests passed." << std::endl;
     return 0;
 }

@@ -2,8 +2,10 @@ package ai.rx1.ivrdroid.telecom.external
 
 import android.content.Context
 import android.system.Os
+import android.os.SystemClock
 import ai.rx1.ivrdroid.control.PendingCallSubEvent
 import ai.rx1.ivrdroid.control.SecureControlStore
+import ai.rx1.ivrdroid.control.RecordingFailureJournal
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -15,6 +17,17 @@ import java.time.Instant
 object ExternalCallAuditStore {
     private const val MAXIMUM_EVENTS = 128
     private const val MAXIMUM_BYTES = 128 * 1024L
+
+    internal fun existingTransition(
+        events: JSONArray, snapshot: ExternalCallSessionSnapshot, status: CallControlStatus, reason: String,
+    ): JSONObject? = (0 until events.length()).mapNotNull(events::optJSONObject).firstOrNull {
+        it.optString("session_id") == snapshot.config.sessionId &&
+            it.optLong("revision_id") == snapshot.config.revisionId &&
+            it.optString("block_id") == snapshot.config.blockId &&
+            it.optLong("elapsed_ms", -1) == snapshot.updatedElapsedMs &&
+            it.optString("status") == status.name && it.optString("reason") == reason &&
+            (!it.has("boot_id") || it.optString("boot_id") == snapshot.config.bootId)
+    }
 
     @Synchronized
     fun capture(
@@ -31,15 +44,21 @@ object ExternalCallAuditStore {
             } else {
                 JSONArray()
             }
-            val retained = JSONArray()
-            val first = maxOf(0, existing.length() - (MAXIMUM_EVENTS - 1))
-            for (index in first until existing.length()) retained.put(existing.getJSONObject(index))
             // Deliberately exclude phone numbers, Telecom call IDs, disconnect strings, and audio paths.
-            val occurredAt = Instant.now().toString()
-            retained.put(
+            val previous = existingTransition(existing, snapshot, status, reason)
+            // Recovery can publish an old terminal state days later. Reuse its event identity and
+            // timestamp. If its journal entry has expired, anchor to the same-boot monotonic clock.
+            val occurredAt = previous?.getString("occurred_at") ?: Instant.now().minusMillis(
+                maxOf(0, SystemClock.elapsedRealtime() - snapshot.updatedElapsedMs),
+            ).toString()
+            val retained = JSONArray()
+            val first = maxOf(0, existing.length() - (MAXIMUM_EVENTS - if (previous == null) 1 else 0))
+            for (index in first until existing.length()) retained.put(existing.getJSONObject(index))
+            if (previous == null) retained.put(
                 JSONObject()
                     .put("occurred_at", occurredAt)
                     .put("elapsed_ms", snapshot.updatedElapsedMs)
+                    .put("boot_id", snapshot.config.bootId)
                     .put("session_id", snapshot.config.sessionId)
                     .put("revision_id", snapshot.config.revisionId)
                     .put("block_id", snapshot.config.blockId)
@@ -76,6 +95,8 @@ object ExternalCallAuditStore {
             if (status == CallControlStatus.CONFERENCED) {
                 retainConferenceEvidence(context, snapshot, occurredAt)
             }
+        }.onFailure {
+            RecordingFailureJournal.capture(context, "call_audit_commit", callId = snapshot.config.sessionId, error = it)
         }.isSuccess
 
     @Synchronized

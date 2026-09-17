@@ -54,6 +54,7 @@ public:
         int64_t nowMilliseconds);
     bool MarkRecorderReady(int64_t nowMilliseconds);
     ExternalCallDecision CheckDeadline(int64_t nowMilliseconds) const;
+    void ConfirmIndependentConference(int64_t nowMilliseconds) { independentConferenceAt_ = nowMilliseconds; }
 
     ExternalCallStage stage() const { return stage_; }
     uint64_t lastSequence() const { return lastSequence_; }
@@ -82,6 +83,7 @@ private:
     call_control::StatusKind lastKind_ = call_control::StatusKind::Invalid;
     std::string lastReason_;
     int highestPhaseRank_ = -1;
+    int64_t independentConferenceAt_ = -1;
 };
 
 struct ExternalCallTerminalExpectation {

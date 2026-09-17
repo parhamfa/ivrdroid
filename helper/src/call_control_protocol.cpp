@@ -7,7 +7,7 @@
 namespace ivrdroid::call_control {
 namespace {
 
-constexpr std::string_view kVersion = "IVRDROID_CALL_CONTROL_V1";
+constexpr std::string_view kVersion = "IVRDROID_CALL_CONTROL_V2";
 
 std::vector<std::string_view> Split(std::string_view wire) {
     std::vector<std::string_view> tokens;

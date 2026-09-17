@@ -73,6 +73,13 @@ class AndroidTelecomControl(
 
     override fun calls(): List<TelecomCallSnapshot> = live.map { (id, call) -> snapshot(id, call) }
 
+    fun answerRecoveredCaller(callId: String): Boolean {
+        val call = calls().singleOrNull { it.id == callId } ?: return false
+        if (call.ownerSessionId == null || call.emergency || call.state != TelecomCallState.RINGING ||
+            call.direction != TelecomCallDirection.INCOMING) return false
+        return action(callId) { it.answer(VideoProfile.STATE_AUDIO_ONLY) }
+    }
+
     override fun claimIncomingCaller(
         sessionId: String,
         signedSessionAuthorized: Boolean,
@@ -115,6 +122,9 @@ class AndroidTelecomControl(
         val details = call.details
         return TelecomCallSnapshot(
             id = id,
+            nativeId = NativeTelecomIdentity.from(call.toString()),
+            parentNativeId = call.parent?.let { NativeTelecomIdentity.from(it.toString()) },
+            childrenNativeIds = call.children.mapNotNull { NativeTelecomIdentity.from(it.toString()) },
             direction = when (details.callDirection) {
                 Call.Details.DIRECTION_INCOMING -> TelecomCallDirection.INCOMING
                 Call.Details.DIRECTION_OUTGOING -> TelecomCallDirection.OUTGOING

@@ -28,10 +28,28 @@ class PrivilegedInCallService : InCallService() {
     private val poll = object : Runnable {
         override fun run() {
             if (!running) return
-            runCatching { coordinator.tick() }
+            runCatching { tickCallControl() }
                 .onFailure { Log.e(TAG, "External-call controller tick failed closed.", it) }
             handoffWorker.updateSession(coordinator.conversationHandoffSession())
             handler.postDelayed(this, POLL_INTERVAL_MS)
+        }
+    }
+
+    private fun tickCallControl() {
+        LocalCallSession.observeCalls(applicationContext, telecom.calls())
+        LocalCallSession.recoverAnswer(applicationContext, telecom.calls())?.let { telecom.answerRecoveredCaller(it) }
+        val expiredSession = LocalCallSession.expiredSession()
+        if (expiredSession == null) {
+            coordinator.tick()
+            return
+        }
+        // Callback-triggered ticks obey the same cap as timer ticks. Otherwise
+        // disconnecting the first leg could race into an IVR fallback prompt.
+        val owned = telecom.calls().filter { it.ownerSessionId == expiredSession && !it.emergency }
+        if (owned.isNotEmpty()) {
+            LocalCallSession.finishRequested(applicationContext, "MAX_CALL_DURATION",
+                RootAudioTrigger.readState(applicationContext).sessionPath, expiredSession)
+            owned.forEach { telecom.disconnect(it.id) }
         }
     }
 
@@ -42,7 +60,7 @@ class PrivilegedInCallService : InCallService() {
             this,
             getSystemService(Context.TELECOM_SERVICE) as TelecomManager,
             handler,
-        ) { handler.post { if (running) coordinator.tick() } }
+        ) { handler.post { if (running) tickCallControl() } }
         coordinator = ExternalCallCoordinator(this, telecom)
         handoffWorker = ConversationHandoffWorker(this) { identity, elapsedMs ->
             // The coordinator serializes worker and Telecom ticks. Calling it here also covers a
@@ -90,7 +108,7 @@ class PrivilegedInCallService : InCallService() {
                             sessionId,
                             signedSessionAuthorized = false,
                         )
-                        service.coordinator.tick()
+                        service.tickCallControl()
                     }
                 }
             }

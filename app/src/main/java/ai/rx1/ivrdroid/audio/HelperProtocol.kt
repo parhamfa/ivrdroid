@@ -46,7 +46,7 @@ object HelperCapabilityProtocol {
                 ?.filter { it in 1..4 }
                 ?.toSet()
                 .orEmpty(),
-            callControlCapable = values.contains("call_control=1"),
+            callControlCapable = values.contains("call_control=2"),
             conversationRecordingCapable = values.contains("conversation_recording=1"),
             promptBargeInCapable = values.contains("prompt_barge_in=1"),
             sessionAuditCapable = values.contains("session_audit=1"),

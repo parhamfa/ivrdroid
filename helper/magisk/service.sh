@@ -13,12 +13,26 @@ ACTIVE_HELPER_PID=
 SHORT_FAILURES=0
 MAX_SHORT_FAILURES=7
 HEALTHY_RUNTIME_SECONDS=60
+umask 077
 
 mkdir -p "$STATE_DIR"
 chmod 0700 "$STATE_DIR"
 
 service_log() {
     log -t IVRdroidService "$*" 2>/dev/null
+}
+
+publish_supervisor() {
+    [ -d "$BRIDGE_DIR" ] && [ ! -L "$BRIDGE_DIR" ] || return
+    OWNER_UID=$(stat -c '%u' "$BRIDGE_DIR")
+    case "$OWNER_UID" in ''|*[!0-9]*) return ;; esac
+    [ "$OWNER_UID" -ge 10000 ] || return
+    STATUS_TMP="$BRIDGE_DIR/.helper-supervisor.$$"
+    [ ! -e "$STATUS_TMP" ] && [ ! -L "$STATUS_TMP" ] || return
+    printf 'SUP1 %s %s %s %s\n' "$1" "$SHORT_FAILURES" "${2:-0}" "${3:-0}" >"$STATUS_TMP" || return
+    chmod 0600 "$STATUS_TMP"
+    chown "$OWNER_UID:$OWNER_UID" "$STATUS_TMP"
+    mv -f "$STATUS_TMP" "$BRIDGE_DIR/helper-supervisor"
 }
 
 is_ivrdroid_process() {
@@ -46,6 +60,7 @@ echo $$ >"$SERVICE_PID_FILE"
 chmod 0600 "$SERVICE_PID_FILE"
 
 stop_service() {
+    publish_supervisor STOPPED
     if [ -n "$ACTIVE_HELPER_PID" ]; then
         kill -TERM "$ACTIVE_HELPER_PID" 2>/dev/null
         wait "$ACTIVE_HELPER_PID" 2>/dev/null
@@ -64,6 +79,7 @@ trap stop_service HUP INT TERM
 disable_crash_loop() {
     : >"$MODULE_DISABLE_FILE"
     chmod 0644 "$MODULE_DISABLE_FILE"
+    publish_supervisor DISABLED_CRASH_LOOP "${HELPER_EXIT:-1}" "${HELPER_RUNTIME:-0}"
     service_log \
         "Disabled IVRdroid after $SHORT_FAILURES consecutive startup failures."
     rm -f "$SERVICE_PID_FILE"
@@ -96,6 +112,7 @@ while true; do
         SHORT_FAILURES=$((SHORT_FAILURES + 1))
         service_log \
             "IVRdroid self-test failed ($SHORT_FAILURES/$MAX_SHORT_FAILURES)."
+        publish_supervisor SELF_TEST_FAILED 1
         if [ "$SHORT_FAILURES" -ge "$MAX_SHORT_FAILURES" ]; then
             disable_crash_loop
         fi
@@ -106,11 +123,13 @@ while true; do
     STARTED_AT=$(date +%s)
     "$HELPER_BINARY" --serve &
     ACTIVE_HELPER_PID=$!
+    publish_supervisor RUNNING
     wait "$ACTIVE_HELPER_PID"
     HELPER_EXIT=$?
     ACTIVE_HELPER_PID=
     ENDED_AT=$(date +%s)
     HELPER_RUNTIME=$((ENDED_AT - STARTED_AT))
+    publish_supervisor RESTARTING "$HELPER_EXIT" "$HELPER_RUNTIME"
 
     if [ "$HELPER_RUNTIME" -ge "$HEALTHY_RUNTIME_SECONDS" ]; then
         SHORT_FAILURES=0

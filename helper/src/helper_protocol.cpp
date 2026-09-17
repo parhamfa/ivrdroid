@@ -150,6 +150,10 @@ const char* ToString(LastResult result) {
             return "SESSION_COMPLETE";
         case LastResult::RemoteHangup:
             return "REMOTE_HANGUP";
+        case LastResult::MaxCallDuration:
+            return "MAX_CALL_DURATION";
+        case LastResult::RecoveredOperatorHangup:
+            return "RECOVERED_OPERATOR_HANGUP";
         case LastResult::RecoveredAndEnded:
             return "RECOVERED_AND_ENDED";
         case LastResult::RecoveredAfterReboot:

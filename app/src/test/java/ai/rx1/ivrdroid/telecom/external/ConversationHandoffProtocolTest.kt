@@ -93,5 +93,27 @@ class ConversationHandoffProtocolTest {
         assertEquals(listOf(identity), failures)
     }
 
+    @Test
+    fun processingWaitsForHangupAndAcknowledgementUsesCompletionTime() {
+        var ingested = 0
+        val published = mutableListOf<ConversationHandoffRecord>()
+        val controller = ConversationHandoffController(
+            ingest = {
+                ingested++
+                ConversationHandoffResult(identity, "44444444-4444-4444-8444-444444444444", 0, true, "-")
+            },
+            publish = { published.add(it); true },
+            onFailure = { error("Unexpected failure") },
+            elapsedRealtime = { 238_000 },
+        )
+        controller.tick(session, 190_000, callBusy = true)
+        controller.tick(session, 210_000, callBusy = true)
+        controller.tick(session.copy(callActive = true), 215_000)
+        assertEquals(0, ingested)
+        controller.tick(session, 220_000)
+        assertEquals(1, ingested)
+        assertEquals(238_000L, published.single().elapsedMs)
+    }
+
     private fun resource(name: String): String = requireNotNull(javaClass.classLoader?.getResource(name)).readText()
 }

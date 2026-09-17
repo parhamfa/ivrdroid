@@ -7,7 +7,7 @@ import org.junit.Test
 class CallControlProtocolTest {
     @Test
     fun parsesFrozenHelperDialFixture() {
-        val request = CallControlProtocol.parseRequest(resource("call_control/dial_v1.txt"))
+        val request = CallControlProtocol.parseRequest(resource("call_control/dial_v2.txt"))
             as CallControlRequest.Dial
         assertEquals(91, request.revisionId)
         assertEquals(1, request.sequence)
@@ -18,13 +18,13 @@ class CallControlProtocolTest {
 
     @Test
     fun roundTripsFrozenAppStatusFixture() {
-        val fixture = resource("call_control/status_v1.txt")
+        val fixture = resource("call_control/status_v2.txt")
         assertEquals(fixture, CallControlProtocol.formatStatus(CallControlProtocol.parseStatus(fixture)))
     }
 
     @Test
     fun parsesMonotonicRecorderReadyFixture() {
-        val request = CallControlProtocol.parseRequest(resource("call_control/recorder_ready_v1.txt"))
+        val request = CallControlProtocol.parseRequest(resource("call_control/recorder_ready_v2.txt"))
             as CallControlRequest.RecorderReady
         assertEquals(2, request.sequence)
         assertEquals(2_000, request.elapsedMs)
@@ -32,22 +32,22 @@ class CallControlProtocolTest {
 
     @Test
     fun parsesFrozenHelperCancelFixtureWithBoundedReason() {
-        val request = CallControlProtocol.parseRequest(resource("call_control/cancel_v1.txt"))
+        val request = CallControlProtocol.parseRequest(resource("call_control/cancel_v2.txt"))
             as CallControlRequest.Cancel
         assertEquals("HELPER_CANCELLED", request.reason)
         assertThrows(Exception::class.java) {
-            CallControlProtocol.parseRequest(resource("call_control/cancel_v1.txt").replace(" HELPER_CANCELLED\n", " -\n"))
+            CallControlProtocol.parseRequest(resource("call_control/cancel_v2.txt").replace(" HELPER_CANCELLED\n", " -\n"))
         }
     }
 
     @Test
     fun roundTripsOutcomeAwareAnswerTimeoutFixtures() {
-        val cancelFixture = resource("call_control/answer_timeout_cancel_v1.txt")
+        val cancelFixture = resource("call_control/answer_timeout_cancel_v2.txt")
         val cancel = CallControlProtocol.parseRequest(cancelFixture) as CallControlRequest.Cancel
         assertEquals("ANSWER_TIMEOUT", cancel.reason)
         assertEquals(2, cancel.sequence)
 
-        val terminalFixture = resource("call_control/answer_timeout_not_connected_v1.txt")
+        val terminalFixture = resource("call_control/answer_timeout_not_connected_v2.txt")
         val terminal = CallControlProtocol.parseStatus(terminalFixture)
         assertEquals(CallControlStatus.NOT_CONNECTED, terminal.status)
         assertEquals("ANSWER_TIMEOUT", terminal.reason)
@@ -56,7 +56,7 @@ class CallControlProtocolTest {
 
     @Test
     fun rejectsNonCanonicalOrInjectedRecords() {
-        val dial = resource("call_control/dial_v1.txt")
+        val dial = resource("call_control/dial_v2.txt")
         listOf(
             dial.dropLast(1),
             dial + "TRAILING\n",

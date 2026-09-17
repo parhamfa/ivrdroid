@@ -24,6 +24,9 @@ data class TelecomCallSnapshot(
     val emergency: Boolean,
     val canHold: Boolean,
     val disconnectKind: TelecomDisconnectKind = TelecomDisconnectKind.UNKNOWN,
+    val nativeId: String? = null,
+    val parentNativeId: String? = null,
+    val childrenNativeIds: List<String> = emptyList(),
 )
 
 interface TelecomControl {
@@ -125,6 +128,7 @@ data class ExternalCallSessionSnapshot(
 interface ExternalCallObserver {
     fun onStatus(status: CallControlStatus, reason: String, snapshot: ExternalCallSessionSnapshot)
     fun onSnapshot(snapshot: ExternalCallSessionSnapshot)
+    fun onRecordingFailure(snapshot: ExternalCallSessionSnapshot, nowElapsedMs: Long) {}
 }
 
 class ExternalCallEngine(
@@ -269,17 +273,8 @@ class ExternalCallEngine(
 
     fun recordingHandoffFailed(nowElapsedMs: Long) {
         val session = current ?: return
-        if (session.phase == ExternalCallPhase.COMPLETED) {
-            current = session.copy(
-                phase = ExternalCallPhase.SYSTEM_FAILURE,
-                updatedElapsedMs = nowElapsedMs,
-                reason = "RECORDING_FAILURE",
-            )
-            persist()
-            publish(CallControlStatus.SYSTEM_FAILURE, "RECORDING_FAILURE")
-        } else if (!session.terminal) {
-            failSystem("RECORDING_FAILURE", nowElapsedMs)
-        }
+        // Saving audio has no authority to disconnect either leg or rewrite its outcome.
+        observer.onRecordingFailure(session, nowElapsedMs)
     }
 
     fun protocolFailure(reason: String, nowElapsedMs: Long) {
@@ -288,7 +283,7 @@ class ExternalCallEngine(
         failSystem(reason, nowElapsedMs)
     }
 
-    fun recover(currentBootId: String, nowElapsedMs: Long) {
+    fun recover(currentBootId: String, nowElapsedMs: Long, independentlyReconciled: Boolean = false) {
         val session = current ?: return
         if (session.config.bootId != currentBootId) {
             current = session.copy(
@@ -309,6 +304,12 @@ class ExternalCallEngine(
             return
         }
         val caller = ownedCaller()
+        if (caller == null && independentlyReconciled && telecom.calls().none { it.id == session.callerId }) {
+            // The barrier has established that this leg actually ended while the app
+            // was absent. Normal reconciliation records the hangup and cleans its peer.
+            reconcile(nowElapsedMs)
+            return
+        }
         if (caller == null || caller.emergency) {
             failSystem("RECOVERY_UNOWNED", nowElapsedMs, unholdCaller = false)
             return

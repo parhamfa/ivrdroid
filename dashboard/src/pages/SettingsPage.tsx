@@ -5,6 +5,7 @@ import { Button, ErrorState, Field, Loading, SuccessMessage, formatBytes, format
 import { useRemote } from "../hooks";
 import { RELEASE_VERSION, SOURCE_COMMIT } from "../release";
 import { SessionAuditSettingsCard } from "./SessionAuditSettingsCard";
+import { CallSafetySettingsCard } from "./CallSafetySettingsCard";
 import type { DraftConfiguration, NtfyEvents, NtfyPriority, NtfySettings, RecordingSettings, Schedule, ScheduleException, WeeklyWindow } from "../types";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
@@ -26,7 +27,7 @@ function isExternalCallReady(status: Record<string, unknown>): boolean {
     && status.runtime_versions.includes(4)
     && status.external_call_control_capable === true
     && status.conversation_recording_capable === true
-    && status.call_control_protocol_version === 1;
+    && [1, 2].includes(Number(status.call_control_protocol_version));
 }
 
 function isPromptBargeInReady(status: Record<string, unknown>): boolean {
@@ -164,7 +165,8 @@ export function SettingsPage() {
   return <div className="settings-page">
     {message ? <SuccessMessage>{message}</SuccessMessage> : null}{error ? <ErrorState message={error} /> : null}
     <p className="inspector-note">Dashboard {RELEASE_VERSION} · Source {SOURCE_COMMIT}</p>
-    <SessionAuditSettingsCard />
+      <SessionAuditSettingsCard />
+      <CallSafetySettingsCard />
     <div className="settings-grid settings-grid--recording">
       <section className="surface settings-section" id="recording-behavior"><header><div><h2>Recording behavior <span className="draft-label">Signed draft</span></h2><p>Shared by every Record message step. Saving does not activate it; publication creates a signed V4 revision.</p></div><Mic2 size={23} /></header>
         <div className="settings-form-grid"><Field label="Maximum duration" hint="Hard limit: 10–180 seconds. Caller hangup always stops sooner."><input type="number" min={10} max={180} value={draft.recording_behavior.maximum_duration_seconds} onChange={(event) => setDraft({ ...draft, recording_behavior: { ...draft.recording_behavior, maximum_duration_seconds: Number(event.target.value) } })} /></Field><Field label="DTMF finish key" hint="No silence detector is used."><select value={draft.recording_behavior.finish_key ?? ""} onChange={(event) => setDraft({ ...draft, recording_behavior: { ...draft.recording_behavior, finish_key: event.target.value || null } })}><option value="">Disabled</option>{"0123456789*#".split("").map((key) => <option key={key} value={key}>{key}</option>)}</select></Field></div>
@@ -209,7 +211,7 @@ export function SettingsPage() {
           const wifiTime = typeof wifi?.completed_at === "string" ? formatDate(wifi.completed_at) : "Never";
           const externalReady = isExternalCallReady(device.status);
           const promptBargeInReady = isPromptBargeInReady(device.status);
-          return <div className="device-card" key={device.id}><div><strong>{device.display_name}</strong><span>{device.revoked_at ? "Revoked" : `App ${device.app_version} · Helper ${device.helper_version}`}</span><small>Last seen {formatDate(device.last_seen_at)}</small><small>App source: {String(device.status.source_commit ?? "Not reported")}</small><small>Helper source: {String(device.status.helper_source_commit ?? "Not reported")}</small><small>Boot Wi-Fi: {wifiOutcome} · {wifiTime}</small>{device.revoked_at ? null : <><small>External call V4: {externalReady ? "ready" : "not ready — V4 publication is blocked"}</small><small>Prompt interruption: {promptBargeInReady ? "ready" : "not ready — enabled flows cannot publish"}</small></>}</div>{device.revoked_at ? null : <Button variant="danger" onClick={() => void revoke(device.id)} disabled={busy}><ShieldOff size={16} /> Revoke</Button>}</div>;
+          return <div className="device-card" key={device.id}><div><strong>{device.display_name}</strong><span>{device.revoked_at ? "Revoked" : `App ${device.app_version} · Helper ${device.helper_version}`}</span><small>Last seen {formatDate(device.last_seen_at)}</small><small>Local recovery: {String(device.status.local_recovery_state ?? "Not reported")}</small><small>Helper supervisor: {String(device.status.helper_supervisor_state ?? "Not reported")}</small><small>App source: {String(device.status.source_commit ?? "Not reported")}</small><small>Helper source: {String(device.status.helper_source_commit ?? "Not reported")}</small><small>Boot Wi-Fi: {wifiOutcome} · {wifiTime}</small>{device.revoked_at ? null : <><small>External call V4: {externalReady ? "ready" : "not ready — V4 publication is blocked"}</small><small>Prompt interruption: {promptBargeInReady ? "ready" : "not ready — enabled flows cannot publish"}</small></>}</div>{device.revoked_at ? null : <Button variant="danger" onClick={() => void revoke(device.id)} disabled={busy}><ShieldOff size={16} /> Revoke</Button>}</div>;
         })}
       </section>
     </div>

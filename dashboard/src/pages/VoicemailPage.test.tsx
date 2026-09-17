@@ -109,6 +109,23 @@ describe("voicemail inbox", () => {
     expect(await screen.findByRole("heading", { name: "No unlistened recordings" })).toBeTruthy();
   });
 
+  it("labels playable surviving audio as partial", async () => {
+    vi.mocked(api.recordings).mockResolvedValue({ ...inbox, items: [{ ...message, kind: "conversation", partial: true, stop_reason: "recording_failure" }] });
+    render(<VoicemailPage />);
+    await screen.findByText("Partial audio");
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(screen.getByText(/some of the conversation is missing/i)).toBeTruthy();
+    expect(screen.getByLabelText("Conversation from ••••4567")).toBeTruthy();
+  });
+
+  it("surfaces a durable processing failure and preserves retry information", async () => {
+    vi.mocked(api.recordings).mockResolvedValue({ ...inbox, items: [{ ...message, status: "processing", playback_url: null, processing_error: "Server processing workspace is full" }] });
+    render(<VoicemailPage />);
+    await screen.findByText("Needs attention");
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(screen.getByText(/Server processing workspace is full.*preserved source will be retried/i)).toBeTruthy();
+  });
+
   it("shows pending audio without exposing destructive or listened actions", async () => {
     vi.mocked(api.recordings).mockResolvedValue({
       ...inbox,
@@ -118,7 +135,7 @@ describe("voicemail inbox", () => {
     await screen.findByText("+15551234567");
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
 
-    expect(screen.getByText(/encrypted tablet\/server upload remains pending/i)).toBeTruthy();
+    expect(screen.getByText(/Check its connection and storage status/i)).toBeTruthy();
     expect(screen.queryByRole("audio")).toBeNull();
     expect((screen.getByRole("button", { name: /Delete/i }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: /Mark listened/i }) as HTMLButtonElement).disabled).toBe(true);

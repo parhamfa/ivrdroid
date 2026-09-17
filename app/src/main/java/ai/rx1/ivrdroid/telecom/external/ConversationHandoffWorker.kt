@@ -7,6 +7,8 @@ import android.util.Log
 import ai.rx1.ivrdroid.control.ConversationHandoffIdentity
 import ai.rx1.ivrdroid.control.ConversationHandoffResult
 import ai.rx1.ivrdroid.control.RecordingSpool
+import ai.rx1.ivrdroid.telecom.CallRuntimeState
+import ai.rx1.ivrdroid.audio.RootAudioTrigger
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -14,6 +16,7 @@ import java.util.concurrent.TimeUnit
 data class ConversationHandoffSession(
     val identity: ConversationHandoffIdentity,
     val bootId: String,
+    val callActive: Boolean = false,
 )
 
 /** Pure sequencing core: one pair is durably ingested before its acknowledgement is exposed. */
@@ -21,21 +24,24 @@ class ConversationHandoffController(
     private val ingest: (ConversationHandoffIdentity) -> ConversationHandoffResult?,
     private val publish: (ConversationHandoffRecord) -> Boolean,
     private val onFailure: (ConversationHandoffIdentity) -> Unit,
+    private val elapsedRealtime: (() -> Long)? = null,
 ) {
     private var pending: ConversationHandoffRecord? = null
     private var nextIngestElapsedMs = 0L
 
-    fun tick(session: ConversationHandoffSession, nowElapsedMs: Long) {
+    fun tick(session: ConversationHandoffSession, nowElapsedMs: Long, callBusy: Boolean = false) {
         require(nowElapsedMs >= 0)
+        if (callBusy || session.callActive) return
         pending?.let { record ->
             if (publish(record)) {
                 pending = null
-                nextIngestElapsedMs = Math.addExact(nowElapsedMs, ACK_VISIBILITY_MS)
+                nextIngestElapsedMs = Math.addExact(nowElapsedMs, retryDelay(record))
             }
             return
         }
         if (nowElapsedMs < nextIngestElapsedMs) return
         val outcome = ingest(session.identity) ?: return
+        val completedAt = maxOf(nowElapsedMs, elapsedRealtime?.invoke() ?: nowElapsedMs)
         val record = ConversationHandoffRecord(
             outcome.identity.callId,
             outcome.identity.revisionId,
@@ -43,7 +49,7 @@ class ConversationHandoffController(
             outcome.recordingId,
             outcome.segmentIndex,
             session.bootId,
-            nowElapsedMs,
+            completedAt,
             if (outcome.succeeded) ConversationHandoffResultKind.OK else ConversationHandoffResultKind.FAILED,
             outcome.reason,
         )
@@ -51,11 +57,14 @@ class ConversationHandoffController(
         if (!outcome.succeeded) onFailure(outcome.identity)
         if (publish(record)) {
             pending = null
-            nextIngestElapsedMs = Math.addExact(nowElapsedMs, ACK_VISIBILITY_MS)
+            nextIngestElapsedMs = Math.addExact(completedAt, retryDelay(record))
         }
     }
 
     internal fun pendingForTest(): ConversationHandoffRecord? = pending
+
+    private fun retryDelay(record: ConversationHandoffRecord): Long =
+        if (record.result == ConversationHandoffResultKind.FAILED) 30_000L else ACK_VISIBILITY_MS
 
     private companion object {
         const val ACK_VISIBILITY_MS = 250L
@@ -63,7 +72,7 @@ class ConversationHandoffController(
 }
 
 /**
- * Local-only worker used while Telecom owns the call. It never invokes DeviceApi or network sync.
+ * Local-only worker that defers encryption until the IVR session ends. It never invokes DeviceApi.
  * A short post-call drain covers the helper's finalizer when Telecom destroys InCallService first.
  */
 class ConversationHandoffWorker(
@@ -78,6 +87,7 @@ class ConversationHandoffWorker(
         ingest = { identity -> RecordingSpool.handoffNextConversation(application, identity) },
         publish = { record -> CallControlBridge.publishConversationHandoff(application, record) },
         onFailure = { identity -> onFailure(identity, SystemClock.elapsedRealtime()) },
+        elapsedRealtime = SystemClock::elapsedRealtime,
     )
     @Volatile private var session: ConversationHandoffSession? = null
     @Volatile private var stopAtElapsedMs = Long.MAX_VALUE
@@ -102,11 +112,14 @@ class ConversationHandoffWorker(
     private fun runTick() {
         val now = SystemClock.elapsedRealtime()
         try {
-            session?.let { controller.tick(it, now) }
+            session?.let {
+                val busy = it.callActive || CallRuntimeState.isBusy() || !RootAudioTrigger.isIdle(application)
+                controller.tick(it, now, busy)
+            }
         } catch (error: Throwable) {
             Log.e(TAG, "Conversation handoff worker tick failed safely.", error)
         } finally {
-            if (now >= stopAtElapsedMs) {
+            if (SystemClock.elapsedRealtime() >= stopAtElapsedMs) {
                 executor.shutdown()
                 if (wakeLock.isHeld) runCatching { wakeLock.release() }
             }

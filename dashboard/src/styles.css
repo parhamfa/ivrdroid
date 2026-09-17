@@ -622,3 +622,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monos
 .audit-policy-state small { flex-basis: 100%; color: var(--muted); }
 .calls-table td:first-child, .calls-table th:first-child { min-width: 145px; }
 .calls-table td:nth-child(5) { min-width: 140px; max-width: 320px; overflow-wrap: anywhere; }
+.call-outcome-filter { max-width: 280px; }
+.call-outcome-filter select { max-width: 100%; }
+.calls-table .call-outcome-cell { min-width: 180px; max-width: 260px; white-space: normal; }

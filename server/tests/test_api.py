@@ -410,7 +410,7 @@ def test_v4_publish_requires_the_exact_call_control_capabilities(client):
                 "runtime_versions": [1, 2, 3, 4],
                 "external_call_control_capable": True,
                 "conversation_recording_capable": True,
-                "call_control_protocol_version": 2,
+                "call_control_protocol_version": 3,
             },
         )
         session.add(device)

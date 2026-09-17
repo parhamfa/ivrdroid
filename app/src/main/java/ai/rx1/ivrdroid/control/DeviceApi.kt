@@ -94,6 +94,17 @@ class DeviceApi(private val enrollment: Enrollment? = null) {
         return uploadChunk("/api/device/v1/session-recordings$segmentPath/content", offset, content)
     }
 
+    fun continuousJson(method: String, suffix: String, body: JSONObject? = null): JSONObject {
+        require(suffix.matches(Regex("(?:/[0-9a-f-]{36}(?:/complete|/reset)?)?")))
+        if (CallRuntimeState.isBusy()) error("Call started; recording upload paused.")
+        return authenticatedJson(method, "/api/device/v1/continuous-recordings$suffix", body)
+    }
+
+    fun uploadContinuousChunk(id: String, offset: Long, content: ByteArray): JSONObject {
+        SessionAuditProtocol.canonicalId(id)
+        return uploadChunk("/api/device/v1/continuous-recordings/$id/content", offset, content)
+    }
+
     fun uploadRecordingChunk(recording: PendingRecording, offset: Long, content: ByteArray): JSONObject = uploadChunk(
         RecordingApiPaths.segment(recording)?.plus("/content")
             ?: "/api/device/v1/recordings/${recording.recordingId}/content", offset, content,
@@ -187,7 +198,12 @@ class DeviceApi(private val enrollment: Enrollment? = null) {
         allowEmpty: Boolean = false,
     ): JSONObject {
         val connection = open(baseUrl, path, method, authenticate)
+        val recordingRequest = path.startsWith("/api/device/v1/continuous-recordings") ||
+            path.startsWith("/api/device/v1/session-recordings") || path.startsWith("/api/device/v1/recordings") ||
+            path.startsWith("/api/device/v1/conversation-recordings")
+        val interruption = if (recordingRequest) CallRuntimeState.interruptWhenBusy { connection.disconnect() } else null
         try {
+            if (recordingRequest && CallRuntimeState.isBusy()) error("Call started; recording processing paused.")
             if (body != null) {
                 val bytes = body.toString().toByteArray(Charsets.UTF_8)
                 connection.doOutput = true
@@ -199,6 +215,7 @@ class DeviceApi(private val enrollment: Enrollment? = null) {
             val bytes = readBounded(connection.inputStream, 4 * 1024 * 1024)
             return JSONObject(String(bytes, Charsets.UTF_8))
         } finally {
+            interruption?.close()
             connection.disconnect()
         }
     }

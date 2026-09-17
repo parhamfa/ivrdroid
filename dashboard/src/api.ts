@@ -2,6 +2,7 @@ import type {
   AuditRecord,
   CallRecord,
   SessionAuditSettings,
+  CallSafetySettings,
   Device,
   DraftConfiguration,
   FlowDiff,
@@ -118,6 +119,10 @@ export const api = {
   calls: () => request<CallRecord[]>("/api/admin/v1/calls"),
   call: (id: string) => request<CallRecord>(`/api/admin/v1/calls/${encodeURIComponent(id)}`),
   sessionAuditSettings: () => request<SessionAuditSettings>("/api/admin/v1/audit-recording-settings"),
+  callSafetySettings: () => request<CallSafetySettings>("/api/admin/v1/call-safety-settings"),
+  saveCallSafetySettings: (minutes: number) => request<CallSafetySettings>("/api/admin/v1/call-safety-settings", {
+    method: "PUT", body: JSON.stringify({ maximum_call_duration_minutes: minutes }),
+  }),
   saveSessionAuditSettings: (enabled: boolean, localQuotaBytes: number) => request<SessionAuditSettings>("/api/admin/v1/audit-recording-settings", {
     method: "PUT", body: JSON.stringify({ enabled, local_quota_bytes: localQuotaBytes }),
   }),

@@ -18,7 +18,22 @@ Release staging directories must be readable by that owner for Colima bind mount
 `.env`, `deploy/secrets/`, signing keys and rollback archives stay private. Preserve every key
 version required by existing media. Do not print credentials or copy them into build contexts.
 
-## Release 0.9.0 order
+## Release 0.10.0 continuity update
+
+Follow [CALL_CONTINUITY.md](CALL_CONTINUITY.md) for the new protocol and acceptance contract.
+Back up pending device audio, the database and encrypted media before updating. Migrate through
+`0008_continuous_recordings` and deploy the compatible API first. Update the app (code 19) and
+helper (code 27) together while idle, then the dashboard. Keep the published prompt selections
+unchanged. Verify desired/applied policy acknowledgment and the 60-minute default on the tablet.
+
+Retain the compatible new API during tablet rollback. The generated rollback API also includes
+the additive schemas and recording read/source-retention compatibility, but does not process new
+continuous uploads; pending encrypted sources must remain until the compatible worker resumes.
+Never downgrade the schema or restore an old database over new calls and recordings.
+
+Physical acceptance and the two-hour soak are required before tagging this release accepted.
+
+## Previous release procedure (0.9.0)
 
 1. Recheck actual image IDs, schema head, device versions/version codes, active revision, idle
    Telecom/audio state, storage, enrollment and signing identity. Preserve original local changes

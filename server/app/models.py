@@ -155,6 +155,26 @@ class DeviceAuditPolicyAcknowledgement(Base):
     applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class CallSafetyPolicy(Base):
+    __tablename__ = "call_safety_policies"
+    __table_args__ = (CheckConstraint("maximum_call_duration_seconds BETWEEN 60 AND 86400", name="ck_call_safety_duration"),)
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    maximum_call_duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_by: Mapped[str] = mapped_column(String(320), nullable=False)
+
+
+class DeviceCallSafetyAcknowledgement(Base):
+    __tablename__ = "device_call_safety_acknowledgements"
+
+    device_id: Mapped[str] = mapped_column(ForeignKey("devices.id"), primary_key=True)
+    # Zero denotes the signed default policy, so this cannot reference a policy row.
+    policy_version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    maximum_call_duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class RecordingRetentionPolicy(Base):
     __tablename__ = "recording_retention_policies"
 
@@ -193,6 +213,9 @@ class Recording(Base):
     source_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="uploading", index=True)
+    source_format: Mapped[str] = mapped_column(String(32), nullable=False, default="legacy_wav", server_default="legacy_wav")
+    partial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    processing_error: Mapped[str | None] = mapped_column(String(500))
     media_key_version: Mapped[int | None] = mapped_column(Integer)
     media_storage_name: Mapped[str | None] = mapped_column(String(80), unique=True)
     media_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
@@ -201,6 +224,19 @@ class Recording(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deletion_reason: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ContinuousRecording(Base):
+    __tablename__ = "continuous_recordings"
+
+    recording_id: Mapped[str] = mapped_column(ForeignKey("recordings.id", ondelete="CASCADE"), primary_key=True)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="uploading", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    operation_duration_ms: Mapped[int | None] = mapped_column(BigInteger)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

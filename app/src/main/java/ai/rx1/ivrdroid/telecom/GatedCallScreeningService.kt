@@ -55,7 +55,7 @@ class GatedCallScreeningService : CallScreeningService() {
             Log.w(TAG, "IVR caller matched, but answer permission is missing.")
             return
         }
-        if (CallRuntimeState.isBusy() || !RootAudioTrigger.isIdle(this)) {
+        if (!LocalCallSession.canHandleNewCaller(this)) {
             queueEvent(callId, startedAt, decision, "HELPER_BUSY", 0, emptyList())
             Log.w(TAG, "IVR caller matched, but the helper is busy; leaving it ringing.")
             return
@@ -69,9 +69,17 @@ class GatedCallScreeningService : CallScreeningService() {
             callDetails.handle?.schemeSpecificPart,
             startedElapsed,
         )
+        val prepared = runCatching {
+            LocalCallSession.begin(this, buildEvent(callId, startedAt, decision, "IN_PROGRESS", 0, emptyList()), telecomCallId, startedElapsed)
+        }.isSuccess
+        if (!prepared) {
+            if (ownershipRegistered) OwnedCallRegistry.removeSession(this, callId)
+            queueEvent(callId, startedAt, decision, "SESSION_RECOVERY_PENDING", 0, emptyList())
+            return
+        }
         if (!RootAudioTrigger.requestStartMenu(this, callId)) {
             if (ownershipRegistered) OwnedCallRegistry.removeSession(this, callId)
-            queueEvent(callId, startedAt, decision, "HELPER_REQUEST_FAILED", 0, emptyList())
+            LocalCallSession.finishRequested(this, "HELPER_REQUEST_FAILED", emptyList())
             Log.e(TAG, "Could not queue the fixed privileged menu handoff.")
             return
         }
@@ -130,6 +138,7 @@ class GatedCallScreeningService : CallScreeningService() {
         startedElapsed: Long,
         decision: CallerPolicyDecision,
     ) {
+        if (latestIncomingCall.get() != token) return
         val state = RootAudioTrigger.readState(this)
         if (state.hasClaimedSession) {
             answerCurrentRingingCall()
@@ -167,21 +176,22 @@ class GatedCallScreeningService : CallScreeningService() {
         result: String,
         menuPath: List<String>,
     ) {
-        val duration = ((android.os.SystemClock.elapsedRealtime() - startedElapsed) / 1000L)
-            .coerceIn(0, 86_400).toInt()
-        queueEvent(callId, startedAt, decision, result, duration, menuPath)
-        OwnedCallRegistry.removeSession(this, callId)
-        CallRuntimeState.setBusy(false)
+        LocalCallSession.finishRequested(this, result, menuPath, callId)
     }
 
-    private fun queueEvent(
+    private fun queueEvent(callId: String, startedAt: Instant, decision: CallerPolicyDecision,
+        result: String, duration: Int, menuPath: List<String>) {
+        SecureControlStore.enqueueCall(this, buildEvent(callId, startedAt, decision, result, duration, menuPath))
+    }
+
+    private fun buildEvent(
         callId: String,
         startedAt: Instant,
         decision: CallerPolicyDecision,
         result: String,
         duration: Int,
         menuPath: List<String>,
-    ) {
+    ): PendingCallEvent {
         val revision = RootAudioTrigger.readState(this).activeRevision
         val audit = SessionAuditSettings.applied(this)
         val event = PendingCallEvent(
@@ -196,7 +206,7 @@ class GatedCallScreeningService : CallScreeningService() {
                 auditPolicyVersion = audit.version.takeIf { audit.enabled && result != "STOCK_DIALER" },
                 auditQuotaBytes = audit.quotaBytes.takeIf { audit.enabled && result != "STOCK_DIALER" },
             )
-        SecureControlStore.enqueueCall(this, event)
+        return event
     }
 
     @Suppress("DEPRECATION")
@@ -213,6 +223,7 @@ class GatedCallScreeningService : CallScreeningService() {
 
         val telecom = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
         try {
+            if (!LocalCallSession.beforeAnswer(this)) return
             telecom.acceptRingingCall(VideoProfile.STATE_AUDIO_ONLY)
             Log.i(TAG, "Answer request sent for the policy-matched incoming call.")
         } catch (error: SecurityException) {

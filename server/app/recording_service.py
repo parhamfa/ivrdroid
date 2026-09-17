@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from .config import Settings
 from .models import (
+    ContinuousRecording,
     ConversationRecordingSegment,
     Recording,
     RecordingRetentionPolicy,
@@ -588,6 +589,7 @@ def assemble_conversation_recording(
     cipher: RecordingCipher,
     recording: Recording,
     segments: list[ConversationRecordingSegment],
+    *, confirmed_abandoned: bool = False,
 ) -> Path:
     """Validate and assemble ordered PCM segments through private bounded temp files."""
     if not segments:
@@ -598,7 +600,7 @@ def assemble_conversation_recording(
         raise RecordingError("Conversation recording has unverified segments.", 409)
     if any(item.stop_reason != "segment_boundary" for item in segments[:-1]):
         raise RecordingError("Only the final conversation segment may have a terminal stop reason.", 409)
-    if segments[-1].stop_reason == "segment_boundary":
+    if segments[-1].stop_reason == "segment_boundary" and not confirmed_abandoned:
         raise RecordingError("Final conversation segment must have a terminal stop reason.", 409)
 
     total_duration_ms = 0
@@ -718,7 +720,8 @@ def assemble_conversation_recording(
             temporary.unlink(missing_ok=True)
 
     recording.duration_ms = total_duration_ms
-    recording.stop_reason = segments[-1].stop_reason
+    recording.stop_reason = "recording_failure" if confirmed_abandoned else segments[-1].stop_reason
+    recording.partial = confirmed_abandoned or any(item.partial for item in segments)
     recording.source_size_bytes = sum(item.expected_size_bytes for item in segments)
     recording.source_sha256 = pcm_digest.hexdigest()
     recording.segment_count = len(segments)
@@ -935,7 +938,7 @@ def reconcile_recording_storage(session: Session, settings: Settings) -> None:
             owner = session.scalar(
                 select(Recording.id).where(
                     Recording.media_storage_name == path.name,
-                    Recording.status == "ready",
+                    Recording.status.in_(["ready", "processing"]),
                 ),
             )
             if owner is None:
@@ -1016,7 +1019,10 @@ def cleanup_abandoned_uploads(
     settings: Settings,
 ) -> list[RecordingUpload | ConversationRecordingSegment]:
     cutoff = utcnow() - timedelta(hours=settings.recording_abandoned_upload_hours)
-    uploads = session.scalars(select(RecordingUpload).where(RecordingUpload.updated_at < cutoff)).all()
+    uploads = session.scalars(select(RecordingUpload).where(RecordingUpload.updated_at < cutoff,
+        ~RecordingUpload.recording_id.in_(select(ContinuousRecording.recording_id)))).all()
+    # Continuous sources remain owned until explicit completion or device reconciliation.
+    # Elapsed time alone cannot distinguish an offline tablet from abandoned audio.
     for upload in uploads:
         recording = session.get(Recording, upload.recording_id)
         session.delete(upload)

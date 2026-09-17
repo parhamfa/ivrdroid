@@ -1,6 +1,8 @@
 package ai.rx1.ivrdroid.control
 
 import java.nio.charset.StandardCharsets
+import java.io.InputStream
+import java.io.OutputStream
 import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.SecretKey
@@ -40,5 +42,27 @@ internal object RecordingEnvelope {
         cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BYTES * 8, nonce))
         cipher.updateAAD(aad.toByteArray(StandardCharsets.US_ASCII))
         return cipher.doFinal(ciphertext)
+    }
+
+    /** Same authenticated format, without allocating a complete WAV and ciphertext at once. */
+    fun encryptStream(key: SecretKey, aad: String, input: InputStream, output: OutputStream,
+        nonce: ByteArray? = null, checkpoint: () -> Unit = {}) {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        if (nonce == null) cipher.init(Cipher.ENCRYPT_MODE, key) else {
+            require(nonce.size == NONCE_BYTES)
+            cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(TAG_BYTES * 8, nonce))
+        }
+        cipher.updateAAD(aad.toByteArray(StandardCharsets.US_ASCII))
+        require(cipher.iv.size == NONCE_BYTES)
+        output.write(magic)
+        output.write(cipher.iv)
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+            checkpoint()
+            val count = input.read(buffer)
+            if (count < 0) break
+            if (count > 0) cipher.update(buffer, 0, count)?.let(output::write)
+        }
+        output.write(cipher.doFinal())
     }
 }

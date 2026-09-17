@@ -2,6 +2,8 @@
 #include "audit_policy.h"
 #include "call_control_protocol.h"
 #include "sha256.h"
+#include "continuous_recording.h"
+#include "recording_policy.h"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +37,7 @@ namespace {
 #endif
 constexpr char kBridge[] = IVRDROID_AUDIT_BRIDGE;
 constexpr char kInbox[] = IVRDROID_AUDIT_BRIDGE "/session-audit";
+constexpr char kConversationInbox[] = IVRDROID_AUDIT_BRIDGE "/continuous-recordings";
 constexpr size_t kRingSize = 128;
 constexpr size_t kEventLimit = 4096;
 constexpr int64_t kFrameNs = 25'000'000;
@@ -68,6 +71,7 @@ uid_t appUid = 0;
 std::string callId;
 int captureCard = 0, captureDevice = 0;
 pid_t capturePid = -1, writerPid = -1;
+std::vector<pid_t> finishingConversationWriters;
 volatile sig_atomic_t childStop = 0;
 void StopChild(int) { childStop = 1; }
 int64_t ClockNs(clockid_t clock) {
@@ -75,13 +79,13 @@ int64_t ClockNs(clockid_t clock) {
     return clock_gettime(clock, &time) == 0 ? time.tv_sec * 1'000'000'000LL + time.tv_nsec : 0;
 }
 int Reason(const char* value) {
-    const char* values[] = {"", "session_complete", "caller_hangup", "preempted", "capture_failure", "storage_full", "interrupted", "writer_failure"};
-    for (int i = 1; i < 8; ++i) if (std::strcmp(value, values[i]) == 0) return i;
+    const char* values[] = {"", "session_complete", "caller_hangup", "preempted", "capture_failure", "storage_full", "interrupted", "writer_failure", "max_call_duration", "buffer_overrun"};
+    for (int i = 1; i < 10; ++i) if (std::strcmp(value, values[i]) == 0) return i;
     return 6;
 }
 const char* ReasonText(int reason) {
-    const char* values[] = {"interrupted", "session_complete", "caller_hangup", "preempted", "capture_failure", "storage_full", "interrupted", "writer_failure"};
-    return values[std::clamp(reason, 0, 7)];
+    const char* values[] = {"interrupted", "session_complete", "caller_hangup", "preempted", "capture_failure", "storage_full", "interrupted", "writer_failure", "max_call_duration", "buffer_overrun"};
+    return values[std::clamp(reason, 0, 9)];
 }
 bool WriteAllBytes(int fd, const void* value, size_t size) {
     const auto* bytes = static_cast<const uint8_t*>(value);
@@ -152,13 +156,50 @@ uint64_t DirectoryBytes(const std::string& path) {
     }
     closedir(directory); return total;
 }
-bool StorageAvailable() {
+[[maybe_unused]] bool StorageAvailable() {
     uint64_t spool = 0;
     std::istringstream capacity(ReadFile(std::string(kBridge) + "/audit-capacity", 80));
     if (!(capacity >> spool)) return false;
     struct statvfs disk {};
     if (statvfs(kInbox, &disk) != 0) return false;
     return AuditStorageFits(spool, DirectoryBytes(kInbox), disk.f_bavail * static_cast<uint64_t>(disk.f_frsize), policy.quotaBytes);
+}
+uint64_t LargestPlaintext(const std::string& path) {
+    DIR* directory = opendir(path.c_str()); if (!directory) return 0;
+    uint64_t largest = 0;
+    while (auto* entry = readdir(directory)) {
+        if (entry->d_name[0] == '.') continue;
+        const std::string item = path + "/" + entry->d_name;
+        struct stat value {};
+        if (lstat(item.c_str(), &value) != 0) continue;
+        if (S_ISREG(value.st_mode) && item.size() >= 4 && item.substr(item.size() - 4) == ".pcm")
+            largest = std::max(largest, static_cast<uint64_t>(value.st_size));
+        else if (S_ISDIR(value.st_mode) && call_control::IsCanonicalUuid(entry->d_name))
+            largest = std::max(largest, LargestPlaintext(item));
+    }
+    closedir(directory); return largest;
+}
+// Refresh at least once per second in each writer. The returned absolute byte
+// budget also limits every individual append between refreshes.
+uint64_t ContinuousBudget(bool audit, uint64_t currentBytes) {
+    uint64_t conversationSpool = 0, auditSpool = 0, pendingWorkspace = 0;
+    std::string magic, extra;
+    std::istringstream capacity(ReadFile(std::string(kBridge) + "/continuous-capacity", 160));
+    if (!(capacity >> magic >> conversationSpool >> auditSpool >> pendingWorkspace) || magic != "PCM1" || (capacity >> extra)) return currentBytes;
+    const uint64_t quota = audit ? policy.quotaBytes : kConversationSpoolLimitBytes;
+    const uint64_t used = (audit ? auditSpool : conversationSpool) + DirectoryBytes(audit ? kInbox : kConversationInbox);
+    struct statvfs disk {};
+    if (statvfs(kBridge, &disk) != 0 || used >= quota) return currentBytes;
+    const uint64_t largest = std::max({pendingWorkspace, LargestPlaintext(kInbox), LargestPlaintext(kConversationInbox)});
+    const uint64_t workspace = largest + ((largest + 65535) / 65536) * 32 + 84;
+    const uint64_t free = disk.f_bavail * static_cast<uint64_t>(disk.f_frsize);
+    constexpr uint64_t reserve = 576ULL * 1024 * 1024;
+    if (workspace < largest || workspace > UINT64_MAX - reserve || free <= reserve + workspace) return currentBytes;
+    // As a file grows, its eventual encrypted workspace grows with it. Reserve
+    // two seconds of concurrent-writer headroom before allowing either to grow.
+    const uint64_t headroom = free - reserve - workspace;
+    if (headroom <= 768000) return currentBytes;
+    return currentBytes + std::min(quota - used, (headroom - 768000) / 2);
 }
 uint64_t ProcessStart(pid_t pid) {
     std::ifstream input("/proc/" + std::to_string(pid) + "/stat");
@@ -180,7 +221,7 @@ struct Context {
 };
 bool SaveContext(const Context& value) {
     std::ostringstream output;
-    output << "AUDIT1 " << value.id << ' ' << value.version << ' ' << value.wall << ' ' << value.base << ' '
+    output << "AUDIT2 " << value.id << ' ' << value.version << ' ' << value.wall << ' ' << value.base << ' '
         << value.total << ' ' << value.pid << ' ' << value.processStart << ' ' << value.boot << '\n';
     return AtomicFile(value.directory() + "/context", output.str());
 }
@@ -208,7 +249,7 @@ bool SaveReport(const Context& context, int reason, bool checkpoint = false) {
     std::string events = shared && context.id == callId ? Timeline(context) : ReadFile(context.directory() + "/events", 1024 * 1024);
     if (events.empty()) events = "[]";
     if (checkpoint) return AtomicFile(context.directory() + "/events", events);
-    if (reason > 2 && context.total && events.back() == ']') {
+    if ((reason > 2 && reason != 8) && context.total && events.back() == ']') {
         const int64_t boundary = context.total / 48;
         const std::string gap = "{\"offset_ms\":" + std::to_string(boundary) +
             ",\"type\":\"gap\",\"block_id\":null,\"detail\":\"" + ReasonText(reason) + "\"}";
@@ -232,7 +273,7 @@ bool SaveReport(const Context& context, int reason, bool checkpoint = false) {
     out << "{\"recording_id\":\"" << context.id << "\",\"policy_version\":" << context.version
         << ",\"state\":\"" << (context.total ? "pending_upload" : "unavailable") << "\",\"captured_at\":"
         << (context.total ? "\"" + Timestamp(context.wall) + "\"" : "null") << ",\"duration_ms\":" << context.total / 48 << ",\"partial\":"
-        << (reason > 2 ? "true" : "false") << ",\"stop_reason\":\"" << ReasonText(reason) << "\",\"events\":" << events << '}';
+        << ((reason > 2 && reason != 8) ? "true" : "false") << ",\"stop_reason\":\"" << ReasonText(reason) << "\",\"events\":" << events << '}';
     return AtomicFile(context.directory() + "/report.json", out.str());
 }
 bool SealSegment(const Context& context, uint32_t index, uint64_t frames, int reason) {
@@ -251,7 +292,7 @@ bool SealSegment(const Context& context, uint32_t index, uint64_t frames, int re
         << "\",\"policy_version\":" << context.version << ",\"segment_index\":" << index
         << ",\"captured_at\":\"" << Timestamp(context.wall + index * 15000LL) << "\",\"duration_ms\":" << frames / 48
         << ",\"stop_reason\":\"" << (reason ? ReasonText(reason) : "segment_boundary") << "\",\"partial\":"
-        << (reason > 2 ? "true" : "false") << ",\"size_bytes\":" << 44 + frames * 4 << ",\"sha256\":\"" << digest << "\"}";
+        << ((reason > 2 && reason != 8) ? "true" : "false") << ",\"size_bytes\":" << 44 + frames * 4 << ",\"sha256\":\"" << digest << "\"}";
     return AtomicFile(stem + ".json", out.str());
 }
 void CaptureWorker() {
@@ -310,9 +351,16 @@ void WriterWorker() {
     if (!context.wall) context.wall = ClockNs(CLOCK_REALTIME) / 1'000'000;
     if (!PrivateDirectory(context.directory()) || !SaveContext(context)) { shared->writerFailed.store(true); _exit(1); }
     uint64_t next = 1, nextPrompt = 1;
-    int fd = -1, reason = 0;
-    uint32_t index = 0;
-    uint64_t segmentFrames = 0;
+    int reason = 0;
+    ContinuousRecordingContext recording;
+    recording.kind = "session_audit"; recording.id = context.id; recording.callId = context.id;
+    recording.bootId = context.boot; recording.blockId = "-"; recording.policy = context.version;
+    recording.wallMs = context.wall; recording.elapsedMs = context.base / 1'000'000;
+    recording.pid = context.pid; recording.processStart = context.processStart;
+    ContinuousPcmFile audio(context.directory(), appUid, recording);
+    if (!audio.Open()) { SaveReport(context, errno == ENOSPC ? 5 : 7); shared->writerFailed.store(true); _exit(1); }
+    uint64_t budget = 0;
+    int64_t checkedAt = -1;
     std::deque<PromptChunk> prompts;
     while (!childStop) {
         if (context.total % 48000 == 0 && SafeFile(context.directory() + "/abort", 80)) { reason = 7; break; }
@@ -326,11 +374,12 @@ void WriterWorker() {
             usleep(2000); continue;
         }
         CopiedFrame frame;
-        if (!CopyFrame(shared->input[next % kRingSize], next, &frame)) { reason = 7; break; }
+        if (!CopyFrame(shared->input[next % kRingSize], next, &frame)) { reason = 9; break; }
         const uint64_t producedPrompts = shared->prompts.load(std::memory_order_acquire);
         while (nextPrompt <= producedPrompts) {
+            if (prompts.size() >= kRingSize * 2) { reason = 9; break; }
             CopiedFrame prompt;
-            if (!CopyFrame(shared->output[nextPrompt % kRingSize], nextPrompt, &prompt)) { reason = 7; break; }
+            if (!CopyFrame(shared->output[nextPrompt % kRingSize], nextPrompt, &prompt)) { reason = 9; break; }
             prompts.push_back({(prompt.timeNs - context.base) * 48000 / 1'000'000'000LL, prompt.prompt,
                 std::vector<int16_t>(prompt.samples, prompt.samples + prompt.frames * 2)});
             ++nextPrompt;
@@ -348,23 +397,14 @@ void WriterWorker() {
             }
         }
         while (!prompts.empty() && prompts.front().start + static_cast<int64_t>(prompts.front().samples.size() / 2) <= static_cast<int64_t>(context.total)) prompts.pop_front();
-        if (fd < 0) {
-            if (!StorageAvailable()) { reason = 5; break; }
-            const std::string path = context.directory() + "/" + Stem(index) + ".wav.partial";
-            fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-            if (fd < 0 || fchown(fd, appUid, appUid) != 0 || !WaveHeader(fd, 0) || lseek(fd, 44, SEEK_SET) != 44) { reason = 7; break; }
+        const int64_t now = ClockNs(CLOCK_MONOTONIC) / 1'000'000;
+        if (checkedAt < 0 || now - checkedAt >= 1000) {
+            budget = ContinuousBudget(true, context.total * 4); checkedAt = now;
         }
-        if (!WriteAllBytes(fd, frame.samples, sizeof(frame.samples))) { reason = errno == ENOSPC ? 5 : 7; break; }
-        context.total += kAuditFrameCount; segmentFrames += kAuditFrameCount; ++next;
-        if (segmentFrames % 48000 == 0 && (!WaveHeader(fd, segmentFrames) || fsync(fd) != 0 || !SaveContext(context) || !SaveReport(context, 0, true))) { reason = 7; break; }
-        if (segmentFrames == kAuditSegmentFrames) {
-            close(fd); fd = -1;
-            if (!SealSegment(context, index, segmentFrames, 0)) {
-                // Keep the last committed context intact for journal recovery.
-                shared->writerFailed.store(true); _exit(1);
-            }
-            ++index; segmentFrames = 0;
-        }
+        if (!audio.Append(frame.samples, kAuditFrameCount, budget)) { reason = errno == ENOSPC ? 5 : 7; break; }
+        context.total = audio.frames(); ++next;
+        if (context.total % 48000 == 0 && (!audio.Checkpoint() || !SaveContext(context) || !SaveReport(context, 0, true))) { reason = 7; break; }
+
     }
     // The guardian may still be classifying an observed disconnect. Audit waits here,
     // after capture has stopped, without delaying Telecom or audio cleanup.
@@ -373,13 +413,13 @@ void WriterWorker() {
         ClockNs(CLOCK_MONOTONIC) < reasonDeadline) usleep(2000);
     if (reason == 0) reason = shared->reason.load();
     if (reason == 0) reason = shared->failed.load() ? 4 : 6;
-    if (fd >= 0) close(fd);
-    if (segmentFrames && !SealSegment(context, index, segmentFrames, reason)) {
+    if (shared->failed.load() && (reason == 1 || reason == 2 || reason == 8)) reason = 4;
+    if (!audio.Finish(ReasonText(reason), (reason > 2 && reason != 8))) {
         shared->writerFailed.store(true); _exit(1);
     }
     SaveContext(context);
     SaveReport(context, reason);
-    if (reason > 2) shared->writerFailed.store(true);
+    if ((reason > 2 && reason != 8)) shared->writerFailed.store(true);
     _exit(0);
 }
 } // namespace
@@ -394,7 +434,7 @@ void RefreshAuditPolicy(uid_t uid) {
 }
 void PrepareSessionAudio(const std::string& uuid, uid_t uid, int card, int device) {
     ReleaseSessionAudio(); appUid = uid; callId = uuid; captureCard = card; captureDevice = device;
-    if (!policy.enabled || !call_control::IsCanonicalUuid(uuid) || !PrivateDirectory(kInbox)) return;
+    if (!call_control::IsCanonicalUuid(uuid) || !PrivateDirectory(kInbox) || !PrivateDirectory(kConversationInbox)) return;
     void* memory = mmap(nullptr, sizeof(SharedAudio), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (memory != MAP_FAILED) shared = new (memory) SharedAudio();
 }
@@ -418,6 +458,7 @@ void SpawnSessionAudioWorkers() {
     capturePid = fork();
     if (capturePid == 0) { prctl(PR_SET_PDEATHSIG, SIGTERM); if (getppid() != parent) _exit(1); CloseInheritedDescriptors(); CaptureWorker(); }
     if (capturePid < 0) { shared->captureClosed.store(true); shared->failed.store(true); }
+    if (!policy.enabled) return;
     writerPid = fork();
     if (writerPid == 0) {
         CloseInheritedDescriptors();
@@ -544,6 +585,94 @@ int StartSessionCapture(SessionCapture* input) { return input ? (input->broker ?
 const char* SessionCaptureError(SessionCapture* input) { return input && input->direct ? pcm_get_error(input->direct) : "Session capture unavailable or overrun"; }
 void CloseSessionCapture(SessionCapture* input) { if (input) { if (input->direct) pcm_close(input->direct); delete input; } }
 
+struct ConversationWriter {
+    std::atomic<bool> stop {false}, failed {false};
+    std::atomic<uint64_t> endSequence {UINT64_MAX};
+    bool partial = false;
+    char reason[33] {};
+    pid_t pid = -1;
+};
+
+ConversationWriter* StartContinuousConversation(const std::string& id, const std::string& uuid,
+    uint64_t revision, const std::string& block) {
+    finishingConversationWriters.erase(std::remove_if(finishingConversationWriters.begin(), finishingConversationWriters.end(),
+        [](pid_t pid) { return waitpid(pid, nullptr, WNOHANG) != 0; }), finishingConversationWriters.end());
+    if (finishingConversationWriters.size() >= 8) return nullptr;
+    if (!shared || !shared->ready.load() || !call_control::IsCanonicalUuid(id) || uuid != callId ||
+        !call_control::IsCanonicalUuid(block) || revision == 0) return nullptr;
+    void* memory = mmap(nullptr, sizeof(ConversationWriter), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) return nullptr;
+    auto* writer = new (memory) ConversationWriter();
+    const uint64_t first = shared->produced.load(std::memory_order_acquire) + 1;
+    const int64_t wall = shared->wallMs.load() + (first - 1) * kFrameNs / 1'000'000;
+    const int64_t elapsed = ClockNs(CLOCK_MONOTONIC) / 1'000'000;
+    const pid_t parent = getpid();
+    // Never store fork()'s child return value in shared memory: the child would
+    // overwrite the real PID with zero and make a healthy writer appear dead.
+    const pid_t child = fork();
+    if (child == 0) {
+        CloseInheritedDescriptors(); childStop = 0;
+        if (!DropAuditPrivileges()) { writer->failed.store(true); _exit(1); }
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        signal(SIGTERM, StopChild); signal(SIGINT, StopChild);
+        if (getppid() != parent) _exit(1);
+        ContinuousRecordingContext context;
+        context.kind = "conversation"; context.id = id; context.callId = uuid; context.bootId = BootId();
+        context.revision = revision; context.blockId = block; context.wallMs = wall; context.elapsedMs = elapsed;
+        context.pid = getpid(); context.processStart = ProcessStart(getpid());
+        ContinuousPcmFile audio(std::string(kConversationInbox) + "/" + id, appUid, context);
+        if (!audio.Open()) { writer->failed.store(true); _exit(1); }
+        uint64_t next = first, budget = 0;
+        int64_t checkedAt = -1;
+        std::string reason;
+        while (!childStop) {
+            const uint64_t produced = shared->produced.load(std::memory_order_acquire);
+            if (writer->stop.load(std::memory_order_acquire) && next > writer->endSequence.load()) break;
+            if (next > produced) {
+                if (shared->stop.load() || shared->failed.load()) { reason = "interrupted"; break; }
+                usleep(2000); continue;
+            }
+            CopiedFrame frame;
+            if (!CopyFrame(shared->input[next % kRingSize], next, &frame)) { reason = "buffer_overrun"; break; }
+            const int64_t now = ClockNs(CLOCK_MONOTONIC) / 1'000'000;
+            if (checkedAt < 0 || now - checkedAt >= 1000) {
+                budget = ContinuousBudget(false, audio.frames() * 4); checkedAt = now;
+            }
+            if (!audio.Append(frame.samples, frame.frames, budget)) { reason = errno == ENOSPC ? "storage_full" : "writer_failure"; break; }
+            ++next;
+            if (audio.frames() % 48000 == 0 && !audio.Checkpoint()) { reason = "writer_failure"; break; }
+        }
+        bool partial = true;
+        if (reason.empty() && writer->stop.load(std::memory_order_acquire)) { reason = writer->reason; partial = writer->partial; }
+        if (shared->reason.load() == 8 && !shared->failed.load() && (reason.empty() || reason == "interrupted")) { reason = "max_call_duration"; partial = false; }
+        if (reason.empty()) reason = "interrupted";
+        if (partial) writer->failed.store(true);
+        const bool saved = audio.Finish(reason, partial);
+        if (!saved) writer->failed.store(true);
+        _exit(saved ? 0 : 1);
+    }
+    writer->pid = child;
+    if (child < 0) { munmap(memory, sizeof(ConversationWriter)); return nullptr; }
+    return writer;
+}
+bool ContinuousConversationHealthy(ConversationWriter* writer) {
+    if (!writer || writer->failed.load()) return false;
+    int status = 0;
+    if (waitpid(writer->pid, &status, WNOHANG) == writer->pid) { writer->pid = -1; return false; }
+    return writer->pid > 0;
+}
+void StopContinuousConversation(ConversationWriter* writer, const char* reason, bool partial) {
+    if (!writer) return;
+    std::snprintf(writer->reason, sizeof(writer->reason), "%s", reason);
+    writer->partial = partial;
+    writer->endSequence.store(shared ? shared->produced.load() : 0);
+    writer->stop.store(true, std::memory_order_release);
+    if (writer->pid > 0) finishingConversationWriters.push_back(writer->pid);
+    // The child owns its checkpoint and final receipt. Never wait for disk I/O in
+    // the call controller, including after disconnect and before the next IVR block.
+    munmap(writer, sizeof(ConversationWriter));
+}
+
 void RecoverAuditRecordings(uid_t uid) {
     appUid = uid;
     if (geteuid() != uid) {
@@ -568,8 +697,16 @@ void RecoverAuditRecordings(uid_t uid) {
         std::istringstream metadata(ReadFile(path + "/context", 512));
         Context context; std::string magic;
         if (!(metadata >> magic >> context.id >> context.version >> context.wall >> context.base >> context.total >> context.pid >> context.processStart >> context.boot) ||
-            magic != "AUDIT1" || context.id != entry->d_name || context.total > 48000ULL * 86400 || context.wall <= 0) continue;
+            (magic != "AUDIT1" && magic != "AUDIT2") || context.id != entry->d_name || context.total > 48000ULL * 86400 || context.wall <= 0) continue;
         if (context.boot == BootId() && context.pid > 0 && context.processStart != 0 && ProcessStart(context.pid) == context.processStart) continue;
+        if (magic == "AUDIT2") {
+            ContinuousRecordingContext committed;
+            if (!ParseContinuousContext(ReadFile(path + "/continuous.context", 1024), &committed) ||
+                committed.id != context.id || !ContinuousPcmFile::Recover(path, uid, committed)) continue;
+            context.total = committed.frames;
+            SaveReport(context, 6);
+            continue;
+        }
         uint32_t index = context.total / kAuditSegmentFrames;
         // A checkpoint can reach a boundary before the atomic segment rename.
         if (index > 0 && SafeFile(path + "/" + Stem(index - 1) + ".wav.partial", 44 + kAuditSegmentFrames * 4)) {

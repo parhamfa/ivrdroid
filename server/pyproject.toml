@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ivrdroid-server"
-version = "0.10.0"
+version = "0.10.1"
 description = "Dashboard and device control plane for IVRdroid"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-only" }

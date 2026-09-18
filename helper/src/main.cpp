@@ -62,7 +62,7 @@ using ivrdroid::protocol::CurrentState;
 using ivrdroid::protocol::LastResult;
 
 constexpr char kLogTag[] = "IVRdroidHelper";
-constexpr char kHelperVersion[] = "0.10.0";
+constexpr char kHelperVersion[] = "0.10.1";
 #ifndef IVRDROID_SOURCE_COMMIT
 #define IVRDROID_SOURCE_COMMIT "unknown"
 #endif
@@ -6471,20 +6471,26 @@ int Serve() {
 
     alignas(inotify_event) char events[4096] = {};
     int64_t lastAuditRecovery = MonotonicMilliseconds();
+    int64_t lastIdleObservation = -1000;
     while (!gStopRequested) {
-        const auto idleObservation = ReadLiveCallObservation();
-        const auto native = ivrdroid::FormatNativeCallSnapshot(idleObservation.snapshot, gBootId, "-", MonotonicMilliseconds(), ++gNativeSnapshotSequence);
-        if (!native.empty()) WriteBridgeValue((std::string(kBridgeDir) + "/native-calls").c_str(),
-            (std::string(kBridgeDir) + "/.native-calls.tmp").c_str(), native.substr(0, native.size() - 1).c_str(), 4096);
-        if (idleObservation.disposition == ivrdroid::CallDisposition::Idle && ReadAudioModeState() == AudioModeState::Normal) {
-            gSessionCallUuid = "-"; gOriginalNativeCaller.clear();
-            RefreshCallSafetyPolicy();
-            RecoveryOwnership ownership;
-            if (ReadRecoveryOwnership(&ownership)) AcknowledgeRecovery(ownership);
-            ivrdroid::RefreshAuditPolicy(gAppUid);
-            if (MonotonicMilliseconds() - lastAuditRecovery >= 30000) {
-                ivrdroid::RecoverAuditRecordings(gAppUid);
-                lastAuditRecovery = MonotonicMilliseconds();
+        // Publishing into the watched directory wakes inotify itself. Keep native
+        // polling bounded while still processing app commands immediately.
+        if (MonotonicMilliseconds() - lastIdleObservation >= 500) {
+            lastIdleObservation = MonotonicMilliseconds();
+            const auto idleObservation = ReadLiveCallObservation();
+            const auto native = ivrdroid::FormatNativeCallSnapshot(idleObservation.snapshot, gBootId, "-", MonotonicMilliseconds(), ++gNativeSnapshotSequence);
+            if (!native.empty()) WriteBridgeValue((std::string(kBridgeDir) + "/native-calls").c_str(),
+                (std::string(kBridgeDir) + "/.native-calls.tmp").c_str(), native.substr(0, native.size() - 1).c_str(), 4096);
+            if (idleObservation.disposition == ivrdroid::CallDisposition::Idle && ReadAudioModeState() == AudioModeState::Normal) {
+                gSessionCallUuid = "-"; gOriginalNativeCaller.clear();
+                RefreshCallSafetyPolicy();
+                RecoveryOwnership ownership;
+                if (ReadRecoveryOwnership(&ownership)) AcknowledgeRecovery(ownership);
+                ivrdroid::RefreshAuditPolicy(gAppUid);
+                if (MonotonicMilliseconds() - lastAuditRecovery >= 30000) {
+                    ivrdroid::RecoverAuditRecordings(gAppUid);
+                    lastAuditRecovery = MonotonicMilliseconds();
+                }
             }
         }
         const bool processed = ProcessOneCommand();
@@ -6492,7 +6498,7 @@ int Serve() {
         if (processed && !WaitForSystemReady()) break;
 
         pollfd descriptor {inotifyFd, POLLIN, 0};
-        const int pollResult = poll(&descriptor, 1, 1000);
+        const int pollResult = poll(&descriptor, 1, 500);
         if (pollResult < 0 && errno != EINTR) break;
         if (pollResult <= 0 || (descriptor.revents & POLLIN) == 0) continue;
 

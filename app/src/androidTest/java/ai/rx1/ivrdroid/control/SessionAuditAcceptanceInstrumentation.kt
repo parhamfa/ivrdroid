@@ -38,6 +38,29 @@ class SessionAuditAcceptanceInstrumentation : Instrumentation() {
         try {
             check(!(targetContext.getSystemService(Context.TELECOM_SERVICE) as android.telecom.TelecomManager).isInCall)
             check(RootAudioTrigger.initialize(isolated))
+            val nativeOutputs = listOf("native-calls", "call-safety-protocol", "call-safety-state",
+                "call-lifetime", "call-outcome", "call_control.attached",
+                "conversation_capture_failure.json", "conversation_finalizer_failure.json")
+            for (name in nativeOutputs) {
+                val path = File(files, "bridge/$name")
+                check(path.isFile && path.readText() == "UNAVAILABLE\n")
+                val stat = android.system.Os.stat(path.absolutePath)
+                check(stat.st_uid == android.os.Process.myUid() && stat.st_mode and 0b111111111 == 0b110000000)
+                check(path.delete()) // Reproduce an upgrade from the legacy bridge.
+            }
+            check(!CallSafetySettings.capable(isolated))
+            SessionAuditFiles.write(File(files, "bridge/call_control.status"), "EXISTING_SESSION_EVIDENCE\n".toByteArray())
+            check(RootAudioTrigger.initialize(isolated))
+            check(nativeOutputs.all { File(files, "bridge/$it").isFile })
+            check(File(files, "bridge/call_control.status").readText() == "EXISTING_SESSION_EVIDENCE\n")
+            val snapshot = "NATIVE2 ${ai.rx1.ivrdroid.telecom.external.BootIdentity.current()} - ${android.os.SystemClock.elapsedRealtime()} 1 1 0 0\n"
+            SessionAuditFiles.write(File(files, "bridge/native-calls"), snapshot.toByteArray())
+            SessionAuditFiles.write(File(files, "bridge/call-safety-protocol"), "1\n".toByteArray())
+            check(RootAudioTrigger.initialize(isolated))
+            check(File(files, "bridge/native-calls").readText() == snapshot)
+            check(ai.rx1.ivrdroid.telecom.external.CallRecoveryBridge.snapshot(isolated)?.parsed == true)
+            check(CallSafetySettings.capable(isolated))
+            output.putString("bridge_bootstrap", "PASS: fresh/legacy bridge creates private native outputs, preserves recovery evidence and accepts native publication")
             SessionAuditFiles.write(File(files, "bridge/status"), "READY".toByteArray())
             val id = UUID.randomUUID().toString()
             val event = PendingCallEvent(id, "2026-09-12T12:00:00Z", null, "IVR_HANDLED", null,

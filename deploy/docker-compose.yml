@@ -35,7 +35,7 @@ services:
       - database
 
   api:
-    image: ivrdroid-api:${IVRDROID_RELEASE_TAG:-0.10.0}
+    image: ivrdroid-api:${IVRDROID_RELEASE_TAG:-0.10.1}
     platform: linux/amd64
     build:
       context: ../server
@@ -89,7 +89,7 @@ services:
       - application
 
   web:
-    image: ivrdroid-web:${IVRDROID_RELEASE_TAG:-0.10.0}
+    image: ivrdroid-web:${IVRDROID_RELEASE_TAG:-0.10.1}
     platform: linux/amd64
     build:
       context: ../dashboard

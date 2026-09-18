@@ -58,7 +58,15 @@ object RootAudioTrigger {
                 ) &&
                 ensurePrivateFile(File(directory, CALL_CONTROL_REQUEST_NAME), "UNAVAILABLE") &&
                 ensurePrivateFile(File(directory, CALL_CONTROL_STATUS_NAME), "UNAVAILABLE") &&
-                ensurePrivateFile(File(directory, CALL_CONTROL_RECORDING_ACK_NAME), "UNAVAILABLE")
+                ensurePrivateFile(File(directory, CALL_CONTROL_RECORDING_ACK_NAME), "UNAVAILABLE") &&
+                // Native publication deliberately requires an existing app-owned file.
+                // Provision every V2 output before local recovery waits for its contents.
+                // UNAVAILABLE cannot be mistaken for native readiness or a policy ack.
+                listOf(
+                    "native-calls", "call-safety-protocol", "call-safety-state",
+                    "call-lifetime", "call-outcome", "call_control.attached",
+                    "conversation_capture_failure.json", "conversation_finalizer_failure.json",
+                ).all { ensurePrivateFile(File(directory, it), "UNAVAILABLE") }
         } catch (error: Exception) {
             Log.e(TAG, "Could not initialize the private helper bridge.", error)
             false

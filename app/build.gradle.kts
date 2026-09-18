@@ -11,8 +11,8 @@ android {
         applicationId = "ai.rx1.ivrdroid"
         minSdk = 29
         targetSdk = 35
-        versionCode = 19
-        versionName = "0.10.0"
+        versionCode = 20
+        versionName = "0.10.1"
 
         buildConfigField("String", "CONTROL_PLANE_URL", "\"https://ivrdroid.rx1.ai\"")
         buildConfigField("String", "CONFIG_SIGNING_PUBLIC_KEY_B64", "\"fz+JZNn34uWdo408TosUYVS162AusewBxkg2ip8Cnnw=\"")

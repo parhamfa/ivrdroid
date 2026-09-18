@@ -1,4 +1,4 @@
-# Continuous recordings and call continuity (0.10.0)
+# Continuous recordings and call continuity (0.10.1)
 
 The original caller defines the session. A signed, independently versioned call-safety policy
 sets its maximum duration (60 minutes by default; 1–1,440 minutes). The app and native guardian
@@ -12,6 +12,10 @@ and records MAX_CALL_DURATION. Other prompt, dialing and privacy watchdogs remai
 The encrypted general session journal exists even with whole-call auditing disabled. Application
 startup restores it before network synchronization. Answer and dialing intent is persisted before
 Telecom is called. Recovery reconciles observed state rather than replaying uncertain commands.
+Startup also provisions the app-owned native output files on both fresh installs and upgrades,
+without replacing existing recovery evidence. Their initial unavailable values cannot acknowledge
+a policy or imply readiness. Idle native observations run at a bounded cadence; publishing their
+files cannot trigger an inotify feedback loop of repeated Telecom queries.
 
 Bridge version 2 requires matching app/helper builds. In addition to the versioned command/status
 wire, it carries NATIVE2 call snapshots, OWN2 caller/operator/conference ownership, ATTACHED2

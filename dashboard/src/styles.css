@@ -118,6 +118,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monos
 .policy-summary svg { color: var(--teal); }
 .recent-calls h2 { padding: 19px 21px 0; }
 .table-scroll { overflow-x: auto; }
+.caller-number { white-space: nowrap; }
 
 .split-page { margin: -25px -28px -45px; }
 .split-page__main { min-width: 0; padding: 25px 28px 45px; transition: margin-right .2s ease; }

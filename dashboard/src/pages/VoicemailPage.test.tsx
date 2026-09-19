@@ -65,13 +65,13 @@ describe("voicemail inbox", () => {
     await screen.findByText("+15551234567");
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
 
-    const audio = screen.getByLabelText("Voicemail from ••••4567");
+    const audio = screen.getByLabelText("Voicemail from +15551234567");
     fireEvent.play(audio);
 
     await waitFor(() => expect(api.setRecordingListened).toHaveBeenCalledWith(message.id, true));
     expect(await screen.findByRole("heading", { name: "No unlistened recordings" })).toBeTruthy();
     expect(screen.getByRole("dialog", { name: "Voicemail" })).toBeTruthy();
-    expect(screen.getByLabelText("Voicemail from ••••4567")).toBe(audio);
+    expect(screen.getByLabelText("Voicemail from +15551234567")).toBe(audio);
     expect(screen.getByRole("button", { name: /Mark unlistened/i })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /Mark unlistened/i }));
@@ -92,7 +92,7 @@ describe("voicemail inbox", () => {
     await waitFor(() => expect(api.recordings).toHaveBeenCalledWith(false, 1));
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
 
-    const audio = screen.getByLabelText("Voicemail from ••••4567");
+    const audio = screen.getByLabelText("Voicemail from +15551234567");
     expect(audio.getAttribute("src")).toBe(message.playback_url);
     expect(screen.getByRole("link", { name: /Download MP3/i }).getAttribute("href")).toBe(message.download_url);
     expect(screen.getByRole("link", { name: /Open call trace/i }).getAttribute("href")).toContain(encodeURIComponent(message.call_id));
@@ -122,7 +122,7 @@ describe("voicemail inbox", () => {
     await screen.findByText("Partial audio");
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
     expect(screen.getByText(/some of the conversation is missing/i)).toBeTruthy();
-    expect(screen.getByLabelText("Conversation from ••••4567")).toBeTruthy();
+    expect(screen.getByLabelText("Conversation from +15551234567")).toBeTruthy();
   });
 
   it("surfaces a durable processing failure and preserves retry information", async () => {
@@ -186,6 +186,6 @@ describe("voicemail inbox", () => {
     const drawer = screen.getByRole("dialog", { name: "Conversation" });
     expect(drawer).toBeTruthy();
     expect(within(drawer).getByText("Operator disconnected")).toBeTruthy();
-    expect(within(drawer).getByLabelText("Conversation from ••••4567")).toBeTruthy();
+    expect(within(drawer).getByLabelText("Conversation from +15551234567")).toBeTruthy();
   });
 });

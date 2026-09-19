@@ -89,7 +89,7 @@ export function OverviewPage({ device }: { device: Device | null }) {
                 {calls.map((call) => (
                   <tr key={call.id}>
                     <td>{formatDate(call.started_at)}</td>
-                    <td>{call.caller_masked}</td>
+                    <td className="caller-number">{call.caller ?? call.caller_masked}</td>
                     <td>{call.policy_decision}</td>
                     <td>{call.menu_path.join(" › ") || "—"}</td>
                     <td className={call.result === "Completed" ? "text-success" : ""}>{call.result}</td>

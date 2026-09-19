@@ -1,11 +1,16 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render as renderUI, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { DisplaySettingsProvider } from "../displaySettings";
+import { DEFAULT_DISPLAY_SETTINGS } from "../display";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { api } from "../api";
 import type { CallRecord, Recording } from "../types";
 import { CallsPage } from "./CallsPage";
 import { callOutcome, recordingStatus } from "./callAudit";
 
-vi.mock("../api", () => ({ api: { calls: vi.fn(), call: vi.fn(), setRecordingListened: vi.fn(), deleteRecording: vi.fn() } }));
+const render = (ui: ReactNode) => renderUI(<DisplaySettingsProvider>{ui}</DisplaySettingsProvider>);
+
+vi.mock("../api", () => ({ api: { displaySettings: vi.fn(), calls: vi.fn(), call: vi.fn(), setRecordingListened: vi.fn(), deleteRecording: vi.fn() } }));
 const recording: Recording = { id: "audio-1", call_id: "call-1", device_id: "tablet", revision_id: null, block_id: null,
   sequence: -1, kind: "session_audit", caller: null, caller_masked: "••7753", captured_at: "2026-09-12T12:00:01Z",
   duration_ms: 15000, stop_reason: "caller_hangup", status: "ready", listened_at: null, deleted_at: null,
@@ -17,6 +22,7 @@ const call: CallRecord = { id: "call-1", device_id: "tablet", started_at: "2026-
     events: [{ offset_ms: 0, type: "answered" }, { offset_ms: 5250, type: "digit", detail: "digit:3" }], recording } };
 
 beforeEach(() => {
+  vi.mocked(api.displaySettings).mockResolvedValue({ ...DEFAULT_DISPLAY_SETTINGS });
   window.history.replaceState(null, "", "/calls");
   vi.mocked(api.calls).mockResolvedValue([structuredClone(call), { ...call, id: "old-call", session_audit: null }]);
   vi.mocked(api.call).mockResolvedValue(structuredClone(call));
@@ -24,6 +30,16 @@ beforeEach(() => {
   vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.clearAllMocks(); });
+
+it("updates table and open detail timestamps together while keeping elapsed timeline values", async () => {
+  render(<CallsPage />);
+  fireEvent.click(await screen.findByRole("button", { name: /Listen to session from/ }));
+  await screen.findByLabelText("Full session recording");
+  vi.mocked(api.displaySettings).mockResolvedValue({ timezone: "UTC", date_calendar: "gregorian" });
+  fireEvent(window, new Event("focus"));
+  await waitFor(() => expect(screen.getAllByText("Sep 12, 2026, 12:00")).toHaveLength(3));
+  expect(screen.getByRole("button", { name: "Seek to 00:05.250 Menu input" })).toBeTruthy();
+});
 
 it("opens partial audio with a seekable timeline and preserves historical no-audio state", async () => {
   render(<CallsPage />);

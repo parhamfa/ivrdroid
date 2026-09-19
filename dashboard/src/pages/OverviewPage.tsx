@@ -10,9 +10,11 @@ import {
 import { api } from "../api";
 import { useRemote } from "../hooks";
 import type { Device } from "../types";
-import { EmptyState, ErrorState, Loading, formatBytes, formatDate, formatDuration } from "../components/ui";
+import { EmptyState, ErrorState, Loading, formatBytes, formatDuration } from "../components/ui";
+import { useDateFormatter } from "../displaySettings";
 
 export function OverviewPage({ device }: { device: Device | null }) {
+  const formatDate = useDateFormatter();
   const remote = useRemote(async () => {
     const [overview, calls, revisions] = await Promise.all([api.overview(), api.calls(), api.revisions()]);
     return { overview, calls: calls.slice(0, 5), revisions };

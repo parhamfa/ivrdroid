@@ -1,7 +1,8 @@
 import { Check, Download, Headphones, Trash2 } from "lucide-react";
 import { useRef, useState } from "react";
 import { api } from "../api";
-import { Button, Drawer, ErrorState, Loading, formatDate, formatDuration } from "../components/ui";
+import { Button, Drawer, ErrorState, Loading, formatDuration } from "../components/ui";
+import { useDateFormatter } from "../displaySettings";
 import { useRemote } from "../hooks";
 import type { CallRecord, Recording, SessionAuditEvent } from "../types";
 import { callOutcome, finalDisconnect, recordingStatus, recordingProgress, eventDetail, eventTime, sessionAudioStatus, timelineEvents } from "./callAudit";
@@ -15,6 +16,7 @@ const eventLabels: Record<SessionAuditEvent["type"], string> = {
 export function CallDetails({ id, autoPlay, onClose, onChange }: {
   id: string; autoPlay: boolean; onClose: () => void; onChange: (value: CallRecord) => void;
 }) {
+  const formatDate = useDateFormatter();
   const remote = useRemote(() => api.call(id), [id]);
   const player = useRef<HTMLAudioElement>(null);
   const seekPending = useRef<number | null>(null);

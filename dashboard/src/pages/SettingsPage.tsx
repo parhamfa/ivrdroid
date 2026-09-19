@@ -1,7 +1,9 @@
 import { Archive, Bell, Clipboard, HardDrive, History, KeyRound, Laptop, Mic2, Plus, RotateCcw, ShieldOff, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import { Button, ErrorState, Field, Loading, SuccessMessage, formatBytes, formatDate } from "../components/ui";
+import { Button, ErrorState, Field, Loading, SuccessMessage, formatBytes } from "../components/ui";
+import { useDateFormatter } from "../displaySettings";
+import { DisplaySettingsCard } from "./DisplaySettingsCard";
 import { useRemote } from "../hooks";
 import { RELEASE_VERSION, SOURCE_COMMIT } from "../release";
 import { SessionAuditSettingsCard } from "./SessionAuditSettingsCard";
@@ -37,6 +39,11 @@ function isPromptBargeInReady(status: Record<string, unknown>): boolean {
 }
 
 export function SettingsPage() {
+  return <div className="settings-page"><DisplaySettingsCard /><OperationalSettings /></div>;
+}
+
+function OperationalSettings() {
+  const formatDate = useDateFormatter();
   const remote = useRemote(async () => {
     const [draft, recordingSettings, ntfySettings, devices, revisions, audit] = await Promise.all([
       api.draft(),

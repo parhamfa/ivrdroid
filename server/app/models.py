@@ -7,9 +7,9 @@ from uuid import uuid4
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
-    CheckConstraint,
     Index,
     Integer,
     JSON,
@@ -305,6 +305,20 @@ class ConversationRecordingSegment(Base):
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="uploading", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class DisplaySettings(Base):
+    __tablename__ = "display_settings"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="display_settings_singleton"),
+        CheckConstraint("date_calendar IN ('gregorian', 'persian')", name="display_settings_calendar"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    timezone: Mapped[str] = mapped_column(String(80), nullable=False, default="Asia/Tehran", server_default="Asia/Tehran")
+    date_calendar: Mapped[str] = mapped_column(String(16), nullable=False, default="persian", server_default="persian")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_by: Mapped[str] = mapped_column(String(320), nullable=False)
 
 
 class NtfySettings(Base):

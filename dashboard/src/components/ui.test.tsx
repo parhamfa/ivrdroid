@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "./AppShell";
-import { formatBytes, formatDate, formatDuration } from "./ui";
+import { formatBytes, formatDuration } from "./ui";
 
 afterEach(() => {
   cleanup();
@@ -12,7 +12,6 @@ describe("dashboard primitives", () => {
   it("formats operational values consistently", () => {
     expect(formatBytes(1_048_576)).toBe("1.0 MB");
     expect(formatDuration(125)).toBe("02:05");
-    expect(formatDate(null)).toBe("Never");
   });
 
   it("renders device health and the approved navigation", () => {

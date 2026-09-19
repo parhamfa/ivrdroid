@@ -7,6 +7,7 @@ from .recording_recovery import router as recording_recovery_router
 from .continuous_recording_worker import process_next as process_next_continuous_recording
 from .session_audit_api import router as session_audit_router
 from .release import VERSION, SOURCE_COMMIT
+from .display_settings import router as display_settings_router
 
 import asyncio
 import base64
@@ -267,6 +268,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(recording_admin_router)
     app.include_router(recording_settings_router)
     app.include_router(ntfy_settings_router)
+    app.include_router(display_settings_router)
     app.include_router(recording_device_router)
     app.include_router(conversation_recording_device_router)
     app.include_router(audit_settings_router)

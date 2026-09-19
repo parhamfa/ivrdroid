@@ -1,11 +1,13 @@
 import { FileAudio2, MoreVertical, Pause, Play, Plus, Search, UploadCloud } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { api } from "../api";
-import { Button, Drawer, EmptyState, ErrorState, Field, Loading, SuccessMessage, formatBytes, formatDate } from "../components/ui";
+import { Button, Drawer, EmptyState, ErrorState, Field, Loading, SuccessMessage, formatBytes } from "../components/ui";
+import { useDateFormatter } from "../displaySettings";
 import { useRemote } from "../hooks";
 import type { Prompt } from "../types";
 
 export function PromptsPage() {
+  const formatDate = useDateFormatter();
   const remote = useRemote(api.prompts, []);
   const fileInput = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState("");

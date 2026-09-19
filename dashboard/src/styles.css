@@ -272,6 +272,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monos
 .settings-section > header > svg { color: var(--teal); }
 .settings-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
 .settings-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.display-preview { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 16px; margin-top: 18px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+.display-preview > span, .display-preview > small { color: var(--muted); font-size: 12px; }
+.display-preview > output { font-weight: 600; font-variant-numeric: tabular-nums; }
 .recording-capacity { display: flex; align-items: center; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: #f8fbfb; }
 .recording-capacity > svg { flex: 0 0 auto; color: var(--teal); }
 .recording-capacity > div { display: grid; gap: 3px; }

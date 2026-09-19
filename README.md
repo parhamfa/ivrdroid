@@ -114,6 +114,12 @@ written under `helper/dist/`, and the system-app package is written under `app/d
 After installing the V4 package, open IVRdroid and grant its newly requested `CALL_PHONE` runtime
 permission before expecting the tablet to advertise external-call capability.
 
+The dashboard's **Settings → Display** card saves one shared timezone and calendar for all
+administrators, initially `Asia/Tehran` and Persian/Jalali. Changes apply after saving and are
+refreshed when another browser window regains focus. IVR schedule rules, stored timestamps,
+CSV exports, and elapsed audio times are independent of these presentation preferences.
+Deploy the API with migration `0009_display_settings` before deploying the updated dashboard.
+
 Run the server tests with:
 
 ```sh

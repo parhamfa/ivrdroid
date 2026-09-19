@@ -164,14 +164,3 @@ export function formatDuration(seconds: number): string {
   const remaining = Math.max(0, seconds % 60);
   return `${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
 }
-
-export function formatDate(value: string | null): string {
-  if (!value) return "Never";
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(new Date(value));
-}

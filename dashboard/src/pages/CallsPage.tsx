@@ -1,7 +1,8 @@
 import { Download, Filter, Headphones, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import { api } from "../api";
-import { Button, EmptyState, ErrorState, Loading, formatDate, formatDuration } from "../components/ui";
+import { Button, EmptyState, ErrorState, Loading, formatDuration } from "../components/ui";
+import { useDateFormatter } from "../displaySettings";
 import { useRemote } from "../hooks";
 import type { CallRecord } from "../types";
 import { CallDetails } from "./CallDetails";
@@ -23,6 +24,7 @@ function traceText(value: string): string {
 }
 
 export function CallsPage() {
+  const formatDate = useDateFormatter();
   const remote = useRemote(api.calls, []);
   const [search, setSearch] = useState("");
   const [result, setResult] = useState("all");

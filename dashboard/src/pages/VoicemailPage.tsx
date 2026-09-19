@@ -1,7 +1,8 @@
 import { Check, Download, Filter, Inbox, PhoneCall, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import { Button, Drawer, EmptyState, ErrorState, Loading, SuccessMessage, formatDate, formatDuration } from "../components/ui";
+import { Button, Drawer, EmptyState, ErrorState, Loading, SuccessMessage, formatDuration } from "../components/ui";
+import { useDateFormatter } from "../displaySettings";
 import { useRemote } from "../hooks";
 import type { Recording } from "../types";
 import { recordingProgress, recordingStatus } from "./callAudit";
@@ -25,6 +26,7 @@ function recordingKind(recording: Recording): "voicemail" | "conversation" | "se
 }
 
 export function VoicemailPage() {
+  const formatDate = useDateFormatter();
   const [unreadOnly, setUnreadOnly] = useState(true);
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Recording | null>(null);

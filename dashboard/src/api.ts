@@ -4,6 +4,7 @@ import type {
   SessionAuditSettings,
   CallSafetySettings,
   Device,
+  DisplaySettings,
   DraftConfiguration,
   FlowDiff,
   Overview,
@@ -65,6 +66,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  displaySettings: () => request<DisplaySettings>("/api/admin/v1/display-settings"),
+  saveDisplaySettings: (settings: DisplaySettings) => request<DisplaySettings>("/api/admin/v1/display-settings", {
+    method: "PUT",
+    body: JSON.stringify(settings),
+  }),
   overview: () => request<Overview>("/api/admin/v1/overview"),
   draft: () => request<DraftConfiguration>("/api/admin/v4/draft"),
   saveDraft: (draft: DraftConfiguration) =>

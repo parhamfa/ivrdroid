@@ -380,3 +380,7 @@ export interface CallSafetySettings {
   signature_b64: string;
   devices: Array<{ id: string; name: string; capable: boolean; applied_version: number | null; maximum_call_duration_seconds: number | null; last_error: string | null }>;
 }
+export type DisplaySettings = {
+  timezone: string;
+  date_calendar: "gregorian" | "persian";
+};

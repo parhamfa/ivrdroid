@@ -1,11 +1,17 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render as renderUI, screen, waitFor, within } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { DisplaySettingsProvider } from "../displaySettings";
+import { DEFAULT_DISPLAY_SETTINGS } from "../display";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api";
 import type { Recording, RecordingList } from "../types";
 import { VoicemailPage } from "./VoicemailPage";
 
+const render = (ui: ReactNode) => renderUI(<DisplaySettingsProvider>{ui}</DisplaySettingsProvider>);
+
 vi.mock("../api", () => ({
   api: {
+    displaySettings: vi.fn(),
     recordings: vi.fn(),
     setRecordingListened: vi.fn(),
     deleteRecording: vi.fn(),
@@ -34,6 +40,7 @@ const message: Recording = {
 const inbox: RecordingList = { items: [message], page: 1, page_size: 50, total: 1 };
 
 beforeEach(() => {
+  vi.mocked(api.displaySettings).mockResolvedValue({ ...DEFAULT_DISPLAY_SETTINGS });
   vi.mocked(api.recordings).mockResolvedValue(inbox);
   vi.mocked(api.setRecordingListened).mockImplementation(async (_id, listened) => ({
     ...message,

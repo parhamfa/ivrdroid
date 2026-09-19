@@ -1,11 +1,18 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render as renderUI, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { DisplaySettingsProvider } from "../displaySettings";
+import { DEFAULT_DISPLAY_SETTINGS } from "../display";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api";
 import type { DraftConfiguration, NtfySettings, RecordingSettings } from "../types";
 import { SettingsPage } from "./SettingsPage";
 
+const render = (ui: ReactNode) => renderUI(<DisplaySettingsProvider>{ui}</DisplaySettingsProvider>);
+
 vi.mock("../api", () => ({
   api: {
+    displaySettings: vi.fn(),
+    saveDisplaySettings: vi.fn(),
     draft: vi.fn(),
     recordingSettings: vi.fn(),
     sessionAuditSettings: vi.fn(),
@@ -67,6 +74,8 @@ const ntfy: NtfySettings = {
 };
 
 beforeEach(() => {
+  vi.mocked(api.displaySettings).mockResolvedValue({ ...DEFAULT_DISPLAY_SETTINGS });
+  vi.mocked(api.saveDisplaySettings).mockImplementation(async (value) => value);
   vi.mocked(api.callSafetySettings).mockResolvedValue({ document: { kind: "call_safety_policy", schema_version: 1, version: 0, maximum_call_duration_seconds: 3600 }, sha256: "", signature_b64: "", devices: [] });
   vi.mocked(api.sessionAuditSettings).mockResolvedValue({ document: { kind: "session_audit_policy", version: 0, enabled: false, local_quota_bytes: 1024 ** 3 }, sha256: "", signature_b64: "", server_quota_bytes: 1024 ** 3, devices: [] });
   vi.mocked(api.draft).mockResolvedValue(structuredClone(draft));
@@ -94,6 +103,18 @@ afterEach(() => {
 });
 
 describe("recording settings", () => {
+  it("saves display preferences without resetting or publishing operational edits", async () => {
+    render(<SettingsPage />);
+    const duration = await screen.findByRole("spinbutton", { name: /Maximum duration/i });
+    fireEvent.change(duration, { target: { value: "90" } });
+    fireEvent.change(screen.getByLabelText(/Calendar/), { target: { value: "gregorian" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save display settings" }));
+    await screen.findByText("Display settings saved for all administrators.");
+    expect((duration as HTMLInputElement).value).toBe("90");
+    expect(api.saveDraft).not.toHaveBeenCalled();
+    expect(api.saveRecordingSettings).not.toHaveBeenCalled();
+  });
+
   it("validates the whole-call limit without changing the separate voicemail duration", async () => {
     vi.mocked(api.saveCallSafetySettings).mockResolvedValue({ document: { kind: "call_safety_policy", schema_version: 1, version: 1, maximum_call_duration_seconds: 7200 }, sha256: "", signature_b64: "", devices: [] });
     render(<SettingsPage />);

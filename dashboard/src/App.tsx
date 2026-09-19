@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
+import { DisplaySettingsNotice } from "./displaySettings";
 import { AppShell, type PageKey } from "./components/AppShell";
 import { CallsPage } from "./pages/CallsPage";
 import { CallerPolicyPage } from "./pages/CallerPolicyPage";
@@ -49,6 +50,7 @@ export function App() {
   const navigate = (next: PageKey, path: string) => { window.history.pushState({}, "", path); setPage(next); };
 
   return <AppShell page={page} title={TITLES[page]} draft={page === "caller-policy" || page === "ivr-flow" || page === "settings"} device={device} onNavigate={navigate}>
+    <DisplaySettingsNotice />
     {page === "overview" ? <OverviewPage device={device} /> : null}
     {page === "caller-policy" ? <CallerPolicyPage /> : null}
     {page === "ivr-flow" ? <FlowPage /> : null}

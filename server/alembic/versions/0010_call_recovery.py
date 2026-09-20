@@ -2,8 +2,8 @@
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0009_call_recovery"
-down_revision = "0008_continuous_recordings"
+revision = "0010_call_recovery"
+down_revision = "0009_display_settings"
 branch_labels = None
 depends_on = None
 

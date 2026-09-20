@@ -11,7 +11,7 @@ IVRDROID_SOURCE_COMMIT=$(git rev-parse HEAD)
 export IVRDROID_SOURCE_COMMIT
 SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
 export SOURCE_DATE_EPOCH
-RELEASE_DIR=${1:-"$REPO_DIR/../ivrdroid-release-artifacts/0.10.1/$IVRDROID_SOURCE_COMMIT"}
+RELEASE_DIR=${1:-"$REPO_DIR/../ivrdroid-release-artifacts/0.10.2/$IVRDROID_SOURCE_COMMIT"}
 mkdir -p "$RELEASE_DIR"
 chmod 0700 "$RELEASE_DIR"
 RELEASE_DIR=$(cd "$RELEASE_DIR" && pwd)
@@ -21,10 +21,10 @@ cmake -S helper -B helper/build-android-arm64 -DIVRDROID_BUILD_AUDIO_HARNESS=ON
 cmake --build helper/build-android-arm64 --parallel
 ./scripts/package-helper.sh
 ./scripts/package-system-app.sh
-cp app/build/outputs/apk/debug/app-debug.apk "$RELEASE_DIR/IVRdroid-0.10.1.apk"
-cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk "$RELEASE_DIR/IVRdroid-0.10.1-acceptance.apk"
-cp app/dist/IVRdroid-system-app-0.10.1.zip "$RELEASE_DIR/"
-cp helper/dist/IVRdroid-helper-0.10.1-disabled.zip "$RELEASE_DIR/"
+cp app/build/outputs/apk/debug/app-debug.apk "$RELEASE_DIR/IVRdroid-0.10.2.apk"
+cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk "$RELEASE_DIR/IVRdroid-0.10.2-acceptance.apk"
+cp app/dist/IVRdroid-system-app-0.10.2.zip "$RELEASE_DIR/"
+cp helper/dist/IVRdroid-helper-0.10.2-disabled.zip "$RELEASE_DIR/"
 cp helper/dist/ivrdroid-helper "$RELEASE_DIR/"
 cp helper/build-android-arm64/ivrdroid-audio-harness "$RELEASE_DIR/"
 git archive --format=tar HEAD > "$RELEASE_DIR/source.tar"

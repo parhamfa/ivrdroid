@@ -13,7 +13,7 @@ from app import models  # noqa: F401
 configuration = context.config
 if configuration.config_file_name is not None:
     fileConfig(configuration.config_file_name)
-configuration.set_main_option("sqlalchemy.url", load_settings().database_url)
+configuration.set_main_option("sqlalchemy.url", load_settings().database_url.replace("%", "%%"))
 target_metadata = Base.metadata
 
 

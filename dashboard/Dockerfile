@@ -11,7 +11,7 @@ RUN npm run build
 
 FROM --platform=linux/amd64 nginxinc/nginx-unprivileged:1.29-alpine@sha256:8059701048a6cc7d64e8ab2812a44be70161bfa9ecfc01d69e95b8ff2a648705
 ARG SOURCE_COMMIT=unknown
-LABEL org.opencontainers.image.version="0.10.1" org.opencontainers.image.revision=${SOURCE_COMMIT}
+LABEL org.opencontainers.image.version="0.10.2" org.opencontainers.image.revision=${SOURCE_COMMIT}
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
 EXPOSE 8080

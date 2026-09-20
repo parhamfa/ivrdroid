@@ -12,7 +12,7 @@ root = Path(__file__).resolve().parents[1]
 commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
 if os.environ.get('IVRDROID_SOURCE_COMMIT') != commit:
     raise SystemExit('Build source commit must match HEAD.')
-version = '0.10.1'
+version = '0.10.2'
 for path in ('app/magisk/module.prop', 'helper/magisk/module.prop'):
     if f'version={version}\n' not in (root / path).read_text():
         raise SystemExit(f'Inconsistent release metadata: {path}')
@@ -22,11 +22,11 @@ if f'versionName = "{version}"' not in app:
 code = int(re.search(r'versionCode = (\d+)', app)[1])
 overlay = int(re.search(r'^versionCode=(\d+)', (root / 'app/magisk/module.prop').read_text(), re.M)[1])
 helper = int(re.search(r'^versionCode=(\d+)', (root / 'helper/magisk/module.prop').read_text(), re.M)[1])
-if code != overlay or code < 20 or helper < 28:
+if code != overlay or code < 21 or helper < 29:
     raise SystemExit('Version codes must preserve Android upgrade order.')
 folder = Path(sys.argv[1]).resolve()
-files = ['IVRdroid-0.10.1.apk', 'IVRdroid-0.10.1-acceptance.apk', 'IVRdroid-system-app-0.10.1.zip',
-         'IVRdroid-helper-0.10.1-disabled.zip', 'ivrdroid-helper', 'ivrdroid-audio-harness', 'source.tar']
+files = ['IVRdroid-0.10.2.apk', 'IVRdroid-0.10.2-acceptance.apk', 'IVRdroid-system-app-0.10.2.zip',
+         'IVRdroid-helper-0.10.2-disabled.zip', 'ivrdroid-helper', 'ivrdroid-audio-harness', 'source.tar']
 artifacts = {}
 for name in files:
     path = folder / name

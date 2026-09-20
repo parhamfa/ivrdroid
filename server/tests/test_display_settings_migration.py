@@ -18,11 +18,11 @@ def test_display_migration_preserves_existing_data_and_saved_preferences(tmp_pat
     config = Config("alembic.ini")
     try:
         command.stamp(config, "0008_continuous_recordings")
-        command.upgrade(config, "head")
+        command.upgrade(config, "0009_display_settings")
         with engine.begin() as connection:
             assert connection.execute(text("SELECT timezone, date_calendar FROM display_settings")).one() == ("Asia/Tehran", "persian")
             connection.execute(text("UPDATE display_settings SET timezone = 'UTC', date_calendar = 'gregorian' WHERE id = 1"))
-        command.upgrade(config, "head")
+        command.upgrade(config, "0009_display_settings")
         with engine.connect() as connection:
             assert connection.execute(text("SELECT timezone, date_calendar FROM display_settings")).one() == ("UTC", "gregorian")
             assert connection.execute(text("SELECT action FROM audit_logs")).scalar_one() == "existing"

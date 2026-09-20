@@ -10,7 +10,7 @@ int main() {
     using ivrdroid::protocol::LastResult;
     assert(std::string(ivrdroid::protocol::kCapabilities) ==
         "runtime=1,2,3,4;recording=1;call_control=2;conversation_recording=1;"
-        "prompt_barge_in=1;session_audit=1");
+        "prompt_barge_in=1;session_audit=1;call_admission=1;capture_receipt=2");
     assert(ivrdroid::protocol::ParseCommand("START_MENU\n") == Command::StartMenu);
     const auto start = ivrdroid::protocol::ParseCommandRequest(
         "START_MENU 11111111-1111-4111-8111-111111111111\n");

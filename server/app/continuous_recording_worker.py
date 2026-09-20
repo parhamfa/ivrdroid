@@ -79,11 +79,8 @@ def _process(session, settings, cipher, recording, receipt, upload):
     needed = recording.source_size_bytes + recording.duration_ms * 36 + reserve
     if shutil.disk_usage(settings.recording_root).free < needed:
         raise RecordingError("Server processing workspace is full; audio is preserved for retry", 507)
-    work_root = settings.recording_root.parent / (settings.recording_root.name + "-processing")
-    work_root.mkdir(mode=0o700, exist_ok=True)
-    if work_root.is_symlink() or work_root.stat().st_uid != os.getuid():
-        raise RecordingError("Server processing workspace is unsafe", 503)
-    os.chmod(work_root, 0o700)
+    from .processing_workspace import processing_workspace
+    work_root = processing_workspace(settings.recording_root)
     # Only the process holding the cross-worker lock may touch these crash remnants.
     for prior in work_root.iterdir():
         if prior.is_dir() and not prior.is_symlink() and prior.name.startswith("job-"):
@@ -96,6 +93,8 @@ def _process(session, settings, cipher, recording, receipt, upload):
         encoded = workspace / "audio.mp3"
         encrypted = workspace / "audio.rec"
         _materialize(settings, cipher, recording, upload, raw)
+        if receipt.validation_error:
+            raise RecordingError(receipt.validation_error, 409)
         try:
             with (workspace / "conversion-error.log").open("w+b") as diagnostic:
                 process = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
@@ -180,9 +179,10 @@ def process_next(application) -> bool:
                 session.refresh(recording); session.refresh(receipt)
                 if receipt.accepted_at is None:
                     permanent = isinstance(error, RecordingError) and error.status_code == 422
-                    receipt.state = "invalid" if permanent else "retrying"
-                    receipt.retry_at = None if permanent else utcnow() + timedelta(seconds=min(3600, 30 * 2 ** min(receipt.attempts, 7)))
-                    recording.status = "failed" if permanent else "processing"
+                    needs_attention = isinstance(error, RecordingError) and error.status_code == 409
+                    receipt.state = "needs_attention" if needs_attention else "invalid" if permanent else "retrying"
+                    receipt.retry_at = None if permanent or needs_attention else utcnow() + timedelta(seconds=min(3600, 30 * 2 ** min(receipt.attempts, 7)))
+                    recording.status = "failed" if permanent or needs_attention else "processing"
                     recording.processing_error = str(error)[:500]
                 LOGGER.exception("Continuous recording %s processing failed", receipt.recording_id)
             finally:

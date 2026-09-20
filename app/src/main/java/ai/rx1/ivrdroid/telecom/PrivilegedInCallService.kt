@@ -37,6 +37,7 @@ class PrivilegedInCallService : InCallService() {
 
     private fun tickCallControl() {
         LocalCallSession.observeCalls(applicationContext, telecom.calls())
+        IncomingCallAdmission.tick(applicationContext, telecom)
         LocalCallSession.recoverAnswer(applicationContext, telecom.calls())?.let { telecom.answerRecoveredCaller(it) }
         val expiredSession = LocalCallSession.expiredSession()
         if (expiredSession == null) {

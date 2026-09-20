@@ -1,4 +1,5 @@
 #include "call_control_protocol.h"
+#include "async_recording_writer.h"
 #include "call_safety_policy.h"
 #include "call_lifetime_policy.h"
 #include "child_process.h"
@@ -230,6 +231,9 @@ std::string gAuditBlock;
 
 int64_t MonotonicMilliseconds();
 std::string gSessionCallUuid = "-";
+int gHelperLockFd = -1;
+std::vector<pid_t> gDrainingGuardians;
+pid_t gAuditRecoveryPid = -1;
 std::string gOriginalNativeCaller;
 ivrdroid::CallLifetimePolicy gCallLifetimePolicy;
 uint64_t gNativeSnapshotSequence = 0;
@@ -415,7 +419,7 @@ bool ResolveAndValidateBridge() {
         !IsSafeAppOwnedFile(kActiveRevisionBridgePath) ||
         !IsSafeAppOwnedFile(kStagedRevisionBridgePath) ||
         !IsSafeAppOwnedFile(kHelperVersionBridgePath) ||
-        !IsSafeAppOwnedFile(kCapabilitiesBridgePath) ||
+        !IsSafeAppOwnedFile(kCapabilitiesBridgePath, 512) ||
         !IsSafeAppOwnedFile(
             kRecordingCapacityPath,
             kMaximumRecordingCapacityBytes) ||
@@ -436,7 +440,7 @@ bool ResolveAndValidateBridge() {
     return true;
 }
 
-void CleanupPartialRecordings() {
+[[maybe_unused]] void CleanupPartialRecordings() {
     DIR* directory = opendir(kRecordingInboxDir);
     if (directory == nullptr) return;
     while (dirent* entry = readdir(directory)) {
@@ -684,10 +688,16 @@ void WriteLastResult(LastResult result) {
         const std::string path = std::string(kBridgeDir) + "/call-outcome";
         const std::string wire = "END1 " + gSessionCallUuid + " " + gBootId + " " + std::to_string(MonotonicMilliseconds()) + " " + ivrdroid::protocol::ToString(result) + "\n";
         WriteBridgeWire(path.c_str(), (path + ".tmp").c_str(), wire);
+        const std::string own = std::string(kBridgeDir) + "/call-results/" + gSessionCallUuid + ".outcome";
+        WriteBridgeWire(own.c_str(), (own + ".tmp").c_str(), wire);
     }
 }
 
 void WriteSessionPath(const std::string& path) {
+    if (ivrdroid::call_control::IsCanonicalUuid(gSessionCallUuid)) {
+        const std::string own = std::string(kBridgeDir) + "/call-results/" + gSessionCallUuid + ".path";
+        WriteBridgeValue(own.c_str(), (own + ".tmp").c_str(), path.c_str(), kMaximumSessionPathBytes);
+    }
     if (!WriteBridgeValue(
             kSessionPathBridgePath,
             kSessionPathBridgeTempPath,
@@ -889,10 +899,12 @@ const char* AudioModeName(AudioModeState state) {
     return "UNKNOWN";
 }
 
+bool AdmissionCancelled();
 bool WaitForInCall() {
     for (int attempt = 0;
          attempt < kCallWaitIterations && !gStopRequested;
          ++attempt) {
+        if (AdmissionCancelled()) return false;
         if (IsAudioInCall()) return true;
         usleep(kCallWaitSleepUs);
     }
@@ -2172,7 +2184,21 @@ PrivacyStartResult PrivacyResultForCallDisposition(
 
 bool RestorePrivateSession();
 
+bool AdmissionCancelled() {
+    std::string wire;
+    if (gSessionCallUuid.empty() || !ReadOwnedBoundedFile(
+            (std::string(kBridgeDir) + "/call-results/" + gSessionCallUuid + ".cancelled").c_str(),
+            gAppUid, 256, &wire)) return false;
+    std::istringstream input(wire);
+    std::string magic, session, boot, extra;
+    int64_t elapsed = 0;
+    return (input >> magic >> session >> boot >> elapsed) && !(input >> extra) &&
+        magic == "CANCEL1" && session == gSessionCallUuid && boot == gBootId &&
+        elapsed > 0 && elapsed <= MonotonicMilliseconds();
+}
+
 PrivacyStartResult BeginPrivateSession(int guardianFd) {
+    if (AdmissionCancelled()) return PrivacyStartResult::ExternalPreempt;
     WriteCurrentState(CurrentState::ArmingPrivacy);
 
     if (ReadAudioModeState() != AudioModeState::Normal) {
@@ -2232,6 +2258,10 @@ PrivacyStartResult BeginPrivateSession(int guardianFd) {
     for (int attempt = 0;
          attempt < kMixerRouteWaitIterations && !gStopRequested;
          ++attempt) {
+        if (AdmissionCancelled()) {
+            CloseMixerRoute(&route);
+            return PrivacyStartResult::ExternalPreempt;
+        }
         bool startupRouteReady = false;
         const ivrdroid::PrivacyObservation observation =
             EnforcePrivateControls(&route, &startupRouteReady);
@@ -3024,10 +3054,7 @@ struct RecordingCaptureResult {
     const char* stopReason = nullptr;
 };
 
-bool IsRecordingStorageError(int error) {
-    return error == ENOSPC || error == EDQUOT || error == EFBIG ||
-        error == EROFS || error == EMFILE || error == ENFILE;
-}
+
 
 bool CurrentUtcTimestamp(char* output, size_t outputBytes) {
     if (output == nullptr || outputBytes < 25) return false;
@@ -3178,6 +3205,23 @@ struct ConversationSegment {
     std::string finalPath;
     std::array<char, 32> capturedAt {};
 };
+
+void QueueRecordingFailure(const std::string& callUuid, const std::string& blockUuid, const char* reason) {
+    std::string id;
+    std::array<char, 32> occurredAt {};
+    if (!GenerateRecordingUuid(&id) || !CurrentUtcTimestamp(occurredAt.data(), occurredAt.size())) return;
+    const std::string directory = std::string(kBridgeDir) + "/recording-failures";
+    const std::string temporary = directory + "/." + id + ".tmp";
+    const std::string final = directory + "/" + id + ".json";
+    const std::string wire = "{\"call_id\":\"" + callUuid + "\",\"block_id\":\"" + blockUuid +
+        "\",\"occurred_at\":\"" + occurredAt.data() + "\",\"reason\":\"" + reason + "\"}";
+    auto writer = ivrdroid::AsyncRecordingWriter::Start(temporary, gAppUid,
+        [wire](int fd) { return WriteAll(fd, wire.data(), wire.size()) && fsync(fd) == 0; },
+        [temporary, final, directory](int, uint64_t, const std::string&, bool captured) {
+            return captured && rename(temporary.c_str(), final.c_str()) == 0 && SyncDirectory(directory.c_str());
+        });
+    if (writer) writer->Stop("completed", true);
+}
 
 void SaveConversationFailureEvidence(
     const std::string& callUuid, const std::string& recordingUuid,
@@ -3488,6 +3532,7 @@ bool CorrelatesCallControlStatus(
 
 enum class ExternalTeardownResult {
     Safe,
+    CallerHungUp,
     CleanupTimeout,
     Failed,
 };
@@ -3529,7 +3574,7 @@ ExternalTeardownResult AwaitExternalCallTeardown(
                 }
             }
             if (decision == ExternalCallTeardownDecision::MatchedTerminal) {
-                return ExternalTeardownResult::Safe;
+                return status.reason == "CALLER_HANGUP" ? ExternalTeardownResult::CallerHungUp : ExternalTeardownResult::Safe;
             }
             if (decision == ExternalCallTeardownDecision::CleanupTimeout) {
                 return ExternalTeardownResult::CleanupTimeout;
@@ -3684,6 +3729,7 @@ ExternalCallExecutionResult ExecuteExternalCall(
                 static_cast<unsigned long long>(segment.frames));
             ivrdroid::AuditEvent("external_call", instruction.blockId,
                 std::string("recording_failure:") + stage);
+            QueueRecordingFailure(callUuid, instruction.blockId, "RECORDING_FAILURE");
             // The writer owns durable failure evidence. Storage must not block this loop.
         }
         recordingFailed = true;
@@ -3931,7 +3977,10 @@ ExternalCallExecutionResult ExecuteExternalCall(
                 policy.lastReason(),
                 expectation,
                 guardianFd);
-            if (teardown == ExternalTeardownResult::CleanupTimeout) {
+            if (teardown == ExternalTeardownResult::CallerHungUp) {
+                terminal = ExternalCallExecutionKind::CallerHangup;
+                finalStopReason = conferenced ? "caller_hangup" : nullptr;
+            } else if (teardown == ExternalTeardownResult::CleanupTimeout) {
                 terminal = ExternalCallExecutionKind::CleanupTimeout;
             } else if (teardown != ExternalTeardownResult::Safe) {
                 terminal = ExternalCallExecutionKind::Failed;
@@ -3941,7 +3990,10 @@ ExternalCallExecutionResult ExecuteExternalCall(
 
     if (ivrdroid::RequiresOriginalCallerSafeConfirmation(terminal) &&
         !ConfirmOriginalCallerSafe(guardianFd)) {
-        terminal = ExternalCallExecutionKind::Failed;
+        // The operator may disconnect first and the caller immediately afterward.
+        terminal = ReadLiveCallState() == ivrdroid::CallDisposition::Idle
+            ? ExternalCallExecutionKind::CallerHangup : ExternalCallExecutionKind::Failed;
+        if (terminal == ExternalCallExecutionKind::CallerHangup) finalStopReason = conferenced ? "caller_hangup" : nullptr;
     }
 
     if (terminal == ExternalCallExecutionKind::CleanupTimeout || terminal == ExternalCallExecutionKind::Failed) {
@@ -3967,6 +4019,7 @@ RecordingCaptureResult CaptureRecordingMessage(
     int guardianFd) {
     if (callUuid.empty() ||
         !RecordingStorageAvailable(instruction.maximumDurationMilliseconds)) {
+        if (!callUuid.empty()) QueueRecordingFailure(callUuid, instruction.blockId, "STORAGE_UNAVAILABLE");
         return {RecordingCaptureKind::Unavailable, nullptr};
     }
     const PromptResult beep = ProcessRecordingBeep(guardianFd);
@@ -3991,25 +4044,35 @@ RecordingCaptureResult CaptureRecordingMessage(
         std::string(kRecordingInboxDir) + "/." + recordingUuid + ".wav.partial";
     const std::string final =
         std::string(kRecordingInboxDir) + "/" + recordingUuid + ".wav";
-    unlink(temporary.c_str());
-    const int fd = open(
-        temporary.c_str(),
-        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-        0600);
-    if (fd < 0) {
-        const int failure = errno;
-        unlink(temporary.c_str());
-        return {IsRecordingStorageError(failure)
-            ? RecordingCaptureKind::Unavailable
-            : RecordingCaptureKind::Failed, nullptr};
-    }
-    if (!WriteWaveHeader(fd, 0)) {
-        const int failure = errno;
-        if (fd >= 0) close(fd);
-        unlink(temporary.c_str());
-        return {IsRecordingStorageError(failure)
-            ? RecordingCaptureKind::Unavailable
-            : RecordingCaptureKind::Failed, nullptr};
+    std::array<char, 32> capturedAt {};
+    if (!CurrentUtcTimestamp(capturedAt.data(), capturedAt.size())) return {RecordingCaptureKind::Unavailable, nullptr};
+    const auto finish = [=](int fd, uint64_t bytes, const std::string& reason, bool captured) {
+        // Only immutable identities and this recording's file are available here.
+        const uint64_t dataBytes = bytes - bytes % 4;
+        bool complete = fd >= 0 && dataBytes > 0 && dataBytes <= UINT32_MAX &&
+            ftruncate(fd, 44 + dataBytes) == 0 && WriteWaveHeader(fd, static_cast<uint32_t>(dataBytes)) && fsync(fd) == 0 && captured;
+        if (complete) complete = rename(temporary.c_str(), final.c_str()) == 0 && SyncDirectory(kRecordingInboxDir);
+        std::string hash;
+        if (complete) complete = ivrdroid::Sha256File(final.c_str(), kMaximumRecordingBytes, &hash) &&
+            WriteRecordingReceipt(recordingUuid, callUuid, revisionId, instruction.blockId, sequence,
+                capturedAt.data(), dataBytes / 192, reason.c_str(), dataBytes + 44, hash);
+        if (!complete) {
+            std::array<char, 32> occurredAt {}; CurrentUtcTimestamp(occurredAt.data(), occurredAt.size());
+            std::ostringstream event;
+            event << "{\"call_id\":\"" << callUuid << "\",\"block_id\":\"" << instruction.blockId
+                << "\",\"occurred_at\":\"" << occurredAt.data() << "\",\"reason\":\"WRITER_FAILURE\",\"frames\":" << dataBytes / 4 << "}";
+            const std::string path = std::string(kBridgeDir) + "/recording-failures/" + recordingUuid + ".json";
+            const int evidence = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+            if (evidence >= 0) { const auto wire = event.str(); WriteAll(evidence, wire.data(), wire.size()); fsync(evidence); close(evidence); }
+            // Keep the prefix and receipt evidence for recovery. Never publish a successful voicemail.
+        }
+        return complete;
+    };
+    auto writer = ivrdroid::AsyncRecordingWriter::Start(temporary, gAppUid,
+        [](int fd) { return WriteWaveHeader(fd, 0); }, finish);
+    if (!writer) {
+        QueueRecordingFailure(callUuid, instruction.blockId, "WRITER_UNAVAILABLE");
+        return {RecordingCaptureKind::Unavailable, nullptr};
     }
 
     pcm_config config {};
@@ -4019,20 +4082,12 @@ RecordingCaptureResult CaptureRecordingMessage(
     config.period_count = kDtmfPeriodCount;
     config.format = PCM_FORMAT_S16_LE;
     ivrdroid::SessionCapture* input = ivrdroid::OpenSessionCapture(gProfile->card, gProfile->captureDevice, PCM_IN, &config);
-    if (input == nullptr || !ivrdroid::SessionCaptureReady(input) ||
-        !NotifyGuardian(guardianFd, kGuardianRecording)) {
+    if (input == nullptr || !ivrdroid::SessionCaptureReady(input)) {
         if (input != nullptr) ivrdroid::CloseSessionCapture(input);
-        close(fd);
-        unlink(temporary.c_str());
-        return {RecordingCaptureKind::Failed, nullptr};
+        return {RecordingCaptureKind::Unavailable, nullptr};
     }
-
-    char capturedAt[32] = {};
-    if (!CurrentUtcTimestamp(capturedAt, sizeof(capturedAt))) {
-        ivrdroid::CloseSessionCapture(input);
-        close(fd);
-        unlink(temporary.c_str());
-        return {RecordingCaptureKind::Failed, nullptr};
+    if (!NotifyGuardian(guardianFd, kGuardianRecording)) {
+        ivrdroid::CloseSessionCapture(input); return {RecordingCaptureKind::Failed, nullptr};
     }
 
     WriteCurrentState(CurrentState::RecordingMessage);
@@ -4042,24 +4097,28 @@ RecordingCaptureResult CaptureRecordingMessage(
     std::deque<std::vector<int16_t>> pending;
     ivrdroid::StereoDtmfDetector detector(48'000);
     uint64_t capturedFrames = 0;
-    uint64_t writtenFrames = 0;
     RecordingCaptureKind result = RecordingCaptureKind::Completed;
     const char* stopReason = "maximum_duration";
     bool writeOk = true;
-    bool storageUnavailable = false;
 
     const auto writeSamples = [&](const std::vector<int16_t>& frame) {
-        if (!WriteAll(fd, frame.data(), frame.size() * sizeof(int16_t))) {
-            storageUnavailable = IsRecordingStorageError(errno);
+        if (!writer->Append(frame.data(), frame.size() * sizeof(int16_t))) {
             return false;
         }
-        writtenFrames += frame.size() / 2;
         return true;
     };
     while (capturedFrames < maximumFrames && !gStopRequested) {
+        const auto notice = ReadGuardianCallNotice(guardianFd);
+        if (notice == GuardianCallNotice::Hangup) { result = RecordingCaptureKind::HangupFinalized; stopReason = "caller_hangup"; break; }
+        if (notice == GuardianCallNotice::Failed) { writeOk = false; break; }
         const int framesRead = ivrdroid::ReadSessionCapture(input, samples.data(), kDtmfFrameCount);
         if (framesRead != static_cast<int>(kDtmfFrameCount)) {
-            writeOk = false;
+            // Capture can close a moment before the monitor's hangup message.
+            if (ReadGuardianCallNotice(guardianFd) == GuardianCallNotice::Hangup ||
+                ReadLiveCallState() == ivrdroid::CallDisposition::Idle) {
+                result = RecordingCaptureKind::HangupFinalized;
+                stopReason = "caller_hangup";
+            } else writeOk = false;
             break;
         }
         capturedFrames += kDtmfFrameCount;
@@ -4124,95 +4183,28 @@ RecordingCaptureResult CaptureRecordingMessage(
     }
     ivrdroid::CloseSessionCapture(input);
 
-    if (result == RecordingCaptureKind::Completed ||
-        result == RecordingCaptureKind::HangupFinalized) {
-        if (!NotifyGuardian(guardianFd, kGuardianRecordingFinalize)) {
-            writeOk = false;
+    if (result == RecordingCaptureKind::Completed || result == RecordingCaptureKind::HangupFinalized) {
+        while (writeOk && !pending.empty()) { writeOk = writeSamples(pending.front()); pending.pop_front(); }
+    }
+    writer->Stop(stopReason, !gStopRequested && writeOk &&
+        (result == RecordingCaptureKind::Completed || result == RecordingCaptureKind::HangupFinalized));
+    // A caller who hung up needs no finalization wait. This child owns no audio fd.
+    if (result != RecordingCaptureKind::Completed) return {result, stopReason};
+    if (!writeOk) return {RecordingCaptureKind::Unavailable, nullptr};
+    int64_t heartbeat = 0;
+    while (!writer->done() && !gStopRequested) {
+        const auto notice = ReadGuardianCallNotice(guardianFd);
+        if (notice == GuardianCallNotice::Hangup) return {RecordingCaptureKind::HangupFinalized, "caller_hangup"};
+        if (notice == GuardianCallNotice::Failed) return {RecordingCaptureKind::Failed, nullptr};
+        const int64_t now = MonotonicMilliseconds();
+        if (now - heartbeat >= 250) {
+            if (!NotifyGuardian(guardianFd, kGuardianRecording)) return {RecordingCaptureKind::Failed, nullptr};
+            heartbeat = now;
         }
-        while (writeOk && !pending.empty()) {
-            writeOk = writeSamples(pending.front());
-            pending.pop_front();
-        }
+        usleep(25'000);
     }
-    const uint64_t dataBytes = writtenFrames * 4ULL;
-    bool finalized = !gStopRequested && writeOk && dataBytes > 0 &&
-        dataBytes <= UINT32_MAX &&
-        (result == RecordingCaptureKind::Completed ||
-         result == RecordingCaptureKind::HangupFinalized);
-    if (finalized && !WriteWaveHeader(fd, static_cast<uint32_t>(dataBytes))) {
-        storageUnavailable = IsRecordingStorageError(errno);
-        finalized = false;
-    }
-    if (finalized && fsync(fd) != 0) {
-        storageUnavailable = IsRecordingStorageError(errno);
-        finalized = false;
-    }
-    if (finalized && (fchmod(fd, 0600) != 0 || fchown(fd, gAppUid, gAppUid) != 0)) {
-        finalized = false;
-    }
-    if (!finalized) {
-        close(fd);
-        unlink(temporary.c_str());
-        if (result == RecordingCaptureKind::Completed && storageUnavailable) {
-            return {RecordingCaptureKind::Unavailable, nullptr};
-        }
-        return {result == RecordingCaptureKind::Completed
-            ? RecordingCaptureKind::Failed
-            : (result == RecordingCaptureKind::HangupFinalized
-                ? RecordingCaptureKind::Failed
-                : result), nullptr};
-    }
-    close(fd);
-    if (rename(temporary.c_str(), final.c_str()) != 0) {
-        const int failure = errno;
-        unlink(temporary.c_str());
-        unlink(final.c_str());
-        return {result == RecordingCaptureKind::Completed && IsRecordingStorageError(failure)
-            ? RecordingCaptureKind::Unavailable
-            : RecordingCaptureKind::Failed, nullptr};
-    }
-    if (!SyncDirectory(kRecordingInboxDir)) {
-        const int failure = errno;
-        unlink(final.c_str());
-        SyncDirectory(kRecordingInboxDir);
-        return {result == RecordingCaptureKind::Completed && IsRecordingStorageError(failure)
-            ? RecordingCaptureKind::Unavailable
-            : RecordingCaptureKind::Failed, nullptr};
-    }
-
-    std::string sha256;
-    struct stat state {};
-    const uint32_t durationMilliseconds = static_cast<uint32_t>(writtenFrames / 48ULL);
-    errno = 0;
-    if (lstat(final.c_str(), &state) != 0 ||
-        !S_ISREG(state.st_mode) || state.st_uid != gAppUid ||
-        state.st_size <= 44 ||
-        !ivrdroid::Sha256File(final.c_str(), kMaximumRecordingBytes, &sha256) ||
-        !WriteRecordingReceipt(
-            recordingUuid,
-            callUuid,
-            revisionId,
-            instruction.blockId,
-            sequence,
-            capturedAt,
-            durationMilliseconds,
-            stopReason,
-            static_cast<uint64_t>(state.st_size),
-            sha256)) {
-        const int failure = errno;
-        unlink(final.c_str());
-        const std::string receipt =
-            std::string(kRecordingInboxDir) + "/" + recordingUuid + ".json";
-        const std::string receiptTemporary =
-            std::string(kRecordingInboxDir) + "/." + recordingUuid + ".json.tmp";
-        unlink(receipt.c_str());
-        unlink(receiptTemporary.c_str());
-        SyncDirectory(kRecordingInboxDir);
-        return {result == RecordingCaptureKind::Completed && IsRecordingStorageError(failure)
-            ? RecordingCaptureKind::Unavailable
-            : RecordingCaptureKind::Failed, nullptr};
-    }
-    return {result, stopReason};
+    return writer->failed() || gStopRequested ? RecordingCaptureResult {RecordingCaptureKind::Unavailable, nullptr}
+        : RecordingCaptureResult {RecordingCaptureKind::Completed, stopReason};
 }
 
 bool ReadTelecomDump(std::string* dump) {
@@ -4533,6 +4525,9 @@ bool ReleaseSessionForPreemption(LastResult result) {
 }
 
 bool RecoverAndEndFailedSession(LastResult failureResult) {
+    // Revoked admission must yield to Android, never hang up a caller the app
+    // deliberately stopped trying to answer (kill switch or manual answering).
+    if (AdmissionCancelled()) return ReleaseSessionForPreemption(LastResult::ExternalCallPreempted);
     WriteCurrentState(CurrentState::Recovering);
     const EndCallResult endResult = EndSingleCallAndWait();
     if (endResult == EndCallResult::EmergencyPreempt) {
@@ -4719,6 +4714,39 @@ void StopCallMonitor(CallMonitor* monitor) {
     monitor->pid = -1;
 }
 
+[[noreturn]] void DrainReleasedGuardian(int controlFd, bool safe) {
+    safe = ivrdroid::ReleaseSessionCaptureWorker() && safe;
+    if (safe) {
+        const std::string path = std::string(kBridgeDir) + "/call-results/" + gSessionCallUuid + ".released";
+        const std::string wire = "RELEASE1 " + gSessionCallUuid + " " + gBootId + " " +
+            std::to_string(MonotonicMilliseconds()) + "\n";
+        // Failure to persist an ack leaves recovery conservative.
+        safe = WriteBridgeWire(path.c_str(), (path + ".tmp").c_str(), wire);
+        if (safe) Log(ANDROID_LOG_INFO, "Local resources released: %s", wire.c_str());
+    }
+    const char ack = safe ? 'R' : 'E';
+    send(controlFd, &ack, 1, MSG_NOSIGNAL);
+    close(controlFd);
+    // From here this process owns only the OLD recording mappings and children.
+    // It must not restore mixers, publish global helper state, or scan new files.
+    ivrdroid::DrainSessionAudioWorkers();
+    _exit(safe ? 0 : 1);
+}
+
+void ScheduleAuditRecovery() {
+    if (gAuditRecoveryPid > 0) {
+        if (waitpid(gAuditRecoveryPid, nullptr, WNOHANG) == 0) return;
+        gAuditRecoveryPid = -1;
+    }
+    const pid_t child = fork();
+    if (child == 0) {
+        if (gHelperLockFd >= 0) close(gHelperLockFd);
+        ivrdroid::RecoverAuditRecordings(gAppUid);
+        _exit(0);
+    }
+    if (child > 0) gAuditRecoveryPid = child;
+}
+
 [[noreturn]] void PreemptAndExitGuardian(
     int controlFd,
     pid_t workerPid,
@@ -4728,13 +4756,11 @@ void StopCallMonitor(CallMonitor* monitor) {
     bool stopWorker) {
     ivrdroid::StopSessionAudio("preempted");
     if (stopWorker) kill(workerPid, SIGKILL);
-    CleanupPartialRecordings();
     StopCallMonitor(callMonitor);
     CloseMixerRoute(privacyRoute);
-    const bool released = ReleaseSessionForPreemption(result);
-    close(controlFd);
-    ivrdroid::DrainSessionAudioWorkers();
-    _exit(released ? 0 : 1);
+    const bool captureReleased = ivrdroid::ReleaseSessionCaptureWorker();
+    const bool released = ReleaseSessionForPreemption(result) && captureReleased;
+    DrainReleasedGuardian(controlFd, released);
 }
 
 [[noreturn]] void RecoverAndExitGuardian(
@@ -4747,13 +4773,11 @@ void StopCallMonitor(CallMonitor* monitor) {
     ivrdroid::StopSessionAudio(failureResult == LastResult::RemoteHangup ? "caller_hangup" :
         failureResult == LastResult::FailedCapture ? "capture_failure" : "interrupted");
     if (stopWorker) kill(workerPid, SIGKILL);
-    CleanupPartialRecordings();
     StopCallMonitor(callMonitor);
     CloseMixerRoute(privacyRoute);
-    const bool recovered = RecoverAndEndFailedSession(failureResult);
-    close(controlFd);
-    ivrdroid::DrainSessionAudioWorkers();
-    _exit(recovered ? 0 : 1);
+    const bool captureReleased = ivrdroid::ReleaseSessionCaptureWorker();
+    const bool recovered = RecoverAndEndFailedSession(failureResult) && captureReleased;
+    DrainReleasedGuardian(controlFd, recovered);
 }
 
 EndCallResult EndOwnedCallsAndWait(const ivrdroid::OwnedCallTopology& owned) {
@@ -4786,17 +4810,17 @@ EndCallResult EndOwnedCallsAndWait(const ivrdroid::OwnedCallTopology& owned) {
     kill(workerPid, SIGKILL);
     StopCallMonitor(monitor);
     CloseMixerRoute(route);
+    bool resourcesReleased = ivrdroid::ReleaseSessionCaptureWorker();
     if (ended == EndCallResult::Ended) {
         const auto restored = RecoverMixerSnapshot(MixerRestoreTarget::AuditedPostCall);
+        resourcesReleased = resourcesReleased && restored != MixerRecoveryResult::Failed;
         WriteLastResult(restored == MixerRecoveryResult::Failed ? LastResult::FailedRestore : result);
         WriteCurrentState(restored == MixerRecoveryResult::Failed ? CurrentState::Error : CurrentState::Recovering);
     } else {
         ReleaseSessionForPreemption(ended == EndCallResult::EmergencyPreempt ? LastResult::EmergencyPreempted :
             ended == EndCallResult::ExternalPreempt ? LastResult::ExternalCallPreempted : LastResult::UnverifiedCallPreempted);
     }
-    close(controlFd);
-    ivrdroid::DrainSessionAudioWorkers();
-    _exit(ended == EndCallResult::Ended ? 0 : 1);
+    DrainReleasedGuardian(controlFd, resourcesReleased && ended == EndCallResult::Ended);
 }
 
 void GuardianProcess(int controlFd, pid_t workerPid) {
@@ -5152,35 +5176,16 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
                 Log(
                     ANDROID_LOG_INFO,
                     "Call monitor confirmed that the remote call ended.");
-                if (phase == kGuardianRemoteHangup) {
-                    // The worker finalized the recording and its terminal message wins.
-                } else if (currentPhase == kGuardianRecording ||
-                           currentPhase == kGuardianOwnedDialing ||
-                           currentPhase == kGuardianOwnedConference) {
-                    if (!recordingHangupRequested) {
-                        if (!NotifyGuardian(controlFd, kGuardianRecordingHangup)) {
-                            RecoverAndExitGuardian(
-                                controlFd,
-                                workerPid,
-                                &privacyRoute,
-                                &callMonitor,
-                                LastResult::RemoteHangup,
-                                true);
-                        }
-                        recordingHangupRequested = true;
-                        phaseDeadline = MonotonicMilliseconds() + 5'000;
+                ivrdroid::StopSessionAudio("caller_hangup");
+                if (phase != kGuardianRemoteHangup && !recordingHangupRequested) {
+                    // Give every healthy control phase a chance to observe ordinary
+                    // hangup. Only stuck call-control work reaches the watchdog.
+                    if (!NotifyGuardian(controlFd, kGuardianRecordingHangup)) {
+                        RecoverAndExitGuardian(controlFd, workerPid, &privacyRoute, &callMonitor,
+                            LastResult::RemoteHangup, true);
                     }
-                } else if (currentPhase == kGuardianRecordingFinalize) {
-                    // Finalization has its own fixed deadline. Keep enforcing
-                    // privacy while the worker makes the receipt durable.
-                } else {
-                    RecoverAndExitGuardian(
-                        controlFd,
-                        workerPid,
-                        &privacyRoute,
-                        &callMonitor,
-                        LastResult::RemoteHangup,
-                        true);
+                    recordingHangupRequested = true;
+                    phaseDeadline = MonotonicMilliseconds() + 5'000;
                 }
             }
             if (callDecision ==
@@ -5238,9 +5243,10 @@ void GuardianProcess(int controlFd, pid_t workerPid) {
             ivrdroid::StopSessionAudio("session_complete");
             StopCallMonitor(&callMonitor);
             CloseMixerRoute(&privacyRoute);
-            close(controlFd);
-            ivrdroid::DrainSessionAudioWorkers();
-            _exit(0);
+            const bool captureReleased = ivrdroid::ReleaseSessionCaptureWorker();
+            const bool restored = access(kSnapshotPath, F_OK) == 0 && RestorePrivateSession() && captureReleased;
+            WriteLastResult(restored ? LastResult::SessionComplete : LastResult::FailedRestore);
+            DrainReleasedGuardian(controlFd, restored);
         }
         if (phase == kGuardianRemoteHangup) {
             RecoverAndExitGuardian(
@@ -5413,8 +5419,9 @@ bool StartSessionGuardian(SessionGuardian* guardian) {
         return false;
     }
     if (child == 0) {
+        if (gHelperLockFd >= 0) close(gHelperLockFd);
         close(descriptors[1]);
-        ivrdroid::SpawnSessionAudioWorkers();
+        ivrdroid::SpawnSessionAudioWorkers(gDrainingGuardians.size() < 8);
         GuardianProcess(descriptors[0], workerPid);
     }
 
@@ -5426,17 +5433,29 @@ bool StartSessionGuardian(SessionGuardian* guardian) {
 
 bool FinishSessionGuardian(SessionGuardian* guardian, char result) {
     const bool notified = NotifyGuardian(guardian->controlFd, result);
-    close(guardian->controlFd);
-    guardian->controlFd = -1;
-
-    int status = 0;
-    while (waitpid(guardian->pid, &status, 0) < 0) {
-        if (errno != EINTR) return false;
+    char ack = 0;
+    bool released = false;
+    const int64_t deadline = MonotonicMilliseconds() + kRecoveryTotalMaximumMs + 2000;
+    while (notified && MonotonicMilliseconds() < deadline) {
+        pollfd fd {guardian->controlFd, POLLIN, 0};
+        const int waited = poll(&fd, 1, static_cast<int>(deadline - MonotonicMilliseconds()));
+        if (waited < 0 && errno == EINTR) continue;
+        if (waited <= 0 || recv(fd.fd, &ack, 1, 0) != 1) break;
+        if (ack == kGuardianRecordingHangup) continue; // An earlier hangup notice is not the release ack.
+        released = ack == 'R'; break;
+    }
+    close(guardian->controlFd); guardian->controlFd = -1;
+    if (released) {
+        gDrainingGuardians.push_back(guardian->pid);
+    } else {
+        // Do not admit another caller when the resource-release proof is absent.
+        int status = 0;
+        const int64_t deadline = MonotonicMilliseconds() + 2000;
+        while (waitpid(guardian->pid, &status, WNOHANG) == 0 && MonotonicMilliseconds() < deadline) usleep(2000);
+        if (waitpid(guardian->pid, &status, WNOHANG) == 0) kill(guardian->pid, SIGKILL);
     }
     guardian->pid = -1;
-    return notified &&
-        WIFEXITED(status) &&
-        WEXITSTATUS(status) == 0;
+    return released;
 }
 
 enum class SessionOutcome {
@@ -6123,9 +6142,12 @@ void DiscardRequestQueuedWhileBusy() {
     }
 }
 
+bool VerifiedPendingCaller(const ivrdroid::TelecomCallSnapshot& calls, const std::string& expectedSession);
+
 bool ProcessOneCommand() {
     std::string body;
     if (!ConsumeCommand(&body)) return false;
+    gSessionCallUuid.clear(); // Rejections/configuration work do not belong to the last completed call.
     const ivrdroid::protocol::CommandRequest request =
         ivrdroid::protocol::ParseCommandRequest(body);
     if (request.command == ivrdroid::protocol::Command::Invalid) {
@@ -6184,6 +6206,11 @@ bool ProcessOneCommand() {
         return true;
     }
 
+    if (!VerifiedPendingCaller(ReadLiveCallObservation().snapshot, request.callUuid)) {
+        Log(ANDROID_LOG_WARN, "START_MENU no longer identifies the verified ringing caller.");
+        WriteLastResult(LastResult::RejectedRequest);
+        return true;
+    }
     Log(ANDROID_LOG_INFO, "Accepted START_MENU from app UID %u.", gAppUid);
     gSessionCallUuid = request.callUuid;
     gOriginalNativeCaller = ReadLiveCallObservation().snapshot.singleCallIdentity;
@@ -6233,7 +6260,7 @@ bool ProcessOneCommand() {
     const bool guardianSucceeded =
         FinishSessionGuardian(&guardian, guardianResult);
     ivrdroid::ReleaseSessionAudio();
-    ivrdroid::RecoverAuditRecordings(gAppUid);
+    ScheduleAuditRecovery();
     DiscardRequestQueuedWhileBusy();
     if (!guardianSucceeded) {
         Log(ANDROID_LOG_ERROR, "Session recovery did not complete cleanly.");
@@ -6243,17 +6270,6 @@ bool ProcessOneCommand() {
 
     if (outcome == SessionOutcome::Complete ||
         outcome == SessionOutcome::RemoteHangup) {
-        const bool hasSnapshot = access(kSnapshotPath, F_OK) == 0;
-        if ((outcome == SessionOutcome::Complete && !hasSnapshot) ||
-            (hasSnapshot && !RestorePrivateSession())) {
-            Log(
-                ANDROID_LOG_ERROR,
-                "Completed session did not restore its durable mixer snapshot.");
-            WriteLastResult(LastResult::FailedRestore);
-            WriteCurrentState(CurrentState::Error);
-            gStopRequested = 1;
-            return true;
-        }
         WriteLastResult(
             outcome == SessionOutcome::Complete
                 ? LastResult::SessionComplete
@@ -6339,6 +6355,18 @@ bool RecoverStaleSnapshot() {
     return true;
 }
 
+bool VerifiedPendingCaller(const ivrdroid::TelecomCallSnapshot& calls, const std::string& expectedSession) {
+    std::string wire;
+    if (!ReadOwnedBoundedFile((std::string(kBridgeDir) + "/incoming-caller").c_str(), gAppUid, 512, &wire)) return false;
+    std::istringstream in(wire);
+    std::string magic, session, boot, caller, extra; int64_t at = 0;
+    if (!(in >> magic >> session >> boot >> caller >> at) || (in >> extra) || magic != "INCOMING1" ||
+        !ivrdroid::call_control::IsCanonicalUuid(session) || boot != gBootId ||
+        (!expectedSession.empty() && session != expectedSession) ||
+        at > MonotonicMilliseconds() || MonotonicMilliseconds() - at > 2000) return false;
+    return ivrdroid::IsOnlyRingingCaller(calls, caller);
+}
+
 bool WaitForSystemReady() {
     ivrdroid::SystemReadinessPolicy policy(kSystemIdleConfirmationMs);
     policy.Start(MonotonicMilliseconds());
@@ -6346,10 +6374,15 @@ bool WaitForSystemReady() {
     CurrentState publishedState = CurrentState::WaitingForSystem;
 
     while (!gStopRequested) {
-        const ivrdroid::CallDisposition disposition = ReadLiveCallState();
+        const auto observed = ReadLiveCallObservation();
+        const bool pending = VerifiedPendingCaller(observed.snapshot, "");
+        const auto native = ivrdroid::FormatNativeCallSnapshot(observed.snapshot, gBootId, "-",
+            MonotonicMilliseconds(), ++gNativeSnapshotSequence);
+        if (!native.empty()) WriteBridgeWire((std::string(kBridgeDir) + "/native-calls").c_str(),
+            (std::string(kBridgeDir) + "/.native-calls.tmp").c_str(), native);
         const AudioModeState audioState = ReadAudioModeState();
         const ivrdroid::SystemReadinessDecision decision = policy.Observe(
-            disposition,
+            pending ? ivrdroid::CallDisposition::Idle : observed.disposition,
             ToAudioCallDisposition(audioState),
             MonotonicMilliseconds());
 
@@ -6414,11 +6447,10 @@ int Serve() {
     if (!WriteBridgeValue(
             kCapabilitiesBridgePath,
             kCapabilitiesBridgeTempPath,
-            ivrdroid::protocol::kCapabilities)) {
+            ivrdroid::protocol::kCapabilities, 512)) {
         Log(ANDROID_LOG_ERROR, "Could not publish helper capabilities.");
         return 12;
     }
-    CleanupPartialRecordings();
     if (!ValidateAllPromptFiles()) return 13;
     if (!InitializeRevisionState()) return 13;
 
@@ -6428,6 +6460,7 @@ int Serve() {
         Log(ANDROID_LOG_ERROR, "Another helper instance already owns the lock.");
         return 14;
     }
+    gHelperLockFd = lockFd;
     if (!WritePidFile()) {
         close(lockFd);
         return 15;
@@ -6439,7 +6472,7 @@ int Serve() {
         close(lockFd);
         return 16;
     }
-    ivrdroid::RecoverAuditRecordings(gAppUid);
+    ScheduleAuditRecovery();
     if (!WaitForSystemReady()) {
         unlink(kPidPath);
         close(lockFd);
@@ -6473,6 +6506,8 @@ int Serve() {
     int64_t lastAuditRecovery = MonotonicMilliseconds();
     int64_t lastIdleObservation = -1000;
     while (!gStopRequested) {
+        gDrainingGuardians.erase(std::remove_if(gDrainingGuardians.begin(), gDrainingGuardians.end(),
+            [](pid_t child) { return waitpid(child, nullptr, WNOHANG) != 0; }), gDrainingGuardians.end());
         // Publishing into the watched directory wakes inotify itself. Keep native
         // polling bounded while still processing app commands immediately.
         if (MonotonicMilliseconds() - lastIdleObservation >= 500) {
@@ -6488,7 +6523,7 @@ int Serve() {
                 if (ReadRecoveryOwnership(&ownership)) AcknowledgeRecovery(ownership);
                 ivrdroid::RefreshAuditPolicy(gAppUid);
                 if (MonotonicMilliseconds() - lastAuditRecovery >= 30000) {
-                    ivrdroid::RecoverAuditRecordings(gAppUid);
+                    ScheduleAuditRecovery();
                     lastAuditRecovery = MonotonicMilliseconds();
                 }
             }

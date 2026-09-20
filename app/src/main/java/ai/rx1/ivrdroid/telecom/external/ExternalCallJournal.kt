@@ -8,6 +8,14 @@ import java.nio.file.StandardCopyOption
 
 class ExternalCallJournal(private val file: File) {
     @Synchronized
+    fun retire(snapshot: ExternalCallSessionSnapshot) {
+        if (!file.exists()) return
+        val destination = File(file.parentFile, "${file.name}.retired-${snapshot.config.sessionId}-${snapshot.config.blockId}")
+        Files.move(file.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        ai.rx1.ivrdroid.control.SessionAuditFiles.sync(requireNotNull(file.parentFile))
+    }
+
+    @Synchronized
     fun save(snapshot: ExternalCallSessionSnapshot) {
         val document = JSONObject()
             .put("version", VERSION)

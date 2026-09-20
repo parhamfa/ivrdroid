@@ -205,13 +205,21 @@ object SyncCoordinator {
     }
 
     private fun uploadPendingEvents(context: Context, api: DeviceApi) {
+        var failure: Exception? = null
         val events = SecureControlStore.pendingCalls(context).filter { SessionAuditSpool.hasBinding(context, it) }
-        if (events.isEmpty()) return
         events.chunked(100).forEach { batch ->
+            try {
             val accepted = api.uploadEvents(batch)
             SessionAuditSpool.acknowledgeCalls(context, batch, accepted)
-            SecureControlStore.acknowledgeCalls(context, accepted)
+            SecureControlStore.acknowledgeCalls(context, batch, accepted)
+            } catch (error: Exception) { failure = error }
         }
+        // Sub-events remain uploadable even when the parent was acknowledged earlier.
+        SecureControlStore.pendingCallEvents(context).entries.chunked(100).forEach { entries ->
+            val submitted = entries.associate { it.key to it.value }
+            SecureControlStore.acknowledgeCallEvents(context, submitted, api.uploadCallEvents(submitted))
+        }
+        failure?.let { throw it }
     }
 
     private fun uploadPendingRecordings(context: Context, api: DeviceApi) {

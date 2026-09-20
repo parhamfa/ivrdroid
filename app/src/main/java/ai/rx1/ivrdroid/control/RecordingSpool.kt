@@ -73,6 +73,15 @@ object RecordingSpool {
 
     @Synchronized
     fun reconcile(context: Context) {
+        val failures = File(context.filesDir, "bridge/recording-failures")
+        for (file in failures.listFiles().orEmpty()) {
+            if (!file.name.matches(Regex("${uuid.pattern}\\.json"))) continue
+            val evidence = JSONObject(String(SessionAuditFiles.read(file, 4096), Charsets.UTF_8))
+            SecureControlStore.appendCallEvent(context, evidence.getString("call_id"), PendingCallSubEvent(
+                evidence.getString("occurred_at"), "RECORDING_FAILURE", evidence.getString("block_id"),
+                evidence.getString("reason"), "recording_failure"))
+            require(file.delete()); SessionAuditFiles.sync(failures)
+        }
         try { reconcileInternal(context, onlyStorageKey = null) } catch (_: DeferredForCall) { }
     }
 

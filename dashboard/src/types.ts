@@ -182,6 +182,9 @@ export interface CallRecord {
   menu_path: string[];
   result: string;
   duration_seconds: number;
+  ended_at?: string | null;
+  cleanup_status?: "pending" | "complete" | "recovered" | "failed" | "unknown" | null;
+  pending_session_audio_count?: number;
   events: Record<string, unknown>[];
   recording_count: number;
   pending_recording_count: number;

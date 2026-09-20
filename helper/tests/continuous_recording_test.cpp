@@ -45,5 +45,12 @@ int main() {
     seal >> reason >> partial; assert(reason == "interrupted" && partial == 1);
     unlink((directory + "/audio.pcm").c_str()); unlink((directory + "/continuous.context").c_str());
     unlink((directory + "/continuous.sealed").c_str()); rmdir(directory.c_str());
+    c.version = 2;
+    c.frames = 1200; c.captureEndMs = 1025; c.finalizedMs = 8000;
+    assert(ParseContinuousContext(FormatContinuousContext(c), &parsed));
+    assert(parsed.version == 2 && parsed.captureEndMs == 1025 && parsed.finalizedMs == 8000);
+    assert(parsed.frames / 48 == 25); // Seven seconds of finalization do not extend captured audio.
+    c.finalizedMs = 1000;
+    assert(FormatContinuousContext(c).empty());
     std::cout << "Continuous PCM checkpoint, boundary and recovery tests passed.\n";
 }

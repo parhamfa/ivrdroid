@@ -67,7 +67,7 @@ object SessionAuditSpool {
         File(context.filesDir, "bridge/audit-capacity"), "${usageBytes(context)}\n".toByteArray(Charsets.US_ASCII),
     )
 
-    /** Runs during calls. Only completed, fsynced segments are read; network uploads wait for idle. */
+    /** Bind small metadata during calls; encryption and old-file scanning wait for idle. */
     @Synchronized
     fun reconcile(context: Context) {
         var failed = false
@@ -77,6 +77,7 @@ object SessionAuditSpool {
         }
         // Finish interrupted app sessions only after both helper and Telecom report idle.
         val idle = !CallRuntimeState.isBusy() && RootAudioTrigger.isIdle(context) && telecomIdle(context)
+        if (!idle) return
         root(context).listFiles { file -> file.name.startsWith(".") && file.name.endsWith(".acked") }.orEmpty().forEach { it.deleteRecursively() }
         inbox(context).listFiles { file -> file.isDirectory && safeId.matches(file.name) }.orEmpty().forEach { incoming ->
             try {
@@ -85,6 +86,7 @@ object SessionAuditSpool {
                 val call = readJson(folder, "call.meta")
                 val policyVersion = call.getLong("audit_policy_version")
                 incoming.listFiles { file -> segmentName.matches(file.name) }.orEmpty().sortedBy(File::getName).forEach { receipt ->
+                    if (CallRuntimeState.isBusy()) return
                     val stem = receipt.name.removeSuffix(".json")
                     val source = File(incoming, "$stem.wav")
                     if (!source.exists()) return@forEach
@@ -140,8 +142,9 @@ object SessionAuditSpool {
             }
         }
         directories(context).forEach { folder ->
+            if (CallRuntimeState.isBusy()) return
             if (!File(folder, "call.meta").exists() || File(folder, "metadata.ack").exists()) return@forEach
-            var call = readJson(folder, "call.meta")
+            val call = readJson(folder, "call.meta")
             if (!File(folder, "report.meta").exists()) {
                 // Absence has a state, never fabricated capture timestamps or audio.
                 if (!idle || File(inbox(context), "${folder.name}/context").exists()) return@forEach
@@ -151,14 +154,9 @@ object SessionAuditSpool {
                     .put("stop_reason", "capture_failure").put("events", org.json.JSONArray()))
             }
             val report = readJson(folder, "report.meta")
-            if (call.getString("result") == "IN_PROGRESS") {
-                if (!idle) return@forEach
-                val knownEnd = if (report.isNull("captured_at")) Instant.parse(call.getString("started_at"))
-                    else Instant.parse(report.getString("captured_at")).plusMillis(report.getLong("duration_ms"))
-                val observedSeconds = java.time.Duration.between(Instant.parse(call.getString("started_at")), knownEnd).seconds.coerceIn(0, 86400)
-                call = JSONObject(call.toString()).put("result", "RECOVERED_AND_ENDED").put("duration_seconds", observedSeconds)
-                writeJson(folder, "call.meta", call)
-            }
+            // LocalCallSession owns disconnect time and outcome. Audio duration is
+            // not evidence that a call ended, nor a reason to overwrite its outcome.
+            if (call.getString("result") == "IN_PROGRESS") return@forEach
             val event = CallEventPayload.decode(call).copy(sessionAudit = report)
             SecureControlStore.enqueueCall(context, event)
         }
@@ -171,6 +169,8 @@ object SessionAuditSpool {
         events.filter { it.callId in accepted && it.sessionAudit != null }.forEach { event ->
             val folder = File(root(context), event.callId)
             if (!folder.isDirectory || !File(folder, "report.meta").exists()) return@forEach
+            val currentReport = readJson(folder, "report.meta")
+            if (CanonicalJson.encode(currentReport) != CanonicalJson.encode(requireNotNull(event.sessionAudit))) return@forEach
             SessionAuditFiles.write(File(folder, "metadata.ack"), byteArrayOf(1))
             if (event.sessionAudit!!.getString("state") == "unavailable") remove(folder)
         }

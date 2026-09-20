@@ -30,6 +30,7 @@ bool MatchesOwnedConference(const TelecomCallSnapshot& snapshot, const OwnedCall
 // Recover only the parent of two already identified owned legs; never infer a leg by count.
 bool ResolveOwnedConference(const TelecomCallSnapshot& snapshot, OwnedCallTopology* owned);
 bool ContainsOnlyOwnedCalls(const TelecomCallSnapshot& snapshot, const OwnedCallTopology& owned);
+bool IsOnlyRingingCaller(const TelecomCallSnapshot& snapshot, std::string_view caller);
 bool IsLiveTelecomState(std::string_view state);
 std::string FormatNativeCallSnapshot(const TelecomCallSnapshot& snapshot, std::string_view boot,
     std::string_view session, uint64_t elapsedMs, uint64_t sequence);

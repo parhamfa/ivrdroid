@@ -71,6 +71,7 @@ from .schemas import (
     DraftConfigurationV3,
     DraftConfigurationV4,
     EventBatchRequest,
+    CallSubEventBatchRequest,
     PairingCodeRequest,
     PairingCodeResponse,
     PromptResponse,
@@ -859,7 +860,9 @@ def call_detail(call_id: str, request: Request, _: str = Depends(require_admin),
         "id": call.id, "device_id": call.device_id, "started_at": call.started_at,
         "caller": caller, "caller_masked": mask_phone(caller), "policy_decision": call.policy_decision,
         "revision_id": call.revision_id, "menu_path": call.menu_path, "result": call.result,
-        "duration_seconds": call.duration_seconds, "events": call.events,
+        "duration_seconds": call.duration_seconds,
+        "ended_at": call.ended_at,
+        "cleanup_status": call.cleanup_status, "events": call.events,
         "session_audit": call_audit_summary(request, call, session.scalar(select(Recording).where(Recording.call_id == call.id, Recording.kind == "session_audit")), include_events=True),
         "recording_count": sum(r.status == "ready" for r in recordings),
         "pending_recording_count": sum(r.status in {"uploading", "processing"} for r in recordings),
@@ -909,10 +912,13 @@ def list_calls(
                 menu_path=call.menu_path or [],
                 result=call.result,
                 duration_seconds=call.duration_seconds,
+                ended_at=call.ended_at,
+                cleanup_status=call.cleanup_status,
                 events=call.events or [],
                 session_audit=call_audit_summary(request, call, audit_recordings.get(call.id)),
                 recording_count=counts.get(call.id, (0, 0))[0],
                 pending_recording_count=counts.get(call.id, (0, 0))[1],
+                pending_session_audio_count=int((call_audit_summary(request, call, audit_recordings.get(call.id)) or {}).get("state") in {"pending_upload", "uploading", "processing"}),
             ),
         )
     return response
@@ -1133,86 +1139,75 @@ def acknowledge_revision(
         )
 
 
+def _pending_call_notifications(session: Session, request: Request, call: CallRecord) -> list[tuple[str, dict]]:
+    from .call_history import claim_notifications
+    caller = request.app.state.cipher.decrypt(call.caller_encrypted) if call.caller_encrypted else None
+    return [(key, {**call_notification_kwargs(key, call_id=call.id, result=call.result,
+        policy_decision=call.policy_decision, extra=extra), "caller_masked": mask_phone(caller) if caller else None})
+        for key, extra in claim_notifications(session, call)]
+
+
+@device_router.post("/call-events:batch")
+def upload_call_events(body: CallSubEventBatchRequest, request: Request, background_tasks: BackgroundTasks,
+    device: Device = Depends(require_device), session: Session = Depends(get_session)) -> dict:
+    from .call_history import merge_events
+    # Serialize metadata submissions for this device, including parent creation.
+    session.execute(select(Device).where(Device.id == device.id).with_for_update()).scalar_one()
+    notifications = []
+    for item in body.calls:
+        call = session.get(CallRecord, item.call_id)
+        merge_events(session, device.id, item.call_id, [event.model_dump(mode="json") for event in item.events], call)
+        if call is not None:
+            notifications.extend(_pending_call_notifications(session, request, call))
+    device.last_seen_at = utcnow()
+    session.commit()
+    for key, kwargs in notifications:
+        schedule_ntfy(background_tasks, request.app, key, **kwargs)
+    return {"accepted_call_ids": [item.call_id for item in body.calls]}
+
+
 @device_router.post("/events:batch")
-def upload_events(
-    body: EventBatchRequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    device: Device = Depends(require_device),
-    session: Session = Depends(get_session),
-) -> dict:
-    accepted: list[str] = []
-    pending_notifications: list[tuple[str, dict]] = []
+def upload_events(body: EventBatchRequest, request: Request, background_tasks: BackgroundTasks,
+    device: Device = Depends(require_device), session: Session = Depends(get_session)) -> dict:
+    from .call_history import merge_events
+    session.execute(select(Device).where(Device.id == device.id).with_for_update()).scalar_one()
+    accepted = []
+    notifications = []
     for call in body.calls:
         validate_call_report(session, call.session_audit, call.result, device.id)
         audit_document = call.session_audit.model_dump(mode="json") if call.session_audit else None
-        event_documents = [event.model_dump(mode="json") for event in call.events]
         existing = session.get(CallRecord, call.call_id)
-        notify = False
         if existing is not None:
             if existing.device_id != device.id:
-                raise HTTPException(status_code=409, detail="Call ID belongs to another device")
-            if existing.result == "IN_PROGRESS" and call.result != "IN_PROGRESS":
+                raise HTTPException(409, "Call ID belongs to another device")
+            merge_events(session, device.id, call.call_id, [event.model_dump(mode="json") for event in call.events], existing)
+            if existing.result in {"IN_PROGRESS", "END_DETAILS_UNAVAILABLE"} and call.result != "IN_PROGRESS":
                 existing.menu_path = call.menu_path
                 existing.result = call.result
                 existing.duration_seconds = call.duration_seconds
-                existing.events = event_documents
-                existing.session_audit = audit_document
+                existing.ended_at = call.ended_at
+                existing.cleanup_status = call.cleanup_status
                 existing.received_at = utcnow()
-                notify = True
-            elif audit_document is not None and existing.session_audit is None:
-                # A durable audit finalizer may finish after the terminal call event.
+            if audit_document is not None and existing.session_audit is None:
                 validate_call_report(session, call.session_audit, existing.result, device.id)
                 existing.session_audit = audit_document
             elif audit_document is not None and existing.session_audit != audit_document:
-                raise HTTPException(status_code=409, detail="A terminal audit report cannot be replaced")
-            accepted.append(call.call_id)
+                raise HTTPException(409, "A terminal audit report cannot be replaced")
         else:
-            caller_encrypted = request.app.state.cipher.encrypt(call.caller) if call.caller else None
-            session.add(
-                CallRecord(
-                    id=call.call_id,
-                    device_id=device.id,
-                    started_at=call.started_at,
-                    caller_encrypted=caller_encrypted,
-                    caller_last4="" if not call.caller else call.caller[-4:],
-                    policy_decision=call.policy_decision,
-                    revision_id=call.revision_id,
-                    menu_path=call.menu_path,
-                    result=call.result,
-                    duration_seconds=call.duration_seconds,
-                    events=event_documents,
-                    session_audit=audit_document,
-                ),
-            )
-            accepted.append(call.call_id)
-            notify = call.result != "IN_PROGRESS"
-        if notify:
-            caller = mask_phone(call.caller) if call.caller else None
-            for event_key, extra in classify_call_notifications(
-                call.policy_decision,
-                call.result,
-                event_documents,
-            ):
-                pending_notifications.append(
-                    (
-                        event_key,
-                        {
-                            **call_notification_kwargs(
-                                event_key,
-                                call_id=call.call_id,
-                                result=call.result,
-                                policy_decision=call.policy_decision,
-                                extra=extra,
-                            ),
-                            "caller_masked": caller,
-                        },
-                    ),
-                )
+            existing = CallRecord(id=call.call_id, device_id=device.id, started_at=call.started_at,
+                caller_encrypted=request.app.state.cipher.encrypt(call.caller) if call.caller else None,
+                caller_last4=call.caller[-4:] if call.caller else "", policy_decision=call.policy_decision,
+                revision_id=call.revision_id, menu_path=call.menu_path, result=call.result,
+                duration_seconds=call.duration_seconds, ended_at=call.ended_at, cleanup_status=call.cleanup_status,
+                events=[], session_audit=audit_document, terminal_notification_scheduled=False)
+            session.add(existing)
+            merge_events(session, device.id, call.call_id, [event.model_dump(mode="json") for event in call.events], existing)
+        accepted.append(call.call_id)
+        notifications.extend(_pending_call_notifications(session, request, existing))
     device.last_seen_at = utcnow()
     session.commit()
-    for event_key, kwargs in pending_notifications:
-        schedule_ntfy(background_tasks, request.app, event_key, **kwargs)
+    for key, kwargs in notifications:
+        schedule_ntfy(background_tasks, request.app, key, **kwargs)
     return {"accepted_call_ids": accepted}
 
 

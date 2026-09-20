@@ -23,6 +23,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
@@ -353,7 +354,7 @@ void WriterWorker() {
     uint64_t next = 1, nextPrompt = 1;
     int reason = 0;
     ContinuousRecordingContext recording;
-    recording.kind = "session_audit"; recording.id = context.id; recording.callId = context.id;
+    recording.version = 2; recording.kind = "session_audit"; recording.id = context.id; recording.callId = context.id;
     recording.bootId = context.boot; recording.blockId = "-"; recording.policy = context.version;
     recording.wallMs = context.wall; recording.elapsedMs = context.base / 1'000'000;
     recording.pid = context.pid; recording.processStart = context.processStart;
@@ -401,7 +402,7 @@ void WriterWorker() {
         if (checkedAt < 0 || now - checkedAt >= 1000) {
             budget = ContinuousBudget(true, context.total * 4); checkedAt = now;
         }
-        if (!audio.Append(frame.samples, kAuditFrameCount, budget)) { reason = errno == ENOSPC ? 5 : 7; break; }
+        if (!audio.Append(frame.samples, kAuditFrameCount, budget, (frame.timeNs + kFrameNs) / 1'000'000)) { reason = errno == ENOSPC ? 5 : 7; break; }
         context.total = audio.frames(); ++next;
         if (context.total % 48000 == 0 && (!audio.Checkpoint() || !SaveContext(context) || !SaveReport(context, 0, true))) { reason = 7; break; }
 
@@ -449,16 +450,17 @@ void CloseInheritedDescriptors() {
     closedir(descriptors);
 }
 bool DropAuditPrivileges() {
+    setpriority(PRIO_PROCESS, 0, 10);
     if (geteuid() == appUid) return true;
     return setgroups(0, nullptr) == 0 && setgid(appUid) == 0 && setuid(appUid) == 0;
 }
-void SpawnSessionAudioWorkers() {
+void SpawnSessionAudioWorkers(bool allowRecording) {
     if (!shared) return;
     const pid_t parent = getpid();
     capturePid = fork();
     if (capturePid == 0) { prctl(PR_SET_PDEATHSIG, SIGTERM); if (getppid() != parent) _exit(1); CloseInheritedDescriptors(); CaptureWorker(); }
     if (capturePid < 0) { shared->captureClosed.store(true); shared->failed.store(true); }
-    if (!policy.enabled) return;
+    if (!policy.enabled || !allowRecording) return;
     writerPid = fork();
     if (writerPid == 0) {
         CloseInheritedDescriptors();
@@ -494,10 +496,34 @@ void SuperviseSessionAudioWorkers() {
         if (!shared->stop.load()) shared->writerFailed.store(true);
     }
 }
+bool ReleaseSessionCaptureWorker() {
+    if (!shared || capturePid <= 0) return !shared || shared->captureClosed.load();
+    shared->stop.store(true);
+    const int64_t deadline = ClockNs(CLOCK_MONOTONIC) + 500'000'000;
+    while (ClockNs(CLOCK_MONOTONIC) < deadline) {
+        const pid_t done = waitpid(capturePid, nullptr, WNOHANG);
+        if (done == capturePid || (done < 0 && errno == ECHILD)) {
+            capturePid = -1; shared->captureClosed.store(true); return true;
+        }
+        usleep(2000);
+    }
+    // A blocked device read must release its fd before a new call can capture.
+    kill(capturePid, SIGKILL);
+    const int64_t killDeadline = ClockNs(CLOCK_MONOTONIC) + 500'000'000;
+    while (ClockNs(CLOCK_MONOTONIC) < killDeadline) {
+        const pid_t done = waitpid(capturePid, nullptr, WNOHANG);
+        if (done == capturePid || (done < 0 && errno == ECHILD)) {
+            capturePid = -1; shared->captureClosed.store(true); shared->failed.store(true); return true;
+        }
+        usleep(2000);
+    }
+    return false;
+}
+
 void DrainSessionAudioWorkers() {
     if (!shared) return;
     StopSessionAudio("interrupted");
-    const int64_t deadline = ClockNs(CLOCK_MONOTONIC) + 1'500'000'000;
+    const int64_t deadline = ClockNs(CLOCK_MONOTONIC) + 120'000'000'000LL;
     for (pid_t* child : {&capturePid, &writerPid}) {
         if (*child <= 0) continue;
         while (waitpid(*child, nullptr, WNOHANG) == 0 && ClockNs(CLOCK_MONOTONIC) < deadline) usleep(2000);
@@ -605,7 +631,7 @@ ConversationWriter* StartContinuousConversation(const std::string& id, const std
     auto* writer = new (memory) ConversationWriter();
     const uint64_t first = shared->produced.load(std::memory_order_acquire) + 1;
     const int64_t wall = shared->wallMs.load() + (first - 1) * kFrameNs / 1'000'000;
-    const int64_t elapsed = ClockNs(CLOCK_MONOTONIC) / 1'000'000;
+    const int64_t elapsed = (shared->baseNs.load() + (first - 1) * kFrameNs) / 1'000'000;
     const pid_t parent = getpid();
     // Never store fork()'s child return value in shared memory: the child would
     // overwrite the real PID with zero and make a healthy writer appear dead.
@@ -617,7 +643,7 @@ ConversationWriter* StartContinuousConversation(const std::string& id, const std
         signal(SIGTERM, StopChild); signal(SIGINT, StopChild);
         if (getppid() != parent) _exit(1);
         ContinuousRecordingContext context;
-        context.kind = "conversation"; context.id = id; context.callId = uuid; context.bootId = BootId();
+        context.version = 2; context.kind = "conversation"; context.id = id; context.callId = uuid; context.bootId = BootId();
         context.revision = revision; context.blockId = block; context.wallMs = wall; context.elapsedMs = elapsed;
         context.pid = getpid(); context.processStart = ProcessStart(getpid());
         ContinuousPcmFile audio(std::string(kConversationInbox) + "/" + id, appUid, context);
@@ -638,7 +664,7 @@ ConversationWriter* StartContinuousConversation(const std::string& id, const std
             if (checkedAt < 0 || now - checkedAt >= 1000) {
                 budget = ContinuousBudget(false, audio.frames() * 4); checkedAt = now;
             }
-            if (!audio.Append(frame.samples, frame.frames, budget)) { reason = errno == ENOSPC ? "storage_full" : "writer_failure"; break; }
+            if (!audio.Append(frame.samples, frame.frames, budget, (frame.timeNs + frame.frames * 1'000'000'000LL / 48000) / 1'000'000)) { reason = errno == ENOSPC ? "storage_full" : "writer_failure"; break; }
             ++next;
             if (audio.frames() % 48000 == 0 && !audio.Checkpoint()) { reason = "writer_failure"; break; }
         }
@@ -683,7 +709,7 @@ void RecoverAuditRecordings(uid_t uid) {
             RecoverAuditRecordings(uid); _exit(0);
         }
         if (child > 0) {
-            const int64_t deadline = ClockNs(CLOCK_MONOTONIC) + 1'500'000'000;
+            const int64_t deadline = ClockNs(CLOCK_MONOTONIC) + 120'000'000'000LL;
             while (waitpid(child, nullptr, WNOHANG) == 0 && ClockNs(CLOCK_MONOTONIC) < deadline) usleep(2000);
             if (waitpid(child, nullptr, WNOHANG) == 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); }
         }
@@ -698,7 +724,14 @@ void RecoverAuditRecordings(uid_t uid) {
         Context context; std::string magic;
         if (!(metadata >> magic >> context.id >> context.version >> context.wall >> context.base >> context.total >> context.pid >> context.processStart >> context.boot) ||
             (magic != "AUDIT1" && magic != "AUDIT2") || context.id != entry->d_name || context.total > 48000ULL * 86400 || context.wall <= 0) continue;
-        if (context.boot == BootId() && context.pid > 0 && context.processStart != 0 && ProcessStart(context.pid) == context.processStart) continue;
+        if (context.boot == BootId()) {
+            if (context.pid <= 0 || context.processStart == 0) continue;
+            // An unreadable live process is unknown, never an orphan to finalize.
+            if (kill(context.pid, 0) == 0 || errno != ESRCH) {
+                const auto start = ProcessStart(context.pid);
+                if (start == 0 || start == context.processStart) continue;
+            }
+        }
         if (magic == "AUDIT2") {
             ContinuousRecordingContext committed;
             if (!ParseContinuousContext(ReadFile(path + "/continuous.context", 1024), &committed) ||

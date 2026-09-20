@@ -12,9 +12,10 @@ struct SessionCapture;
 void RefreshAuditPolicy(uid_t appUid);
 void RecoverAuditRecordings(uid_t appUid);
 void PrepareSessionAudio(const std::string& callUuid, uid_t appUid, int card, int device);
-void SpawnSessionAudioWorkers(); // called only in the guardian, before its monitor starts
+void SpawnSessionAudioWorkers(bool allowRecording = true); // called only in the guardian, before its monitor starts
 void ActivateSessionAudio();
 void StopSessionAudio(const char* reason);
+bool ReleaseSessionCaptureWorker(); // closes hardware; never waits for a recording writer
 void DrainSessionAudioWorkers();
 void SuperviseSessionAudioWorkers();
 void ReleaseSessionAudio();

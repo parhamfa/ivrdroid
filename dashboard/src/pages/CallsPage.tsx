@@ -5,7 +5,7 @@ import { Button, EmptyState, ErrorState, Loading, formatDate, formatDuration } f
 import { useRemote } from "../hooks";
 import type { CallRecord } from "../types";
 import { CallDetails } from "./CallDetails";
-import { audioMatches, callOutcome, sessionAudioStatus } from "./callAudit";
+import { audioMatches, callOutcome, sessionAudioStatus, pendingSessionAudio } from "./callAudit";
 
 function csvCell(value: unknown): string {
   return `"${String(value ?? "").replaceAll('"', '""')}"`;
@@ -71,14 +71,14 @@ export function CallsPage() {
           <div><small>Total calls</small><strong>{remote.data?.length ?? 0}</strong></div>
           <div><small>IVR handled</small><strong>{remote.data?.filter((call) => call.policy_decision === "IVR_HANDLED").length ?? 0}</strong></div>
           <div><small>Stock dialer</small><strong>{remote.data?.filter((call) => call.policy_decision !== "IVR_HANDLED").length ?? 0}</strong></div>
-          <div><small>Recordings</small><strong>{remote.data?.reduce((total, call) => total + call.recording_count, 0) ?? 0}</strong><span>{remote.data?.reduce((total, call) => total + call.pending_recording_count, 0) ?? 0} pending upload</span></div>
+          <div><small>Recordings</small><strong>{remote.data?.reduce((total, call) => total + call.recording_count, 0) ?? 0}</strong><span>{remote.data?.reduce((total, call) => total + call.pending_recording_count, 0) ?? 0} pending recordings · {remote.data?.reduce((total, call) => total + pendingSessionAudio(call), 0) ?? 0} pending session audio</span></div>
         </section>
         <section className="surface calls-table">
           <div className="section-toolbar calls-toolbar">
             <h2>Call history</h2>
             <label className="search-input"><Search size={19} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search calls" /></label>
             <label className="compact-select call-outcome-filter"><Filter size={17} /><select aria-label="Call outcome filter" value={result} onChange={(event) => setResult(event.target.value)}><option value="all">All outcomes</option>{results.map((item) => <option key={item}>{item}</option>)}</select></label>
-            <label className="compact-select"><Headphones size={17} /><select aria-label="Session audio filter" value={audioFilter} onChange={(event) => setAudioFilter(event.target.value)}><option value="all">All session audio</option><option value="unlistened">Unlistened</option><option value="ready">Ready to listen</option><option value="partial">Partial</option><option value="Pending upload">Pending upload</option><option value="Unavailable">Unavailable</option><option value="Not recorded">Not recorded</option></select></label>
+            <label className="compact-select"><Headphones size={17} /><select aria-label="Session audio filter" value={audioFilter} onChange={(event) => setAudioFilter(event.target.value)}><option value="all">All session audio</option><option value="unlistened">Unlistened</option><option value="ready">Ready to listen</option><option value="partial">Partial</option><option value="Pending upload">Pending upload</option><option value="Processing audio">Processing audio</option><option value="Processing needs attention">Processing needs attention</option><option value="Upload needs attention">Upload needs attention</option><option value="Recording needs review">Recording needs review</option><option value="Recording failed">Recording failed</option><option value="Unavailable">Unavailable</option><option value="Not recorded">Not recorded</option></select></label>
             <Button variant="secondary" onClick={exportCsv} disabled={!calls.length}><Download size={17} /> Export CSV</Button>
           </div>
           {calls.length === 0 ? <EmptyState title="No matching calls">Call metadata appears here after the tablet uploads acknowledged events.</EmptyState> : (

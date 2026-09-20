@@ -132,8 +132,31 @@ class CallRecord(Base):
     menu_path: Mapped[list[str]] = mapped_column(JSON, default=list)
     result: Mapped[str] = mapped_column(String(64), nullable=False)
     duration_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_status: Mapped[str | None] = mapped_column(String(32))
+    terminal_notification_scheduled: Mapped[bool] = mapped_column(Boolean, default=False)
     events: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     session_audit: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CallHistoryCorrection(Base):
+    __tablename__ = "call_history_corrections"
+    call_id: Mapped[str] = mapped_column(ForeignKey("call_records.id"), primary_key=True)
+    evidence_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    original: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    applied: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    corrected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CallEventReceipt(Base):
+    """Independent of the parent upload; identity deduplicates retries and late events."""
+    __tablename__ = "call_event_receipts"
+    device_id: Mapped[str] = mapped_column(ForeignKey("devices.id"), primary_key=True)
+    call_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    identity: Mapped[str] = mapped_column(String(64), primary_key=True)
+    document: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    notification_scheduled: Mapped[bool] = mapped_column(Boolean, default=False)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -231,6 +254,7 @@ class ContinuousRecording(Base):
     __tablename__ = "continuous_recordings"
 
     recording_id: Mapped[str] = mapped_column(ForeignKey("recordings.id", ondelete="CASCADE"), primary_key=True)
+    validation_error: Mapped[str | None] = mapped_column(String(500))
     manifest: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     state: Mapped[str] = mapped_column(String(24), nullable=False, default="uploading", index=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

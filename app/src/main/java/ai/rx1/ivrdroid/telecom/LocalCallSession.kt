@@ -17,6 +17,8 @@ import ai.rx1.ivrdroid.telecom.external.TelecomCallState
 import org.json.JSONObject
 import java.io.File
 import java.time.Instant
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -44,6 +46,17 @@ object LocalCallSession {
         val value = journal ?: return
         SessionAuditFiles.encrypt(path(context), "call-session:1", value.toString().toByteArray(Charsets.UTF_8))
     }
+
+    @Synchronized
+    fun owns(session: String?): Boolean = session != null && journal?.getJSONObject("event")?.getString("call_id") == session
+
+    @Synchronized
+    fun answerRequested(session: String): Boolean = owns(session) && journal?.optBoolean("answer_requested") == true
+
+    private fun finalizing(context: Context) = SessionAuditFiles.directory(File(directory(context), "finalizing"))
+    private fun resultWire(context: Context, id: String, extension: String): List<String>? = runCatching {
+        String(SessionAuditFiles.read(File(context.filesDir, "bridge/call-results/$id.$extension"), 512), Charsets.US_ASCII).trim().split(' ')
+    }.getOrNull()
 
     @Synchronized
     fun canHandleNewCaller(context: Context): Boolean {
@@ -99,7 +112,11 @@ object LocalCallSession {
         executor.scheduleWithFixedDelay({ runCatching { reconcile(application) }.onFailure {
             readiness = "SESSION_RECOVERY_FAILED"
             RecordingFailureJournal.capture(application, "session_reconcile", error = it)
-        } }, 0, 500, TimeUnit.MILLISECONDS)
+        }
+            runCatching { finalizePending(application) }.onFailure {
+                RecordingFailureJournal.capture(application, "session_finalization", error = it)
+            }
+        }, 0, 500, TimeUnit.MILLISECONDS)
     }
 
     @Synchronized
@@ -135,7 +152,7 @@ object LocalCallSession {
     @Synchronized
     fun recoverAnswer(context: Context, calls: List<TelecomCallSnapshot>): String? {
         val value = journal ?: return null
-        if (!restoredSession || value.optString("answer_generation") == processGeneration ||
+        if (!restoredSession || value.optBoolean("answer_requested") || value.optString("answer_generation") == processGeneration ||
             value.getLong("answered_elapsed") != 0L || value.getString("boot") != BootIdentity.current()) return null
         val session = value.getJSONObject("event").getString("call_id")
         val native = CallRecoveryBridge.snapshot(context)
@@ -155,11 +172,23 @@ object LocalCallSession {
     @Synchronized
     fun observeCalls(context: Context, calls: List<TelecomCallSnapshot>) {
         val value = journal ?: return
-        val caller = calls.singleOrNull { it.id == value.getString("caller_key") } ?: return
+        val caller = calls.singleOrNull { it.id == value.getString("caller_key") }
+        if (caller == null || caller.state == TelecomCallState.DISCONNECTED) {
+            // Callback restoration can temporarily expose no Call objects. Only
+            // an explicit disconnect (or independent native reconciliation) is evidence.
+            if (caller != null && value.getLong("answered_elapsed") > 0) {
+                if (!value.has("ended_elapsed")) value.put("ended_elapsed", SystemClock.elapsedRealtime())
+                if (caller?.disconnectKind == ai.rx1.ivrdroid.telecom.external.TelecomDisconnectKind.REMOTE)
+                    value.put("disconnect_result", "REMOTE_HANGUP")
+                save(context)
+            }
+            return
+        }
         var changed = false
         if (value.isNull("caller_native") && caller.nativeId != null) { value.put("caller_native", caller.nativeId); changed = true }
         if (value.getLong("answered_elapsed") == 0L && caller.state in setOf(TelecomCallState.ACTIVE, TelecomCallState.HOLDING)) {
             val now = SystemClock.elapsedRealtime()
+            android.util.Log.i("IVRdroidAdmission", "call=${value.getJSONObject("event").getString("call_id")} active_observed_ms=$now")
             value.put("answered_elapsed", now).put("deadline_elapsed", now + value.getInt("maximum_seconds") * 1000L)
             changed = true
         }
@@ -185,9 +214,7 @@ object LocalCallSession {
         val recoveryIdentity = "${controller.startedElapsedMs}:${controller.readiness}"
         if (controller.readiness != "NOT_BOUND" && recoveryIdentity != recordedControllerRecovery) {
             recordedControllerRecovery = recoveryIdentity
-            RecordingFailureJournal.capture(context, "controller_recovery", durationMs = controller.durationMs,
-                componentReadiness = controller.readiness, sessionPhase = controller.phase,
-                callId = journal?.getJSONObject("event")?.getString("call_id"))
+            android.util.Log.i("IVRdroidAdmission", "controller_recovery duration_ms=${controller.durationMs} readiness=${controller.readiness} phase=${controller.phase}")
         }
         val now = SystemClock.elapsedRealtime()
         val boot = BootIdentity.current() ?: return
@@ -208,9 +235,9 @@ object LocalCallSession {
                 absentSince = null; readiness = "CALL_PRESENT"; CallRuntimeState.setBusy(true); return
             }
             if (absentSince == null) { absentSince = now; firstEmptySequence = native.sequence }
-            val settled = now - requireNotNull(absentSince) >= 500 && native.sequence > firstEmptySequence
+            val settled = now - requireNotNull(absentSince) >= 500 && native.sequence != firstEmptySequence && native.elapsedMs > requireNotNull(absentSince)
             readiness = if (settled) "READY" else "WAITING_NATIVE_RECONCILIATION"
-            CallRuntimeState.setBusy(!settled)
+            CallRuntimeState.setBusy(!settled || IncomingCallAdmission.isPending(context))
             return
         }
         val event = CallEventPayload.decode(value.getJSONObject("event")).copy(
@@ -228,15 +255,15 @@ object LocalCallSession {
                     save(context)
                 }
             }
-            if (value.isNull("caller_native") && native.session == event.callId && native.calls.size == 1) {
+            if (value.isNull("caller_native") && native.session == event.callId && native.calls.size == 1 && !value.has("ended_elapsed")) {
                 value.put("caller_native", native.calls.single().id); save(context)
             }
         }
         val callerNative = value.optString("caller_native").takeUnless { it == "null" || it.isEmpty() }
         val callerPresent = sameBoot && native.calls.any { it.id == callerNative }
         val helper = RootAudioTrigger.readState(context)
-        val sessionRunning = sameBoot && native.session == event.callId && !helper.isIdle && native.calls.isNotEmpty()
-        if (callerPresent || sessionRunning || (sameBoot && callerNative == null && native.calls.isNotEmpty())) {
+        val sessionRunning = sameBoot && !value.has("ended_elapsed") && native.session == event.callId && !helper.isIdle && native.calls.isNotEmpty()
+        if (callerPresent || sessionRunning || (sameBoot && !value.has("ended_elapsed") && callerNative == null && native.calls.isNotEmpty())) {
             absentSince = null; CallRuntimeState.setBusy(true); readiness = "ACTIVE_SESSION"
             if (value.getString("phase") != helper.current) {
                 value.put("phase", helper.current).put("last_observed_elapsed", native.elapsedMs); save(context)
@@ -244,24 +271,66 @@ object LocalCallSession {
             return
         }
         if (absentSince == null) { absentSince = now; firstEmptySequence = native.sequence; return }
-        if (now - requireNotNull(absentSince) < 500 || native.sequence <= firstEmptySequence) return
-        val terminal = value.optJSONObject("terminal") ?: run {
-            val outcome = runCatching { String(SessionAuditFiles.read(File(context.filesDir, "bridge/call-outcome"), 512), Charsets.US_ASCII).trim().split(' ') }.getOrNull()
-                ?.takeIf { it.size == 5 && it[0] == "END1" && it[1] == event.callId && it[2] == value.getString("boot") }
-            val ended = outcome?.get(3)?.toLongOrNull() ?: if (sameBoot) native.elapsedMs else value.getLong("last_observed_elapsed")
-            val result = if (value.optString("requested_result") == "MAX_CALL_DURATION") "MAX_CALL_DURATION"
-                else outcome?.get(4) ?: if (!sameBoot) "RECOVERED_AFTER_REBOOT" else value.optString("requested_result").takeIf { it.isNotEmpty() } ?: "RECOVERED_AND_ENDED"
-            val seconds = ((ended - value.getLong("started_elapsed")) / 1000).coerceIn(0, 86400).toInt()
-            val final = event.copy(result = result, durationSeconds = seconds, menuPath =
-                value.optJSONArray("menu_path")?.let { p -> List(p.length()) { p.getString(it) } } ?: helper.sessionPath)
-            CallEventPayload.encode(final).also { value.put("terminal", it); save(context) }
+        if (now - requireNotNull(absentSince) < 500 || native.sequence == firstEmptySequence || native.elapsedMs <= requireNotNull(absentSince)) return
+        if (!value.has("ended_elapsed")) {
+            value.put("ended_elapsed", if (sameBoot) native.elapsedMs else value.getLong("last_observed_elapsed"))
+            if (!sameBoot) value.put("ended_at_unknown", true)
         }
-        SecureControlStore.enqueueCall(context, CallEventPayload.decode(terminal).copy(
-            auditPolicyVersion = event.auditPolicyVersion, auditQuotaBytes = event.auditQuotaBytes))
+        val release = resultWire(context, event.callId, "released")
+        val released = release?.let { it.size == 4 && it[0] == "RELEASE1" && it[1] == event.callId &&
+            it[2] == value.getString("boot") && (it[3].toLongOrNull() ?: Long.MAX_VALUE) <= now } == true
+        // Unanswered requests and legacy restored journals can finish on verified
+        // helper idle; normal calls require the per-session resource-release proof.
+        val noAnswer = value.getLong("answered_elapsed") == 0L && helper.isIdle && native.calls.isEmpty()
+        val recoveredIdle = helper.isIdle && !callerPresent && (native.calls.isEmpty() || IncomingCallAdmission.isPending(context))
+        if (sameBoot && !released && !noAnswer && !recoveredIdle) { readiness = "WAITING_RESOURCE_RELEASE"; return }
+        value.put("released_elapsed", now).put("cleanup_status", if (released || noAnswer) "complete" else "recovered")
+        save(context)
+        Files.move(path(context).toPath(), File(finalizing(context), "${event.callId}.enc").toPath(), StandardCopyOption.ATOMIC_MOVE)
+        SessionAuditFiles.sync(directory(context)); SessionAuditFiles.sync(finalizing(context))
         OwnedCallRegistry.removeSession(context, event.callId)
-        require(path(context).delete()); SessionAuditFiles.sync(directory(context))
         journal = null; absentSince = null
-        CallRuntimeState.setBusy(native.calls.isNotEmpty() || !helper.isIdle)
+        CallRuntimeState.setBusy(native.calls.isNotEmpty() || !helper.isIdle || IncomingCallAdmission.isPending(context))
         readiness = if (CallRuntimeState.isBusy()) "CALL_PRESENT" else "READY"
+    }
+
+    /** No active-session lock: ended sessions cannot hold the next caller's slot. */
+    private fun finalizePending(context: Context) {
+        if (IncomingCallAdmission.isPending(context)) return
+        for (file in finalizing(context).listFiles().orEmpty()) {
+            if (!file.name.matches(Regex("[0-9a-f-]{36}\\.enc"))) continue
+            runCatching { finalizeFile(context, file) }.onFailure {
+                RecordingFailureJournal.capture(context, "session_finalization", callId = file.name.removeSuffix(".enc"), error = it)
+            }
+        }
+    }
+
+    private fun finalizeFile(context: Context, file: File) {
+        val value = JSONObject(String(SessionAuditFiles.decrypt(file, "call-session:1", 64 * 1024), Charsets.UTF_8))
+        val event = CallEventPayload.decode(value.getJSONObject("event"))
+        val outcome = resultWire(context, event.callId, "outcome")?.takeIf {
+            it.size == 5 && it[0] == "END1" && it[1] == event.callId && it[2] == value.getString("boot")
+        }
+        val sameBoot = value.getString("boot") == BootIdentity.current()
+        val requested = value.optString("requested_result").takeIf { it.isNotEmpty() }
+        if (outcome == null && requested == null && sameBoot &&
+            SystemClock.elapsedRealtime() - value.getLong("released_elapsed") < 10_000) return
+        val result = if (requested == "MAX_CALL_DURATION") requested else value.optString("disconnect_result").takeIf { it.isNotEmpty() } ?: outcome?.get(4) ?: requested ?:
+            if (!sameBoot) "RECOVERED_AFTER_REBOOT" else "END_DETAILS_UNAVAILABLE"
+        if (result == "END_DETAILS_UNAVAILABLE" && value.optBoolean("pending_reported")) return
+        val ended = value.getLong("ended_elapsed").coerceAtLeast(value.getLong("started_elapsed"))
+        val elapsed = ended - value.getLong("started_elapsed")
+        val ownPath = runCatching { String(SessionAuditFiles.read(File(context.filesDir,
+            "bridge/call-results/${event.callId}.path"), 8192), Charsets.US_ASCII).trim() }.getOrNull()
+        val menu = ownPath?.takeUnless { it == "UNAVAILABLE" || it == "none" }?.split('>')?.take(64)
+            ?: value.optJSONArray("menu_path")?.let { path -> List(path.length()) { path.getString(it) } } ?: event.menuPath
+        SecureControlStore.enqueueCall(context, event.copy(result = result, durationSeconds = (elapsed / 1000).coerceAtMost(86400).toInt(),
+            endedAt = if (value.optBoolean("ended_at_unknown")) null else Instant.parse(event.startedAt).plusMillis(elapsed).toString(),
+            cleanupStatus = if (result == "END_DETAILS_UNAVAILABLE") "pending" else value.getString("cleanup_status"), menuPath = menu,
+            auditPolicyVersion = value.optLong("audit_policy_version", 0).takeIf { it > 0 },
+            auditQuotaBytes = value.optLong("audit_quota_bytes", 0).takeIf { it > 0 }))
+        // Keep incomplete evidence repairable when a delayed per-session result arrives.
+        if (result != "END_DETAILS_UNAVAILABLE") { require(file.delete()); SessionAuditFiles.sync(finalizing(context)) }
+        else SessionAuditFiles.encrypt(file, "call-session:1", value.put("pending_reported", true).toString().toByteArray())
     }
 }

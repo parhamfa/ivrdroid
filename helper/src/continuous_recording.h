@@ -11,6 +11,8 @@ struct ContinuousRecordingContext {
     uint64_t revision = 0, policy = 0, frames = 0, processStart = 0;
     int64_t wallMs = 0, elapsedMs = 0;
     pid_t pid = -1;
+    unsigned version = 1;
+    int64_t captureEndMs = 0, finalizedMs = 0;
 };
 
 std::string FormatContinuousContext(const ContinuousRecordingContext& context);
@@ -22,9 +24,9 @@ public:
     ContinuousPcmFile(std::string directory, uid_t owner, ContinuousRecordingContext context);
     ~ContinuousPcmFile();
     bool Open();
-    bool Append(const int16_t* samples, uint32_t frames, uint64_t maximumBytes);
+    bool Append(const int16_t* samples, uint32_t frames, uint64_t maximumBytes, int64_t captureEndMs = 0);
     bool Checkpoint();
-    bool Finish(const std::string& reason, bool partial);
+    bool Finish(const std::string& reason, bool partial, bool recovered = false);
     uint64_t frames() const { return context_.frames; }
     static bool Recover(const std::string& directory, uid_t owner, const ContinuousRecordingContext& committed);
 private:

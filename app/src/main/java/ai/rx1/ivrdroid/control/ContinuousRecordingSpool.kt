@@ -176,45 +176,56 @@ object ContinuousRecordingSpool {
     }
 
     fun uploadPending(context: Context, api: DeviceApi) {
+        var failures = 0
         for (folder in folders(context).sortedBy { it.name }) {
             ensureIdle(context)
-            if (!File(folder, "manifest.enc").exists()) continue
-            val manifest = metadata(folder)
-            val id = folder.name
-            require(manifest.getString("recording_id") == id)
-            if (manifest.getString("kind") == "session_audit" && !SessionAuditSpool.continuousMetadataAcknowledged(context, id)) continue
-            var response = api.continuousJson("POST", "", manifest)
-            val size = manifest.getLong("expected_size_bytes")
-            fun verify(): Long {
-                require(response.getString("id") == id && response.getLong("expected_size_bytes") == size &&
-                    response.getString("source_sha256") == manifest.getString("source_sha256") && response.getBoolean("partial") == manifest.getBoolean("partial"))
-                val offset = response.getLong("upload_offset").also { require(it in 0..size) }
-                require(!response.getBoolean("acknowledged") || (offset == size && response.getString("status") in setOf("ready", "deleted")))
-                return offset
+            try { uploadOne(context, api, folder) }
+            catch (interrupted: CallStarted) { throw interrupted }
+            catch (error: Exception) {
+                failures++
+                RecordingFailureJournal.capture(context, "continuous_upload", recordingKey = folder.name, error = error)
             }
-            var offset = verify()
-            if (response.getString("processing_state") == "invalid") {
-                response = api.continuousJson("POST", "/$id/reset", JSONObject())
-                offset = verify()
-            }
-            if (!response.getBoolean("acknowledged") && response.getString("processing_state") == "uploading") {
-                ContinuousRecordingEnvelope.Reader(SessionAuditFiles.key(), "${manifest.getString("kind")}:$id", File(folder, "audio.enc")).use { reader ->
-                    require(reader.size == size && reader.sha256 == manifest.getString("source_sha256"))
-                    while (offset < size) {
-                        ensureIdle(context)
-                        val count = minOf(1024 * 1024L, size - offset).toInt()
-                        response = api.uploadContinuousChunk(id, offset, reader.read(offset, count))
-                        val next = verify(); require(next == offset + count); offset = next
-                    }
+        }
+        check(failures == 0) { "$failures recordings remain queued for retry or review." }
+    }
+
+    private fun uploadOne(context: Context, api: DeviceApi, folder: File) {
+        if (!File(folder, "manifest.enc").exists()) return
+        val manifest = metadata(folder)
+        val id = folder.name
+        require(manifest.getString("recording_id") == id)
+        if (manifest.getString("kind") == "session_audit" && !SessionAuditSpool.continuousMetadataAcknowledged(context, id)) return
+        var response = api.continuousJson("POST", "", manifest)
+        val size = manifest.getLong("expected_size_bytes")
+        fun verify(): Long {
+            require(response.getString("id") == id && response.getLong("expected_size_bytes") == size &&
+                response.getString("source_sha256") == manifest.getString("source_sha256") && response.getBoolean("partial") == manifest.getBoolean("partial"))
+            val offset = response.getLong("upload_offset").also { require(it in 0..size) }
+            require(!response.getBoolean("acknowledged") || (offset == size && response.getString("status") in setOf("ready", "deleted")))
+            return offset
+        }
+        var offset = verify()
+        if (response.getString("processing_state") == "invalid") {
+            response = api.continuousJson("POST", "/$id/reset", JSONObject())
+            offset = verify()
+        }
+        if (!response.getBoolean("acknowledged") && response.getString("processing_state") == "uploading") {
+            ContinuousRecordingEnvelope.Reader(SessionAuditFiles.key(), "${manifest.getString("kind")}:$id", File(folder, "audio.enc")).use { reader ->
+                require(reader.size == size && reader.sha256 == manifest.getString("source_sha256"))
+                while (offset < size) {
+                    ensureIdle(context)
+                    val count = minOf(1024 * 1024L, size - offset).toInt()
+                    response = api.uploadContinuousChunk(id, offset, reader.read(offset, count))
+                    val next = verify(); require(next == offset + count); offset = next
                 }
-                response = api.continuousJson("POST", "/$id/complete", JSONObject()); verify()
             }
-            if (response.getBoolean("acknowledged")) {
-                val acknowledged = File(root(context), ".$id.acked")
-                require(folder.renameTo(acknowledged)); SessionAuditFiles.sync(root(context))
-                finishAcknowledged(context, acknowledged, id)
-                publishCapacity(context)
-            }
+            response = api.continuousJson("POST", "/$id/complete", JSONObject()); verify()
+        }
+        if (response.getBoolean("acknowledged")) {
+            val acknowledged = File(root(context), ".$id.acked")
+            require(folder.renameTo(acknowledged)); SessionAuditFiles.sync(root(context))
+            finishAcknowledged(context, acknowledged, id)
+            publishCapacity(context)
         }
     }
 

@@ -51,6 +51,13 @@ class DeviceApi(private val enrollment: Enrollment? = null) {
         return buildSet { for (index in 0 until accepted.length()) add(accepted.getString(index)) }
     }
 
+    fun uploadCallEvents(events: Map<String, List<PendingCallSubEvent>>): Set<String> {
+        val calls = JSONArray()
+        events.forEach { (id, items) -> calls.put(JSONObject().put("call_id", id).put("events", CallEventPayload.encodeEvents(items))) }
+        val accepted = authenticatedJson("POST", "/api/device/v1/call-events:batch", JSONObject().put("calls", calls)).getJSONArray("accepted_call_ids")
+        return buildSet { for (index in 0 until accepted.length()) add(accepted.getString(index)) }
+    }
+
     fun beginRecording(recording: PendingRecording): JSONObject = authenticatedJson(
         "POST",
         RecordingApiPaths.segment(recording) ?: "/api/device/v1/recordings",

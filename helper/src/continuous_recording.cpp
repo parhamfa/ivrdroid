@@ -26,23 +26,32 @@ bool Valid(const ContinuousRecordingContext& c) {
     return (c.kind == "conversation" || c.kind == "session_audit") && call_control::IsCanonicalUuid(c.id) &&
         call_control::IsCanonicalUuid(c.callId) && call_control::IsCanonicalUuid(c.bootId) &&
         (c.kind == "conversation" ? c.revision > 0 && call_control::IsCanonicalUuid(c.blockId) : c.policy > 0 && c.blockId == "-") &&
-        c.wallMs > 0 && c.elapsedMs > 0 && c.pid > 0 && c.processStart > 0 && c.frames <= 48'000ULL * 86'400;
+        c.wallMs > 0 && c.elapsedMs > 0 && c.pid > 0 && c.processStart > 0 && c.frames <= 48'000ULL * 86'400 && (c.version == 1 ||
+            (c.version == 2 && (c.frames == 0 || c.captureEndMs >= c.elapsedMs) &&
+             (c.finalizedMs == 0 || c.finalizedMs >= c.captureEndMs)));
 }
 }
 
 std::string FormatContinuousContext(const ContinuousRecordingContext& c) {
     if (!Valid(c)) return "";
     std::ostringstream out;
-    out << "PCM1 " << c.kind << ' ' << c.id << ' ' << c.callId << ' ' << c.bootId << ' '
+    out << (c.version == 2 ? "PCM2 " : "PCM1 ") << c.kind << ' ' << c.id << ' ' << c.callId << ' ' << c.bootId << ' '
         << c.revision << ' ' << c.blockId << ' ' << c.policy << ' ' << c.wallMs << ' ' << c.elapsedMs << ' '
-        << c.pid << ' ' << c.processStart << ' ' << c.frames << '\n';
+        << c.pid << ' ' << c.processStart << ' ' << c.frames;
+    if (c.version == 2) out << ' ' << c.captureEndMs << ' ' << c.finalizedMs;
+    out << '\n';
     return out.str();
 }
 bool ParseContinuousContext(const std::string& text, ContinuousRecordingContext* context) {
     if (!context || text.size() > 1024) return false;
     ContinuousRecordingContext c; std::string magic, extra; std::istringstream in(text);
     if (!(in >> magic >> c.kind >> c.id >> c.callId >> c.bootId >> c.revision >> c.blockId >> c.policy >> c.wallMs >> c.elapsedMs >> c.pid >> c.processStart >> c.frames) ||
-        magic != "PCM1" || (in >> extra) || !Valid(c)) return false;
+        (magic != "PCM1" && magic != "PCM2")) return false;
+    if (magic == "PCM2") {
+        c.version = 2;
+        if (!(in >> c.captureEndMs >> c.finalizedMs)) return false;
+    }
+    if ((in >> extra) || !Valid(c)) return false;
     *context = c; return true;
 }
 ContinuousPcmFile::ContinuousPcmFile(std::string directory, uid_t owner, ContinuousRecordingContext context)
@@ -80,13 +89,14 @@ bool ContinuousPcmFile::Open() {
     fd_ = open((directory_ + "/audio.pcm").c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     return fd_ >= 0 && fchown(fd_, owner_, geteuid() == owner_ ? static_cast<gid_t>(-1) : owner_) == 0 && Checkpoint();
 }
-bool ContinuousPcmFile::Append(const int16_t* samples, uint32_t frames, uint64_t maximumBytes) {
+bool ContinuousPcmFile::Append(const int16_t* samples, uint32_t frames, uint64_t maximumBytes, int64_t captureEndMs) {
     const int64_t started = ElapsedMs();
     if (fd_ < 0 || !samples || frames == 0 || frames > 48000 || context_.frames > UINT64_MAX / 4 - frames) return false;
     const uint64_t bytes = (context_.frames + frames) * 4;
     if (bytes > maximumBytes || context_.frames + frames > 48'000ULL * 86'400) return Failure("byte_budget", ENOSPC, started);
     if (!WriteBytes(fd_, samples, frames * 4)) return Failure("append", errno, started);
     context_.frames += frames;
+    if (context_.version == 2) context_.captureEndMs = captureEndMs;
     return true;
 }
 bool ContinuousPcmFile::Checkpoint() {
@@ -95,8 +105,9 @@ bool ContinuousPcmFile::Checkpoint() {
     if (!WriteMetadata("continuous.context", FormatContinuousContext(context_))) return Failure("commit_checkpoint", errno, started);
     return true;
 }
-bool ContinuousPcmFile::Finish(const std::string& reason, bool partial) {
+bool ContinuousPcmFile::Finish(const std::string& reason, bool partial, bool recovered) {
     if (reason.empty() || reason.size() > 32 || reason.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != std::string::npos) return false;
+    if (context_.version == 2) context_.finalizedMs = !recovered && ElapsedMs() >= context_.captureEndMs ? ElapsedMs() : 0;
     // A failed partial write may have left an incomplete PCM frame after the valid prefix.
     if (fd_ < 0 || ftruncate(fd_, static_cast<off_t>(context_.frames * 4)) != 0 || !Checkpoint()) return false;
     return WriteMetadata("continuous.sealed", reason + " " + (partial ? "1\n" : "0\n"));
@@ -108,6 +119,6 @@ bool ContinuousPcmFile::Recover(const std::string& directory, uid_t owner, const
     struct stat st {};
     if (file.fd_ < 0 || fstat(file.fd_, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != owner ||
         (st.st_mode & 0077) != 0 || st.st_size < static_cast<off_t>(committed.frames * 4)) return false;
-    return file.Finish("interrupted", true);
+    return file.Finish("interrupted", true, true);
 }
 } // namespace ivrdroid

@@ -4,12 +4,13 @@ export function finalDisconnect(call: CallRecord): string {
   return ({ REMOTE_HANGUP: "Caller hung up", IN_PROGRESS: "In progress", COMPLETED: "Call completed",
     SYSTEM_FAILURE: "System failure", STOCK_DIALER: "Stock dialer", MAX_CALL_DURATION: "Maximum call duration reached",
     RECOVERED_OPERATOR_HANGUP: "Operator disconnected during app recovery", RECOVERED_AFTER_REBOOT: "Interrupted by tablet restart",
-    RECOVERED_AND_ENDED: "Call ended during recovery" } as Record<string, string>)[call.result] ?? call.result;
+    END_DETAILS_UNAVAILABLE: "Details pending", RECOVERED_AND_ENDED: "Call ended during recovery" } as Record<string, string>)[call.result] ?? call.result;
 }
 
 export function recordingStatus(recording: Recording): string {
   if (recording.status === "ready") return recording.partial ? "Partial audio" : "Ready";
-  if (recording.processing_error) return "Needs attention";
+  if (recording.processing_state === "needs_attention") return "Recording needs review";
+  if (recording.processing_error) return recording.status === "uploading" ? "Upload needs attention" : "Processing needs attention";
   if (recording.processing_state === "awaiting_device_recovery") return "Awaiting tablet recovery";
   if (recording.processing_state === "active_call") return "Call in progress";
   if (recording.status === "processing") return "Processing audio";
@@ -18,6 +19,7 @@ export function recordingStatus(recording: Recording): string {
 }
 
 export function recordingProgress(recording: Recording): string {
+  if (recording.processing_state === "needs_attention") return `${recording.processing_error ?? "Recording timing needs review"}. Audio is preserved. Call times will remain unchanged while this is investigated.`;
   if (recording.processing_error) return `${recording.processing_error}. The preserved source will be retried when the problem is resolved.`;
   if (recording.processing_state === "awaiting_device_recovery") return "The call has ended, but the tablet has not confirmed the recording's final coverage. Check tablet recovery and storage status; available audio has been preserved.";
   if (recording.processing_state === "active_call") return "Recording is still associated with an active call. Final coverage is not yet known.";
@@ -57,7 +59,8 @@ export function sessionAudioStatus(call: CallRecord): string {
   const audit = call.session_audit;
   if (!audit || audit.state === "disabled") return "Not recorded";
   if (audit.state === "ready" && audit.recording?.playback_url) return audit.partial ? "Partial · Listen" : "Listen";
-  if (audit.recording?.processing_error) return "Needs attention";
+  if (audit.recording?.processing_error) return recordingStatus(audit.recording);
+  if (audit.state === "unavailable") return "Recording failed";
   if (audit.state === "processing") return "Processing audio";
   if (["pending_upload", "uploading", "processing"].includes(audit.state)) return "Pending upload";
   return "Unavailable";
@@ -98,4 +101,8 @@ export function eventDetail(event: SessionAuditEvent): string {
     "operator answered": "Operator answered", "merging": "Connecting both calls",
     "conferenced": "Conversation started", "completed": "Conversation ended",
     "not connected": "Operator did not connect", "system failure": "System failure" } as Record<string, string>)[detail] ?? detail;
+}
+
+export function pendingSessionAudio(call: CallRecord): number {
+  return call.pending_session_audio_count ?? Number(["pending_upload", "uploading", "processing"].includes(call.session_audit?.state ?? ""));
 }

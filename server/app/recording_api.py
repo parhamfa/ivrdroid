@@ -383,9 +383,12 @@ def _recording_response(request: Request, recording: Recording, call: CallRecord
     session = object_session(recording)
     receipt = session.get(ContinuousRecording, recording.id) if session is not None else None
     upload = session.get(RecordingUpload, recording.id) if session is not None else None
-    state = receipt.state if receipt else (
-        "active_call" if call.result == "IN_PROGRESS" else "awaiting_device_recovery"
-    ) if recording.status == "uploading" else recording.status
+    if receipt is not None:
+        state = receipt.state
+    elif recording.status == "uploading":
+        state = "active_call" if call.result == "IN_PROGRESS" else "awaiting_device_recovery"
+    else:
+        state = recording.status
     return RecordingResponse(
         id=recording.id,
         call_id=recording.call_id,

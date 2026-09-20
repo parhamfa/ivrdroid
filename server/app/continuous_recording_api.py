@@ -25,8 +25,23 @@ from .services import load_manifest
 router = APIRouter(prefix="/api/device/v1/continuous-recordings", tags=["continuous-recordings"])
 
 
+class CaptureReceipt(StrictModel):
+    version: Literal[2]
+    boot_id: UUID
+    started_elapsed_ms: int = Field(gt=0)
+    ended_elapsed_ms: int = Field(gt=0)
+    finalized_elapsed_ms: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def ordered(self):
+        if self.ended_elapsed_ms < self.started_elapsed_ms or (self.finalized_elapsed_ms is not None and self.finalized_elapsed_ms < self.ended_elapsed_ms):
+            raise ValueError("Capture boundaries must precede file finalization")
+        return self
+
+
 class ContinuousRecordingCreate(StrictModel):
-    format_version: Literal[1] = 1
+    format_version: Literal[1, 2] = 1
+    capture_receipt: CaptureReceipt | None = None
     recording_id: UUID
     call_id: UUID
     kind: Literal["conversation", "session_audit"]
@@ -44,6 +59,8 @@ class ContinuousRecordingCreate(StrictModel):
 
     @model_validator(mode="after")
     def validate_pcm(self):
+        if (self.format_version == 2) != (self.capture_receipt is not None):
+            raise ValueError("Version 2 requires a capture receipt; version 1 retains its original contract")
         if self.expected_size_bytes != self.frames * 4 or self.duration_ms != self.frames * 1000 // 48000:
             raise ValueError("PCM byte count, frame count and duration must agree")
         if self.captured_at.tzinfo is None:
@@ -70,7 +87,7 @@ def _owned(session: Session, recording_id: str, device: Device, *, lock=False):
 
 def _response(recording, receipt, upload):
     accepted = receipt.accepted_at is not None
-    return {"id": recording.id, "format_version": 1, "status": recording.status,
+    return {"id": recording.id, "format_version": receipt.manifest.get("format_version", 1), "status": recording.status,
             "processing_state": receipt.state, "upload_offset": upload.upload_offset if upload else recording.source_size_bytes if accepted else 0,
             "expected_size_bytes": recording.source_size_bytes, "source_sha256": recording.source_sha256,
             "partial": recording.partial, "acknowledged": accepted,
@@ -97,6 +114,8 @@ def _capacity(request, session, body):
 def create(body: ContinuousRecordingCreate, request: Request, device: Device = Depends(require_device), session: Session = Depends(get_session)):
     recording_id, call_id = str(body.recording_id), str(body.call_id)
     manifest = body.model_dump(mode="json")
+    if body.capture_receipt is None:
+        manifest.pop("capture_receipt")
     existing = session.get(Recording, recording_id)
     if existing is not None:
         recording, receipt, upload = _owned(session, recording_id, device)
@@ -109,9 +128,12 @@ def create(body: ContinuousRecordingCreate, request: Request, device: Device = D
     if call.device_id != device.id:
         raise HTTPException(403, "Call belongs to another device")
     captured = _utc(body.captured_at)
-    end = _utc(call.started_at) + timedelta(seconds=call.duration_seconds)
+    end = _utc(call.ended_at) if call.ended_at else _utc(call.started_at) + timedelta(seconds=call.duration_seconds)
+    timing_issue = None
     if captured < _utc(call.started_at) - timedelta(seconds=5) or captured + timedelta(milliseconds=body.duration_ms) > end + timedelta(seconds=5):
-        raise HTTPException(422, "Recording coverage is outside its call")
+        timing_issue = "Recording coverage is outside its call; source retained for evidence review"
+    if body.capture_receipt is not None and abs(body.capture_receipt.ended_elapsed_ms - body.capture_receipt.started_elapsed_ms - body.duration_ms) > 1:
+        timing_issue = "Capture boundaries disagree with the PCM frame count; source retained for evidence review"
     operator = None
     if body.kind == "conversation":
         revision = session.get(Revision, body.revision_id)
@@ -142,7 +164,7 @@ def create(body: ContinuousRecordingCreate, request: Request, device: Device = D
         operator_last4=operator[-4:] if operator else "", captured_at=body.captured_at,
         duration_ms=body.duration_ms, stop_reason=body.stop_reason, source_size_bytes=body.expected_size_bytes,
         source_sha256=body.source_sha256, source_format=body.source_format, partial=body.partial, status="uploading")
-    receipt = ContinuousRecording(recording_id=recording_id, manifest=manifest, state="uploading")
+    receipt = ContinuousRecording(recording_id=recording_id, manifest=manifest, state="uploading", validation_error=timing_issue)
     upload = RecordingUpload(recording_id=recording_id, expected_size_bytes=body.expected_size_bytes,
         source_sha256=body.source_sha256, upload_offset=0, storage_name=create_upload_directory(request.app.state.settings))
     try:
@@ -182,7 +204,7 @@ async def content(recording_id: str, request: Request, upload_offset: int = Head
 @router.post("/{recording_id}/complete", status_code=202)
 def complete(recording_id: str, device: Device = Depends(require_device), session: Session = Depends(get_session)):
     recording, receipt, upload = _owned(session, recording_id, device, lock=True)
-    if receipt.accepted_at is not None or receipt.state in {"queued", "processing"}:
+    if receipt.accepted_at is not None or receipt.state in {"queued", "processing", "needs_attention"}:
         return _response(recording, receipt, upload)
     if upload is None or upload.upload_offset != upload.expected_size_bytes:
         raise HTTPException(409, "Recording upload is incomplete")

@@ -121,7 +121,7 @@ describe("voicemail inbox", () => {
   it("surfaces a durable processing failure and preserves retry information", async () => {
     vi.mocked(api.recordings).mockResolvedValue({ ...inbox, items: [{ ...message, status: "processing", playback_url: null, processing_error: "Server processing workspace is full" }] });
     render(<VoicemailPage />);
-    await screen.findByText("Needs attention");
+    await screen.findByText("Processing needs attention");
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
     expect(screen.getByText(/Server processing workspace is full.*preserved source will be retried/i)).toBeTruthy();
   });

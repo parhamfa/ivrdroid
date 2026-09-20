@@ -6,6 +6,7 @@ import android.util.Log
 import ai.rx1.ivrdroid.audio.RootAudioTrigger
 import ai.rx1.ivrdroid.control.ConversationHandoffIdentity
 import ai.rx1.ivrdroid.control.SecureControlStore
+import ai.rx1.ivrdroid.telecom.LocalCallSession
 
 class ExternalCallCoordinator(
     context: Context,
@@ -83,12 +84,25 @@ class ExternalCallCoordinator(
     private fun recover(nowElapsedMs: Long) {
         val recovered = journal.load()
         val bootId = BootIdentity.current()
-        readiness = recoveryBarrier.observe(CallRecoveryBridge.snapshot(appContext), telecom.calls(), bootId,
-            recovered?.takeUnless { it.terminal }?.config?.sessionId, nowElapsedMs)
+        val native = CallRecoveryBridge.snapshot(appContext)
+        val calls = telecom.calls()
+        // An old controller journal must not demand reattachment to a helper
+        // that has already released it and admitted the next exact caller.
+        val retired = recovered != null && canRetireReleasedController(recovered, calls,
+            LocalCallSession.owns(recovered.config.sessionId), RootAudioTrigger.isIdle(appContext),
+            native?.session?.let(LocalCallSession::owns) == true)
+        readiness = recoveryBarrier.observe(native, calls, bootId,
+            recovered?.takeUnless { it.terminal || retired }?.config?.sessionId, nowElapsedMs)
         ExternalCallRuntimeStatus.recovery = ControllerRecoveryStatus(readiness.name,
             nowElapsedMs - recoveryStartedElapsedMs, recovered?.phase?.name ?: "IDLE", recoveryStartedElapsedMs)
         if (readiness != TelecomReadiness.READY) return
         if (recovered == null) { initialized = true; return }
+        if (retired) {
+            journal.retire(recovered)
+            lastRequest = CallControlBridge.readRequest(appContext)?.takeIf { it.sessionId == recovered.config.sessionId }
+            initialized = true
+            return
+        }
         if (bootId == null || recovered.config.bootId != bootId) {
             // A Telecom call identifier is valid only within its originating boot. Never mutate
             // current calls using a prior-boot journal.
@@ -133,7 +147,19 @@ class ExternalCallCoordinator(
     }
 
     private fun handleDial(request: CallControlRequest.Dial, nowElapsedMs: Long) {
-        val existing = engine?.snapshot()
+        // Durable local admission is the authority. Never replay a dial request
+        // from a retired call against a new incoming caller after process death.
+        if (!LocalCallSession.owns(request.sessionId)) return
+        var existing = engine?.snapshot()
+        val native = CallRecoveryBridge.snapshot(appContext)
+        if (existing != null && existing.config.sessionId != request.sessionId && native != null &&
+            native.parsed && !native.emergency && native.boot == request.bootId && native.session == request.sessionId &&
+            native.elapsedMs <= nowElapsedMs && nowElapsedMs - native.elapsedMs <= 2000 &&
+            canRetireReleasedController(existing, telecom.calls(), LocalCallSession.owns(existing.config.sessionId), false, true)) {
+            journal.retire(existing)
+            engine = null; existing = null
+            lastStatus = null; lastReason = "-"; pendingConferenceEvidence = null
+        }
         if (existing != null && sameIdentity(existing.config, request)) {
             if (request.sequence != existing.lastRequestSequence ||
                 request.elapsedMs != existing.lastRequestElapsedMs || existing.lastRequestKind != "DIAL"

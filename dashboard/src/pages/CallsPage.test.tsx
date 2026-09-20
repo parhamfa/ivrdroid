@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { api } from "../api";
 import type { CallRecord, Recording } from "../types";
 import { CallsPage } from "./CallsPage";
-import { callOutcome } from "./callAudit";
+import { callOutcome, recordingStatus } from "./callAudit";
 
 vi.mock("../api", () => ({ api: { calls: vi.fn(), call: vi.fn(), setRecordingListened: vi.fn(), deleteRecording: vi.fn() } }));
 const recording: Recording = { id: "audio-1", call_id: "call-1", device_id: "tablet", revision_id: null, block_id: null,
@@ -103,4 +103,25 @@ it("does not call a later dialing failure an interrupted conversation", () => {
     event: "external_call", block_id: "operator", status,
   }));
   expect(callOutcome({ ...call, events })).toBe("System failure during call · Caller hung up");
+});
+
+it("keeps recording and cleanup errors separate from a normal caller hangup", async () => {
+  const value: CallRecord = { ...call, cleanup_status: "failed", ended_at: "2026-09-12T12:00:16Z",
+    pending_session_audio_count: 1, session_audit: { ...call.session_audit!, state: "processing",
+      recording: { ...recording, status: "processing", processing_state: "retrying", processing_error: "Permission denied", playback_url: null } } };
+  vi.mocked(api.calls).mockResolvedValue([value]);
+  vi.mocked(api.call).mockResolvedValue(value);
+  render(<CallsPage />);
+  expect(await screen.findByText("0 pending recordings · 1 pending session audio")).toBeTruthy();
+  expect(screen.getByRole("cell", { name: "Processing needs attention" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("cell", { name: "Caller hung up" }));
+  expect(await screen.findByText("Resource cleanup")).toBeTruthy();
+  expect(screen.getByText("failed", { selector: "dd" })).toBeTruthy();
+  expect(screen.getAllByText("Caller hung up", { selector: "dd" })).toHaveLength(2);
+});
+
+it("distinguishes missing details, upload failure and capture timing review", () => {
+  expect(callOutcome({ ...call, result: "END_DETAILS_UNAVAILABLE", cleanup_status: "pending" })).toBe("Details pending");
+  expect(recordingStatus({ ...recording, status: "uploading", processing_error: "Upload failed" })).toBe("Upload needs attention");
+  expect(recordingStatus({ ...recording, status: "failed", processing_state: "needs_attention", processing_error: "Timing mismatch" })).toBe("Recording needs review");
 });

@@ -1,6 +1,7 @@
 package ai.rx1.ivrdroid.control
 
 import android.app.Activity
+import android.app.Application
 import android.app.Instrumentation
 import android.content.Context
 import android.content.ContextWrapper
@@ -19,6 +20,11 @@ import java.io.RandomAccessFile
 
 /** Actual Android Keystore and disk handoff, isolated from enrollment, media and call history. */
 class SessionAuditAcceptanceInstrumentation : Instrumentation() {
+    // The production application starts the real call observer. It would clear
+    // this harness's synthetic busy state whenever the actual phone is idle,
+    // racing the isolated encryption-yield assertions and touching real queues.
+    override fun callApplicationOnCreate(app: Application) = Unit
+
     override fun onCreate(arguments: Bundle?) { super.onCreate(arguments); start() }
 
     override fun onStart() {
@@ -175,7 +181,7 @@ class SessionAuditAcceptanceInstrumentation : Instrumentation() {
             output.putString("stream", "Session audit Android disk and encryption acceptance passed.\n")
             result = Activity.RESULT_OK
         } catch (error: Throwable) {
-            output.putString("stream", "Session audit acceptance failed: ${error.javaClass.simpleName}: ${error.message}\n")
+            output.putString("stream", "Session audit acceptance failed: ${error.stackTraceToString()}\n")
         } finally {
             CallRuntimeState.setBusy(false)
             files.deleteRecursively()

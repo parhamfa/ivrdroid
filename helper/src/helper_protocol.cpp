@@ -192,4 +192,35 @@ const char* ToString(LastResult result) {
     return "FAILED_AUDIO";
 }
 
+std::string FormatCallOutcome(
+    LastResult result,
+    std::string_view callUuid,
+    std::string_view bootUuid,
+    int64_t elapsedMs) {
+    if (!IsCanonicalUuid(callUuid)) return {};
+    // Only call outcomes belong in END1. A command discarded during cleanup
+    // still has the just-finished call's UUID in scope, but cannot end that call.
+    switch (result) {
+        case LastResult::SessionComplete:
+        case LastResult::RemoteHangup:
+        case LastResult::MaxCallDuration:
+        case LastResult::RecoveredOperatorHangup:
+        case LastResult::RecoveredAndEnded:
+        case LastResult::RecoveredAfterReboot:
+        case LastResult::EmergencyPreempted:
+        case LastResult::ExternalCallPreempted:
+        case LastResult::UnverifiedCallPreempted:
+        case LastResult::RecoveryHangupSkipped:
+        case LastResult::FailedRestore:
+        case LastResult::FailedAudio:
+        case LastResult::FailedCapture:
+        case LastResult::FailedEndCall:
+            break;
+        default:
+            return {};
+    }
+    return "END1 " + std::string(callUuid) + " " + std::string(bootUuid) + " " +
+        std::to_string(elapsedMs) + " " + ToString(result) + "\n";
+}
+
 }  // namespace ivrdroid::protocol

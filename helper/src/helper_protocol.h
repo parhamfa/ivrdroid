@@ -76,5 +76,12 @@ Command ParseCommand(std::string_view body);
 CommandRequest ParseCommandRequest(std::string_view body);
 const char* ToString(CurrentState state);
 const char* ToString(LastResult result);
+// Command/maintenance results have no call outcome, even while a call UUID is
+// still in scope during cleanup. An empty wire must never replace a saved END1.
+std::string FormatCallOutcome(
+    LastResult result,
+    std::string_view callUuid,
+    std::string_view bootUuid,
+    int64_t elapsedMs);
 
 }  // namespace ivrdroid::protocol

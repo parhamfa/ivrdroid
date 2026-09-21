@@ -73,6 +73,34 @@ int main() {
         std::string(ivrdroid::protocol::ToString(
             LastResult::UnverifiedCallPreempted)) ==
         "UNVERIFIED_CALL_PREEMPTED");
+    const std::string call = "13f6ea80-353e-46e3-a9c8-327aac21fa7c";
+    const std::string boot = "14f06e76-ee5d-47fc-bd2b-eb8ddcc6fbd3";
+    const auto outcome = [&](LastResult result) {
+        return ivrdroid::protocol::FormatCallOutcome(result, call, boot, 59058179);
+    };
+    const std::string callerHangup = "END1 " + call + " " + boot + " 59058179 REMOTE_HANGUP\n";
+    assert(outcome(LastResult::RemoteHangup) == callerHangup);
+    // Regression: cleanup rejected a queued command after the guardian had
+    // published REMOTE_HANGUP. Neither per-call nor shared END1 may be replaced.
+    for (const LastResult commandResult : {LastResult::RejectedBusy, LastResult::RejectedRequest,
+             LastResult::None, LastResult::RevisionStaged, LastResult::RevisionActivated,
+             LastResult::RevisionRejected, LastResult::IncompatibleDevice, LastResult::Stopped}) {
+        assert(outcome(commandResult).empty());
+    }
+    for (const LastResult callResult : {LastResult::SessionComplete, LastResult::RemoteHangup,
+             LastResult::MaxCallDuration, LastResult::RecoveredOperatorHangup,
+             LastResult::RecoveredAndEnded, LastResult::RecoveredAfterReboot,
+             LastResult::EmergencyPreempted, LastResult::ExternalCallPreempted,
+             LastResult::UnverifiedCallPreempted, LastResult::RecoveryHangupSkipped,
+             LastResult::FailedRestore, LastResult::FailedAudio, LastResult::FailedCapture,
+             LastResult::FailedEndCall}) {
+        assert(outcome(callResult) == "END1 " + call + " " + boot + " 59058179 " +
+            ivrdroid::protocol::ToString(callResult) + "\n");
+    }
+    assert(ivrdroid::protocol::FormatCallOutcome(LastResult::RemoteHangup, "-", boot, 1).empty());
+    assert(ivrdroid::protocol::FormatCallOutcome(LastResult::RemoteHangup, "", boot, 1).empty());
+    assert(outcome(static_cast<LastResult>(999)).empty());
+    assert(std::string(ivrdroid::protocol::ToString(LastResult::RejectedBusy)) == "REJECTED_BUSY");
     std::cout << "Helper protocol tests passed." << std::endl;
     return 0;
 }

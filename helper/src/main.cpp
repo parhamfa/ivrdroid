@@ -63,7 +63,7 @@ using ivrdroid::protocol::CurrentState;
 using ivrdroid::protocol::LastResult;
 
 constexpr char kLogTag[] = "IVRdroidHelper";
-constexpr char kHelperVersion[] = "0.10.2";
+constexpr char kHelperVersion[] = "0.10.3";
 #ifndef IVRDROID_SOURCE_COMMIT
 #define IVRDROID_SOURCE_COMMIT "unknown"
 #endif
@@ -683,10 +683,10 @@ void WriteLastResult(LastResult result) {
             ivrdroid::protocol::ToString(result))) {
         Log(ANDROID_LOG_ERROR, "Could not publish helper session result.");
     }
-    if (ivrdroid::call_control::IsCanonicalUuid(gSessionCallUuid) && result != LastResult::None &&
-        result != LastResult::RevisionStaged && result != LastResult::RevisionActivated && result != LastResult::RevisionRejected) {
+    const std::string wire = ivrdroid::protocol::FormatCallOutcome(
+        result, gSessionCallUuid, gBootId, MonotonicMilliseconds());
+    if (!wire.empty()) {
         const std::string path = std::string(kBridgeDir) + "/call-outcome";
-        const std::string wire = "END1 " + gSessionCallUuid + " " + gBootId + " " + std::to_string(MonotonicMilliseconds()) + " " + ivrdroid::protocol::ToString(result) + "\n";
         WriteBridgeWire(path.c_str(), (path + ".tmp").c_str(), wire);
         const std::string own = std::string(kBridgeDir) + "/call-results/" + gSessionCallUuid + ".outcome";
         WriteBridgeWire(own.c_str(), (own + ".tmp").c_str(), wire);

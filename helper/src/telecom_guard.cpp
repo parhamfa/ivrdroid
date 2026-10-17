@@ -315,4 +315,10 @@ bool ParseNativeCallSnapshot(std::string_view wire, std::string_view expectedBoo
     *snapshot = std::move(result); return true;
 }
 
+bool IsOnlyRingingCaller(const TelecomCallSnapshot& snapshot, std::string_view caller) {
+    if (!snapshot.parsed || snapshot.emergencyCallPresent || snapshot.liveCallCount != 1 || snapshot.calls.size() != 1) return false;
+    const auto& call = snapshot.calls.front();
+    return call.id == caller && call.state == "RINGING" && call.children == 0 && call.parentKnown && !call.hasParent;
+}
+
 }  // namespace ivrdroid

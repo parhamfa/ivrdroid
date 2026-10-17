@@ -9,7 +9,10 @@ import java.util.concurrent.TimeUnit
 /** Audit work never invokes the operator coordinator or its required-recording failure callback. */
 class SessionAuditHandoffWorker(context: Context) {
     private val application = context.applicationContext
-    private val executor = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "ivrdroid-session-audit") }
+    private val executor = Executors.newSingleThreadScheduledExecutor { task -> Thread({
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+        task.run()
+    }, "ivrdroid-session-audit") }
     private val wakeLock = (application.getSystemService(Context.POWER_SERVICE) as PowerManager)
         .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "IVRdroid:session-audit").apply { setReferenceCounted(false) }
     @Volatile private var stopAt = Long.MAX_VALUE

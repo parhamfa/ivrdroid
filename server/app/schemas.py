@@ -627,7 +627,7 @@ class RevisionAckRequest(StrictModel):
 
 
 class ExternalCallSubEvent(StrictModel):
-    event: Literal["external_call"]
+    event: Literal["external_call", "recording_failure"]
     occurred_at: datetime
     status: Literal[
         "ACK",
@@ -660,7 +660,7 @@ class LegacyCallSubEvent(StrictModel):
     @field_validator("event")
     @classmethod
     def contains_no_phone_number(cls, value: str) -> str:
-        if value == "external_call":
+        if value in {"external_call", "recording_failure"}:
             raise ValueError("external_call events require the strict external-call schema")
         if len("".join(character for character in value if character.isdigit())) >= 8:
             raise ValueError("legacy call-event labels cannot contain phone numbers")
@@ -714,7 +714,27 @@ class CallEventInput(StrictModel):
     menu_path: list[Annotated[str, Field(max_length=160)]] = Field(default_factory=list, max_length=64)
     result: str = Field(min_length=1, max_length=64)
     duration_seconds: int = Field(default=0, ge=0, le=86400)
+    ended_at: datetime | None = None
+    cleanup_status: Literal["pending", "complete", "recovered", "failed", "unknown"] | None = None
     events: list[CallSubEvent] = Field(default_factory=list, max_length=128)
+
+    @model_validator(mode="after")
+    def disconnect_order(self):
+        if self.ended_at is not None:
+            if self.started_at.tzinfo is None or self.ended_at.tzinfo is None:
+                raise ValueError("Disconnect evidence requires explicit timezones")
+            if self.ended_at < self.started_at or self.result == "IN_PROGRESS":
+                raise ValueError("Disconnect time must follow a finished call's start")
+        return self
+
+
+class CallSubEventBatchItem(StrictModel):
+    call_id: str = Field(min_length=8, max_length=80)
+    events: list[CallSubEvent] = Field(default_factory=list, max_length=128)
+
+
+class CallSubEventBatchRequest(StrictModel):
+    calls: list[CallSubEventBatchItem] = Field(default_factory=list, max_length=100)
 
 
 class EventBatchRequest(StrictModel):
@@ -746,9 +766,12 @@ class CallResponse(StrictModel):
     menu_path: list[str]
     result: str
     duration_seconds: int
+    ended_at: datetime | None = None
+    cleanup_status: str | None = None
     events: list[dict]
     recording_count: int = 0
     pending_recording_count: int = 0
+    pending_session_audio_count: int = 0
 
 
 class RecordingCreateRequest(StrictModel):

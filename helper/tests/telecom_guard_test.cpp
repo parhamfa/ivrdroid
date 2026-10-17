@@ -45,6 +45,21 @@ int main() {
         CallDisposition::Multiple);
     assert(!ivrdroid::CanForceEndSingleCall(two));
 
+    auto pending = one;
+    pending.calls.front().state = "RINGING";
+    pending.calls.front().children = 0;
+    pending.calls.front().parentKnown = true;
+    pending.calls.front().hasParent = false;
+    assert(ivrdroid::IsOnlyRingingCaller(pending, "TC@12"));
+    assert(!ivrdroid::IsOnlyRingingCaller(pending, "TC@13"));
+    assert(!ivrdroid::IsOnlyRingingCaller(two, "TC@13"));
+    pending.emergencyCallPresent = true;
+    assert(!ivrdroid::IsOnlyRingingCaller(pending, "TC@12"));
+    pending.emergencyCallPresent = false; pending.calls.front().parentKnown = false;
+    assert(!ivrdroid::IsOnlyRingingCaller(pending, "TC@12"));
+    pending.calls.front().parentKnown = true; pending.calls.front().state = "ACTIVE";
+    assert(!ivrdroid::IsOnlyRingingCaller(pending, "TC@12"));
+
     const auto emergency = ivrdroid::ParseTelecomCallSnapshot(
         "CallsManager:\n"
         "  mCalls:\n"

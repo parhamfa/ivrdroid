@@ -37,6 +37,9 @@ object RootAudioTrigger {
             val recordings = File(directory, "recordings")
             if (!recordings.isDirectory && !recordings.mkdirs()) return false
             Os.chmod(recordings.absolutePath, 0b111000000)
+            val failures = File(directory, "recording-failures")
+            if (!failures.isDirectory && !failures.mkdirs()) return false
+            Os.chmod(failures.absolutePath, 0b111000000)
 
             ensurePrivateFile(
                 File(directory, STATUS_NAME),
@@ -63,13 +66,24 @@ object RootAudioTrigger {
                 // Provision every V2 output before local recovery waits for its contents.
                 // UNAVAILABLE cannot be mistaken for native readiness or a policy ack.
                 listOf(
-                    "native-calls", "call-safety-protocol", "call-safety-state",
+                    "native-calls", "incoming-caller", "call-safety-protocol", "call-safety-state",
                     "call-lifetime", "call-outcome", "call_control.attached",
                     "conversation_capture_failure.json", "conversation_finalizer_failure.json",
                 ).all { ensurePrivateFile(File(directory, it), "UNAVAILABLE") }
         } catch (error: Exception) {
             Log.e(TAG, "Could not initialize the private helper bridge.", error)
             false
+        }
+    }
+
+    @Synchronized
+    fun prepareCallBridge(context: Context, callId: String): Boolean {
+        require(java.util.UUID.fromString(callId).toString() == callId)
+        val directory = File(bridgeDirectory(context), "call-results")
+        if (!directory.isDirectory && !directory.mkdirs()) return false
+        Os.chmod(directory.absolutePath, 0b111000000)
+        return listOf("outcome", "released", "path").all {
+            ensurePrivateFile(File(directory, "$callId.$it"), "UNAVAILABLE")
         }
     }
 
@@ -136,7 +150,7 @@ object RootAudioTrigger {
         }
         val directory = bridgeDirectory(context)
         val capabilities = HelperCapabilityProtocol.parse(
-            readBoundedFile(File(directory, CAPABILITIES_NAME)),
+            readBoundedFile(File(directory, CAPABILITIES_NAME), 512),
         )
         return HelperBridgeState(
             current = readBoundedFile(File(directory, STATUS_NAME)),
@@ -155,6 +169,7 @@ object RootAudioTrigger {
             conversationRecordingCapable = capabilities.conversationRecordingCapable,
             promptBargeInCapable = capabilities.promptBargeInCapable,
             sessionAuditCapable = capabilities.sessionAuditCapable,
+            callAdmissionCapable = capabilities.callAdmissionCapable,
         )
     }
 

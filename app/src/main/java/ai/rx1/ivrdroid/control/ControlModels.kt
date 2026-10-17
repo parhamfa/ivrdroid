@@ -25,6 +25,10 @@ data class PendingCallEvent(
     val sessionAudit: JSONObject? = null,
     val auditPolicyVersion: Long? = null,
     val auditQuotaBytes: Long? = null,
+    val endedAt: String? = null,
+    val cleanupStatus: String? = null,
+    val generation: Long = 0,
+
 )
 
 data class PendingCallSubEvent(
@@ -32,8 +36,10 @@ data class PendingCallSubEvent(
     val status: String,
     val blockId: String,
     val reason: String,
+    val eventType: String = "external_call",
 ) {
     init {
+        require(eventType in setOf("external_call", "recording_failure"))
         Instant.parse(occurredAt)
         require(status.matches(Regex("[A-Z][A-Z0-9_]{0,63}")))
         require(blockId.matches(Regex("[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")))
@@ -45,7 +51,7 @@ object CallEventPayload {
     fun preserveEvents(previous: PendingCallEvent, replacement: PendingCallEvent): PendingCallEvent {
         require(previous.callId == replacement.callId)
         return replacement.copy(
-            events = replacement.events.ifEmpty { previous.events },
+            events = (previous.events + replacement.events).distinct().takeLast(128),
             sessionAudit = replacement.sessionAudit ?: previous.sessionAudit,
             auditPolicyVersion = previous.auditPolicyVersion ?: replacement.auditPolicyVersion,
             auditQuotaBytes = previous.auditQuotaBytes ?: replacement.auditQuotaBytes,
@@ -61,6 +67,8 @@ object CallEventPayload {
         .put("menu_path", JSONArray(event.menuPath))
         .put("result", event.result)
         .put("duration_seconds", event.durationSeconds)
+        .put("ended_at", event.endedAt ?: JSONObject.NULL)
+        .put("cleanup_status", event.cleanupStatus ?: JSONObject.NULL)
         .put("events", encodeEvents(event.events))
         .put("session_audit", event.sessionAudit ?: JSONObject.NULL)
 
@@ -75,14 +83,16 @@ object CallEventPayload {
         durationSeconds = item.optInt("duration_seconds", 0),
         events = decodeEvents(item.optJSONArray("events")),
         sessionAudit = item.optJSONObject("session_audit"),
+        endedAt = item.optString("ended_at").takeUnless { it.isEmpty() || it == "null" },
+        cleanupStatus = item.optString("cleanup_status").takeUnless { it.isEmpty() || it == "null" },
     )
 
     fun encodeEvents(events: List<PendingCallSubEvent>): JSONArray = JSONArray().also { array ->
-        require(events.size <= 128)
+        require(events.size <= 4096)
         events.forEach { event ->
             array.put(
                 JSONObject()
-                    .put("event", "external_call")
+                    .put("event", event.eventType)
                     .put("occurred_at", event.occurredAt)
                     .put("status", event.status)
                     .put("block_id", event.blockId)
@@ -93,17 +103,18 @@ object CallEventPayload {
 
     fun decodeEvents(array: JSONArray?): List<PendingCallSubEvent> {
         if (array == null) return emptyList()
-        require(array.length() <= 128)
+        require(array.length() <= 4096)
         return buildList {
             for (index in 0 until array.length()) {
                 val event = array.getJSONObject(index)
-                require(event.getString("event") == "external_call")
+                require(event.getString("event") in setOf("external_call", "recording_failure"))
                 add(
                     PendingCallSubEvent(
                         event.getString("occurred_at"),
                         event.getString("status"),
                         event.getString("block_id"),
                         event.getString("reason"),
+                        event.getString("event"),
                     ),
                 )
             }

@@ -19,6 +19,7 @@ object SecureControlStore {
     private const val KEY_ENROLLMENT = "enrollment"
     private const val KEY_ACTIVE_MANIFEST = "active_manifest"
     private const val KEY_EVENTS = "pending_events"
+    private const val KEY_SUBEVENTS = "pending_call_subevents"
     private const val KEY_LAST_SYNC = "last_sync"
     private const val KEY_LAST_ERROR = "last_error"
 
@@ -72,28 +73,44 @@ object SecureControlStore {
         val events = readEvents(context)
         val existing = events.indexOfFirst { it.callId == event.callId }
         if (existing >= 0) {
-            events[existing] = CallEventPayload.preserveEvents(events[existing], event)
-        } else events.add(event)
+            events[existing] = CallEventPayload.preserveEvents(events[existing], event).copy(generation = events[existing].generation + 1)
+        } else events.add(event.copy(generation = 1))
         writeEvents(context, events)
     }
 
     @Synchronized
     fun appendCallEvent(context: Context, callId: String, event: PendingCallSubEvent) {
-        val calls = readEvents(context)
-        val index = calls.indexOfFirst { it.callId == callId }
-        if (index < 0) return
-        val bounded = (calls[index].events + event).distinct().takeLast(128)
-        calls[index] = calls[index].copy(events = bounded)
-        writeEvents(context, calls)
+        // Independent durable journal: a parent snapshot can already be acknowledged.
+        val journal = readSubEvents(context)
+        val previous = CallEventPayload.decodeEvents(journal.optJSONArray(callId))
+        journal.put(callId, CallEventPayload.encodeEvents((previous + event).distinct()))
+        encrypt(context, KEY_SUBEVENTS, journal.toString())
     }
+
+    @Synchronized
+    fun pendingCallEvents(context: Context): Map<String, List<PendingCallSubEvent>> {
+        val journal = readSubEvents(context)
+        return journal.keys().asSequence().associateWith { CallEventPayload.decodeEvents(journal.getJSONArray(it)).take(128) }
+    }
+
+    @Synchronized
+    fun acknowledgeCallEvents(context: Context, submitted: Map<String, List<PendingCallSubEvent>>, accepted: Set<String>) {
+        val journal = readSubEvents(context)
+        submitted.filterKeys { it in accepted }.forEach { (id, events) ->
+            val remaining = CallEventPayload.decodeEvents(journal.optJSONArray(id)).filterNot { it in events }
+            if (remaining.isEmpty()) journal.remove(id) else journal.put(id, CallEventPayload.encodeEvents(remaining))
+        }
+        encrypt(context, KEY_SUBEVENTS, journal.toString())
+    }
+
+    private fun readSubEvents(context: Context) = decrypt(context, KEY_SUBEVENTS)?.let(::JSONObject) ?: JSONObject()
 
     @Synchronized
     fun pendingCalls(context: Context): List<PendingCallEvent> = readEvents(context)
 
     @Synchronized
-    fun acknowledgeCalls(context: Context, accepted: Set<String>) {
-        if (accepted.isEmpty()) return
-        writeEvents(context, readEvents(context).filterNot { accepted.contains(it.callId) })
+    fun acknowledgeCalls(context: Context, submitted: List<PendingCallEvent>, accepted: Set<String>) {
+        writeEvents(context, CallOutboxPolicy.afterAcknowledgement(readEvents(context), submitted, accepted))
     }
 
     @Synchronized
@@ -134,6 +151,9 @@ object SecureControlStore {
                             result = item.getString("result"),
                             durationSeconds = item.optInt("duration_seconds", 0),
                             events = CallEventPayload.decodeEvents(item.optJSONArray("events")),
+                            endedAt = item.optString("ended_at").takeUnless { it.isEmpty() || it == "null" },
+                            cleanupStatus = item.optString("cleanup_status").takeUnless { it.isEmpty() || it == "null" },
+                            generation = item.optLong("_generation", 0),
                             sessionAudit = item.optJSONObject("session_audit"),
                             auditPolicyVersion = item.optLong("_audit_policy_version", 0).takeIf { it > 0 },
                             auditQuotaBytes = item.optLong("_audit_quota_bytes", 0).takeIf { it > 0 },
@@ -148,6 +168,7 @@ object SecureControlStore {
         val array = JSONArray()
         events.forEach { event ->
             array.put(CallEventPayload.encode(event).put("caller", event.caller ?: "")
+                .put("_generation", event.generation)
                 .put("_audit_policy_version", event.auditPolicyVersion ?: JSONObject.NULL)
                 .put("_audit_quota_bytes", event.auditQuotaBytes ?: JSONObject.NULL))
         }
@@ -180,9 +201,9 @@ object SecureControlStore {
         cipher.updateAAD(key.toByteArray(Charsets.UTF_8))
         val encrypted = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
         val payload = cipher.iv + encrypted
-        preferences(context).edit()
+        check(preferences(context).edit()
             .putString(key, Base64.encodeToString(payload, Base64.NO_WRAP))
-            .apply()
+            .commit()) { "Encrypted control journal could not be persisted." }
     }
 
     private fun decrypt(context: Context, key: String): String? {
@@ -195,7 +216,7 @@ object SecureControlStore {
             cipher.updateAAD(key.toByteArray(Charsets.UTF_8))
             String(cipher.doFinal(payload.copyOfRange(12, payload.size)), Charsets.UTF_8)
         }.getOrElse {
-            preferences(context).edit().remove(key).apply()
+            if (key == KEY_EVENTS || key == KEY_SUBEVENTS) throw IllegalStateException("Outbox unreadable; preserved for recovery.", it)
             null
         }
     }

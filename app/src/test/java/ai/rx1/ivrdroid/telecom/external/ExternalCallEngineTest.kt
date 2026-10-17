@@ -570,6 +570,105 @@ class ExternalCallEngineTest {
     }
 
     @Test
+    fun conferenceParentAnnouncedBeforeItsChildrenCompletesTheMerge() {
+        val fixture = Fixture()
+        fixture.beginMerge()
+
+        // Android 12 Telecom adds the parent first, then links each child in later updates.
+        fixture.telecom.calls.add(conferenceParent())
+        fixture.engine.reconcile(2_150)
+        fixture.telecom.update("conference") { copy(childIds = listOf("operator")) }
+        fixture.engine.reconcile(2_160)
+        assertEquals(ExternalCallPhase.MERGING, fixture.engine.snapshot()?.phase)
+
+        fixture.telecom.update("conference") { copy(childIds = listOf("operator", "caller")) }
+        fixture.telecom.conference = "conference"
+        fixture.engine.reconcile(2_200)
+
+        assertEquals(ExternalCallPhase.CONFERENCED, fixture.engine.snapshot()?.phase)
+        assertEquals("conference", fixture.engine.snapshot()?.conferenceId)
+        assertEquals(0, fixture.telecom.actionCount("disconnect:operator"))
+        assertFalse(fixture.observer.statuses.any { it.first == CallControlStatus.SYSTEM_FAILURE })
+        assertTrue(fixture.observer.rejections.isEmpty())
+    }
+
+    @Test
+    fun unlinkedConferenceParentIsStillBoundedByTheMergeWatchdog() {
+        val fixture = Fixture()
+        fixture.beginMerge()
+        fixture.telecom.calls.add(conferenceParent())
+
+        fixture.engine.reconcile(12_099)
+        assertEquals(ExternalCallPhase.MERGING, fixture.engine.snapshot()?.phase)
+        fixture.engine.reconcile(12_100)
+
+        assertEquals(ExternalCallPhase.CLEANUP_SYSTEM_FAILURE, fixture.engine.snapshot()?.phase)
+        assertEquals("MERGE_TIMEOUT", fixture.engine.snapshot()?.reason)
+        assertTrue("disconnect:operator" in fixture.telecom.actions)
+        assertFalse("disconnect:conference" in fixture.telecom.actions)
+    }
+
+    @Test
+    fun conferenceParentWithAForeignChildFailsClosedWithoutMutatingIt() {
+        val fixture = Fixture()
+        fixture.beginMerge()
+        fixture.telecom.calls.add(conferenceParent("caller", "stranger"))
+
+        fixture.engine.reconcile(2_150)
+
+        assertEquals(ExternalCallPhase.CLEANUP_SYSTEM_FAILURE, fixture.engine.snapshot()?.phase)
+        assertEquals("UNEXPECTED_CALL_TOPOLOGY", fixture.engine.snapshot()?.reason)
+        assertFalse("disconnect:conference" in fixture.telecom.actions)
+        assertEquals(listOf("UNEXPECTED_CALL_TOPOLOGY"), fixture.observer.rejections)
+    }
+
+    @Test
+    fun twoUnlinkedConferenceParentsFailClosed() {
+        val fixture = Fixture()
+        fixture.beginMerge()
+        fixture.telecom.calls.add(conferenceParent())
+        fixture.telecom.calls.add(conferenceParent().copy(id = "conference-2"))
+
+        fixture.engine.reconcile(2_150)
+
+        assertEquals(ExternalCallPhase.CLEANUP_SYSTEM_FAILURE, fixture.engine.snapshot()?.phase)
+        assertEquals("UNEXPECTED_CALL_TOPOLOGY", fixture.engine.snapshot()?.reason)
+    }
+
+    @Test
+    fun conferenceParentBeforeAnyMergeRequestFailsClosed() {
+        val fixture = Fixture()
+        fixture.beginAndDial()
+        fixture.telecom.addOperator(TelecomCallState.DIALING)
+        fixture.engine.reconcile(2_000)
+        fixture.telecom.calls.add(conferenceParent())
+
+        fixture.engine.reconcile(2_100)
+
+        assertEquals(ExternalCallPhase.CLEANUP_SYSTEM_FAILURE, fixture.engine.snapshot()?.phase)
+        assertEquals("UNEXPECTED_CALL_TOPOLOGY", fixture.engine.snapshot()?.reason)
+    }
+
+    @Test
+    fun topologyDiagnosticsNameRolesWithoutNumbersOrSessionIdentity() {
+        val fixture = Fixture()
+        fixture.beginMerge()
+        fixture.telecom.calls.add(conferenceParent("operator"))
+
+        val description = ExternalCallTopologyLog.describe(
+            requireNotNull(fixture.engine.snapshot()),
+            fixture.telecom.calls(),
+        )
+
+        assertTrue("caller:HOLDING:INCOMING" in description)
+        assertTrue("operator:ACTIVE:OUTGOING" in description)
+        assertTrue("other:ACTIVE:UNKNOWN:conference=true:children=[operator]" in description)
+        assertFalse(config.phoneNumber in description)
+        assertFalse("+982100000000" in description)
+        assertFalse(sessionId in description)
+    }
+
+    @Test
     fun recoveryJournalRoundTripsAndRejectsCorruption() {
         val directory = Files.createTempDirectory("ivrdroid-external-call-test").toFile()
         val journal = ExternalCallJournal(directory.resolve("recovery.json"))
@@ -622,18 +721,47 @@ class ExternalCallEngineTest {
             engine.reconcile(1_100)
             assertTrue("place:${config.phoneNumber}:$sessionId:caller" in telecom.actions)
         }
+
+        fun beginMerge() {
+            beginAndDial()
+            telecom.addOperator(TelecomCallState.ACTIVE)
+            engine.reconcile(2_000)
+            engine.recorderReady(2_100)
+            assertEquals(ExternalCallPhase.MERGING, engine.snapshot()?.phase)
+        }
     }
+
+    /** A Telecom conference parent: handle-less, so the app conservatively marks it emergency. */
+    private fun conferenceParent(vararg children: String) = TelecomCallSnapshot(
+        "conference",
+        TelecomCallDirection.UNKNOWN,
+        TelecomCallState.ACTIVE,
+        null,
+        null,
+        emergency = true,
+        canHold = false,
+        conference = true,
+        childIds = children.toList(),
+    )
 
     private class FakeObserver : ExternalCallObserver {
         val statuses = mutableListOf<Pair<CallControlStatus, String>>()
         val statusSnapshots = mutableListOf<ExternalCallSessionSnapshot>()
         val snapshots = mutableListOf<ExternalCallSessionSnapshot>()
+        val rejections = mutableListOf<String>()
         override fun onStatus(status: CallControlStatus, reason: String, snapshot: ExternalCallSessionSnapshot) {
             statuses += status to reason
             statusSnapshots += snapshot
         }
         override fun onSnapshot(snapshot: ExternalCallSessionSnapshot) {
             snapshots += snapshot
+        }
+        override fun onTopologyRejected(
+            reason: String,
+            snapshot: ExternalCallSessionSnapshot,
+            calls: List<TelecomCallSnapshot>,
+        ) {
+            rejections += reason
         }
     }
 

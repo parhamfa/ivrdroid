@@ -54,6 +54,40 @@ int main(int argc, char** argv) {
     using ivrdroid::ExternalCallStage;
     using ivrdroid::call_control::StatusKind;
 
+    // A caller may leave at every pre-conference stage. Replaying the exact
+    // terminal status also satisfies a teardown that started after it arrived.
+    for (int phase = 0; phase < 7; ++phase) {
+        auto early = Policy();
+        uint64_t sequence = 0;
+        if (phase >= 1) early.Observe(Status(StatusKind::Ack, ++sequence), 1100);
+        if (phase >= 2) early.Observe(Status(StatusKind::CallerHeld, ++sequence), 1150);
+        if (phase >= 3) early.Observe(Status(StatusKind::Dialing, ++sequence), 1200);
+        if (phase >= 4) {
+            early.Observe(Status(StatusKind::OperatorAnswered, ++sequence), 1250);
+            assert(early.MarkRecorderReady(1260));
+        }
+        if (phase >= 5) early.Observe(Status(StatusKind::Merging, ++sequence), 1300);
+        if (phase >= 6) early.Observe(Status(StatusKind::Conferenced, ++sequence), 1350);
+        auto end = Status(StatusKind::Completed, ++sequence, 1400, "CALLER_HANGUP");
+        assert(early.Observe(end, 1400) == ExternalCallDecision::CallerHangup);
+        assert(early.Observe(end, 1401) == ExternalCallDecision::Duplicate);
+        auto repeated = end; repeated.sequence++; repeated.elapsedMilliseconds++;
+        assert(early.Observe(repeated, 1402) == ExternalCallDecision::Duplicate);
+        assert(early.Observe(Status(StatusKind::Dialing, 1), 1403) == ExternalCallDecision::Duplicate);
+        ivrdroid::ExternalCallTeardownPolicy teardown(kSession, 17, kBlock, kBoot,
+            early.lastSequence(), early.lastElapsedMilliseconds(), early.lastKind(), early.lastReason(),
+            {StatusKind::Completed, "CALLER_HANGUP"});
+        assert(teardown.Observe(end) == ivrdroid::ExternalCallTeardownDecision::MatchedTerminal);
+        assert(teardown.Observe(repeated) == ivrdroid::ExternalCallTeardownDecision::Duplicate);
+        ivrdroid::ExternalCallTeardownPolicy cancelRaced(kSession, 17, kBlock, kBoot,
+            early.lastSequence(), early.lastElapsedMilliseconds(), early.lastKind(), early.lastReason(),
+            {StatusKind::SystemFailure, "HELPER_CANCELLED"});
+        assert(cancelRaced.Observe(end) == ivrdroid::ExternalCallTeardownDecision::MatchedTerminal);
+    }
+    auto prematureOperator = Policy();
+    assert(prematureOperator.Observe(Status(StatusKind::Completed, 1, 1100, "OPERATOR_HANGUP"), 1100)
+        == ExternalCallDecision::ProtocolFailure);
+
     auto call = Policy();
     assert(call.Observe(Status(StatusKind::Ack, 1), 1'100) ==
         ExternalCallDecision::DialingHeartbeat);
@@ -83,6 +117,8 @@ int main(int argc, char** argv) {
     assert(completed.Observe(Status(
         StatusKind::Completed, 4, 300, "OPERATOR_HANGUP"), 1'400) ==
         ExternalCallDecision::Completed);
+    assert(completed.Observe(Status(StatusKind::Completed, 5, 310, "CALLER_HANGUP"), 1'410) ==
+        ExternalCallDecision::Duplicate);
 
     auto callerEnded = Policy();
     assert(callerEnded.Observe(Status(StatusKind::OperatorAnswered, 1), 1'100) ==
@@ -95,6 +131,8 @@ int main(int argc, char** argv) {
     assert(callerEnded.Observe(Status(
         StatusKind::Completed, 4, 300, "CALLER_HANGUP"), 1'400) ==
         ExternalCallDecision::CallerHangup);
+    assert(callerEnded.Observe(Status(StatusKind::Completed, 5, 310, "OPERATOR_HANGUP"), 1'410) ==
+        ExternalCallDecision::Duplicate);
 
     auto answeredDeadline = Policy();
     assert(answeredDeadline.Observe(Status(StatusKind::Dialing, 1), 1'500) ==

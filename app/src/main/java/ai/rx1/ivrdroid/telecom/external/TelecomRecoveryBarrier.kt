@@ -25,6 +25,14 @@ data class NativeCallSnapshot(val boot: String, val session: String, val elapsed
 
 enum class TelecomReadiness { WAITING_NATIVE, WAITING_CALLBACKS, WAITING_HANDSHAKE, SETTLING, READY, EMERGENCY }
 
+/** Caller/native agreement must also pass TelecomRecoveryBarrier before retirement. */
+fun canRetireReleasedController(old: ExternalCallSessionSnapshot, calls: List<TelecomCallSnapshot>,
+    stillLocallyOwned: Boolean, helperIdle: Boolean, nativeOwnsCurrentSession: Boolean): Boolean {
+    val oldIds = setOfNotNull(old.callerId, old.operatorId, old.conferenceId)
+    return !stillLocallyOwned && (helperIdle || nativeOwnsCurrentSession) &&
+        calls.none { it.ownerSessionId == old.config.sessionId || it.id in oldIds }
+}
+
 class TelecomRecoveryBarrier(private val settleMs: Long = 500, private val maximumAgeMs: Long = 2000) {
     private var fingerprint: String? = null
     private var settledSince = 0L
@@ -55,7 +63,10 @@ class TelecomRecoveryBarrier(private val settleMs: Long = 500, private val maxim
             fingerprint = current; settledSince = now; firstSequence = native.sequence
             return TelecomReadiness.SETTLING
         }
-        return if (now - settledSince >= settleMs && native.sequence > firstSequence) TelecomReadiness.READY else TelecomReadiness.SETTLING
+        // Observer sequence numbers restart with the helper. Fresh boot-scoped
+        // time and a distinct observation are required, not an ever-growing PID counter.
+        return if (now - settledSince >= settleMs && native.sequence != firstSequence && native.elapsedMs > settledSince)
+            TelecomReadiness.READY else TelecomReadiness.SETTLING
     }
     private fun normalize(state: String): String = when (state) {
         "ON_HOLD" -> "HOLDING"

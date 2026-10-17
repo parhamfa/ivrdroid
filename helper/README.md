@@ -4,6 +4,12 @@ This helper is intentionally device-specific. It refuses to serve unless the And
 audio controls, root-owned prompts, app bridge ownership, and audited ROM match the pinned
 Samsung SM-T585 profile.
 
+Helper 0.10.3 keeps command results such as `REJECTED_BUSY` in `last_result` and
+publishes only call outcomes to `call-outcome` and `call-results/<uuid>.outcome`.
+Discarding a queued request during cleanup cannot overwrite the finished call's
+`REMOTE_HANGUP` or other terminal result. The `END1` wire format and the 0.10.2 app
+and server contract are unchanged; this patch can be deployed to the helper alone.
+
 For a UUID-correlated `START_MENU` request it:
 
 1. claims the request while Telecom still exposes one ringing non-emergency call;

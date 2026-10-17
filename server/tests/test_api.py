@@ -842,7 +842,7 @@ def test_pairing_enrollment_sync_ack_and_encrypted_call(client):
     assert calls[0]["menu_path"] == ["prompt", "end"]
     assert calls[0]["result"] == "SESSION_COMPLETE"
     assert calls[0]["duration_seconds"] == 4
-    assert calls[0]["events"] == [external_subevent]
+    assert calls[0]["events"] == [{"event": "Incoming call"}, external_subevent]
     with client.app.state.database.session() as session:
         stored = session.get(CallRecord, "call-12345678")
         assert caller not in stored.caller_encrypted

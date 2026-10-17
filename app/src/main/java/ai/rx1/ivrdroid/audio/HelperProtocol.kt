@@ -14,6 +14,7 @@ data class HelperBridgeState(
     val conversationRecordingCapable: Boolean = false,
     val promptBargeInCapable: Boolean = false,
     val sessionAuditCapable: Boolean = false,
+    val callAdmissionCapable: Boolean = false,
 ) {
     val isIdle: Boolean
         get() = current == HelperProtocol.READY
@@ -32,6 +33,7 @@ data class HelperCapabilities(
     val conversationRecordingCapable: Boolean,
     val promptBargeInCapable: Boolean,
     val sessionAuditCapable: Boolean = false,
+    val callAdmissionCapable: Boolean = false,
 )
 
 object HelperCapabilityProtocol {
@@ -50,6 +52,7 @@ object HelperCapabilityProtocol {
             conversationRecordingCapable = values.contains("conversation_recording=1"),
             promptBargeInCapable = values.contains("prompt_barge_in=1"),
             sessionAuditCapable = values.contains("session_audit=1"),
+            callAdmissionCapable = values.contains("call_admission=1") && values.contains("capture_receipt=2"),
         )
     }
 }

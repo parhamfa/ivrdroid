@@ -921,6 +921,12 @@ def reconcile_recording_storage(session: Session, settings: Settings) -> None:
     ensure_recording_directories(settings)
     changed_root = False
     for path in settings.recording_root.iterdir():
+        if path.name == ".processing":
+            state = path.lstat()
+            if not stat.S_ISDIR(state.st_mode) or state.st_uid != os.getuid() or state.st_mode & 0o077:
+                raise RecordingError("Recording processing directory is unsafe.", 503)
+            # Only the worker holding its processing lock may remove job remnants.
+            continue
         if path.name == ".uploads" or path.name.startswith(".delete-"):
             continue
         if path.name.startswith((".media-", ".playback-")):

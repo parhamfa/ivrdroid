@@ -16,7 +16,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 class SyncService : Service() {
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor = Executors.newSingleThreadExecutor { task -> Thread({
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+        task.run()
+    }, "ivrdroid-sync") }
     private val running = AtomicBoolean(false)
     private val handler by lazy { android.os.Handler(mainLooper) }
     private val syncRunnable = Runnable { runSync() }

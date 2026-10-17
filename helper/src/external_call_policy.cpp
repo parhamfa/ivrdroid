@@ -88,9 +88,13 @@ ExternalCallDecision ExternalCallPolicy::Observe(
     const call_control::Status& status,
     int64_t nowMilliseconds) {
     using call_control::StatusKind;
-    if (terminal()) return ExternalCallDecision::ProtocolFailure;
     if (status.kind == StatusKind::Invalid || !Correlates(status)) {
         return ExternalCallDecision::IgnoredForeign;
+    }
+    if (terminal()) {
+        // Ended attempts do not reopen because callbacks or a terminal heartbeat
+        // arrive late. Correlation above still rejects a different session.
+        return ExternalCallDecision::Duplicate;
     }
     if (nowMilliseconds >= heartbeatDeadlineMilliseconds_ && !(stage_ == ExternalCallStage::Conferenced &&
         independentConferenceAt_ >= 0 && nowMilliseconds >= independentConferenceAt_ && nowMilliseconds - independentConferenceAt_ <= 2000)) {
@@ -163,13 +167,16 @@ ExternalCallDecision ExternalCallPolicy::Observe(
             stage_ = ExternalCallStage::Conferenced;
             return ExternalCallDecision::Conferenced;
         case StatusKind::Completed:
+            // The caller may leave before the operator answers. Android publishes
+            // this completion only after removing the owned operator/conference.
+            if (status.reason == "CALLER_HANGUP") {
+                stage_ = ExternalCallStage::Terminal;
+                return ExternalCallDecision::CallerHangup;
+            }
             if (stage_ != ExternalCallStage::Conferenced) return FailProtocol();
             stage_ = ExternalCallStage::Terminal;
             if (status.reason == "OPERATOR_HANGUP") {
                 return ExternalCallDecision::Completed;
-            }
-            if (status.reason == "CALLER_HANGUP") {
-                return ExternalCallDecision::CallerHangup;
             }
             return ExternalCallDecision::ProtocolFailure;
         case StatusKind::NotConnected:
@@ -236,7 +243,7 @@ bool ExternalCallTeardownPolicy::IsExactDuplicate(
 
 ExternalCallTeardownDecision ExternalCallTeardownPolicy::Observe(
     const call_control::Status& status) {
-    if (terminal_ || !IsTerminalStatus(expectation_.kind) ||
+    if (!IsTerminalStatus(expectation_.kind) ||
         expectation_.reason.empty() ||
         !call_control::IsReason(expectation_.reason) ||
         expectation_.reason == "-") {
@@ -245,10 +252,16 @@ ExternalCallTeardownDecision ExternalCallTeardownPolicy::Observe(
     if (!Correlates(status)) {
         return ExternalCallTeardownDecision::IgnoredForeign;
     }
+    if (terminal_) return (status.kind == lastKind_ && status.reason == lastReason_)
+        ? ExternalCallTeardownDecision::Duplicate : ExternalCallTeardownDecision::IgnoredForeign;
+    const bool callerEnded = status.kind == call_control::StatusKind::Completed && status.reason == "CALLER_HANGUP";
     if (status.sequence == lastSequence_ && lastSequence_ != 0) {
-        return IsExactDuplicate(status)
-            ? ExternalCallTeardownDecision::Duplicate
-            : ExternalCallTeardownDecision::ProtocolFailure;
+        if (!IsExactDuplicate(status)) return ExternalCallTeardownDecision::ProtocolFailure;
+        if (callerEnded || (status.kind == expectation_.kind && status.reason == expectation_.reason)) {
+            terminal_ = true;
+            return ExternalCallTeardownDecision::MatchedTerminal;
+        }
+        return ExternalCallTeardownDecision::Duplicate;
     }
     if (status.sequence <= lastSequence_ ||
         status.elapsedMilliseconds < lastElapsedMilliseconds_) {
@@ -266,8 +279,8 @@ ExternalCallTeardownDecision ExternalCallTeardownPolicy::Observe(
     }
     if (IsTerminalStatus(status.kind)) {
         terminal_ = true;
-        return status.kind == expectation_.kind &&
-                status.reason == expectation_.reason
+        return callerEnded || (status.kind == expectation_.kind &&
+                status.reason == expectation_.reason)
             ? ExternalCallTeardownDecision::MatchedTerminal
             : ExternalCallTeardownDecision::MismatchedTerminal;
     }

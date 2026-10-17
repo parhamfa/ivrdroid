@@ -21,6 +21,11 @@ compile_test() {
         -o "$BUILD_DIR/$output"
 }
 
+compile_test async_recording_writer_test \
+    "$HELPER_DIR/src/async_recording_writer.cpp" \
+    "$TEST_DIR/async_recording_writer_test.cpp"
+"$BUILD_DIR/async_recording_writer_test"
+
 compile_test \
     audit_policy_test \
     "$HELPER_DIR/src/audit_policy.cpp" \

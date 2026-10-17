@@ -27,6 +27,8 @@ data class TelecomCallSnapshot(
     val nativeId: String? = null,
     val parentNativeId: String? = null,
     val childrenNativeIds: List<String> = emptyList(),
+    val conference: Boolean = false,
+    val childIds: List<String> = emptyList(),
 )
 
 interface TelecomControl {
@@ -129,6 +131,11 @@ interface ExternalCallObserver {
     fun onStatus(status: CallControlStatus, reason: String, snapshot: ExternalCallSessionSnapshot)
     fun onSnapshot(snapshot: ExternalCallSessionSnapshot)
     fun onRecordingFailure(snapshot: ExternalCallSessionSnapshot, nowElapsedMs: Long) {}
+    fun onTopologyRejected(
+        reason: String,
+        snapshot: ExternalCallSessionSnapshot,
+        calls: List<TelecomCallSnapshot>,
+    ) {}
 }
 
 class ExternalCallEngine(
@@ -345,13 +352,15 @@ class ExternalCallEngine(
         val knownConferenceId = session.conferenceId ?: session.operatorId?.let { operatorId ->
             telecom.conferenceId(caller.id, operatorId)
         }
+        // A conference parent is never an operator leg, even when it inherits the session extra.
         val tagged = calls.filter {
-            it.id != caller.id && it.id != knownConferenceId &&
+            it.id != caller.id && it.id != knownConferenceId && !it.conference &&
                 it.ownerSessionId == session.config.sessionId &&
                 it.direction == TelecomCallDirection.OUTGOING
         }
         if (tagged.size > 1) {
             // Ambiguous ownership is not permission to disconnect either call.
+            observer.onTopologyRejected("AMBIGUOUS_CALL_TOPOLOGY", session, calls)
             failSystem("AMBIGUOUS_CALL_TOPOLOGY", nowElapsedMs)
             return
         }
@@ -373,11 +382,13 @@ class ExternalCallEngine(
         val active = requireNotNull(current)
         val operator = active.operatorId?.let { id -> calls.singleOrNull { it.id == id } }
         val allowedIds = setOfNotNull(caller.id, active.operatorId, active.conferenceId ?: knownConferenceId)
+        val pendingConferenceId = pendingConferenceParent(active, calls, caller.id, allowedIds)?.id
         val unexpected = calls.any {
             it.state !in setOf(TelecomCallState.DISCONNECTED, TelecomCallState.DISCONNECTING) &&
-                it.id !in allowedIds
+                it.id !in allowedIds && it.id != pendingConferenceId
         }
         if (unexpected) {
+            observer.onTopologyRejected("UNEXPECTED_CALL_TOPOLOGY", active, calls)
             failSystem("UNEXPECTED_CALL_TOPOLOGY", nowElapsedMs)
             return
         }
@@ -498,6 +509,27 @@ class ExternalCallEngine(
             ExternalCallPhase.SYSTEM_FAILURE,
             -> Unit
         }
+    }
+
+    /**
+     * Android 12 Telecom announces a new conference Call to InCallServices before it attaches the
+     * merged legs as children, so a tick can observe a parent with no or only some children.
+     * Only while our own merge is in flight, tolerate exactly one such parent whose children are
+     * all owned legs. Its null handle makes [AndroidTelecomControl] report it as emergency, so the
+     * emergency flag is not consulted here. The merge watchdog still bounds the wait.
+     */
+    private fun pendingConferenceParent(
+        session: ExternalCallSessionSnapshot,
+        calls: List<TelecomCallSnapshot>,
+        callerId: String,
+        allowedIds: Set<String>,
+    ): TelecomCallSnapshot? {
+        if (session.phase != ExternalCallPhase.MERGING) return null
+        val ownedLegs = setOf(callerId, session.operatorId ?: return null)
+        return calls.filter {
+            it.id !in allowedIds && it.conference && ownedLegs.containsAll(it.childIds) &&
+                it.state in setOf(TelecomCallState.NEW, TelecomCallState.ACTIVE, TelecomCallState.HOLDING)
+        }.singleOrNull()
     }
 
     private fun ownedCaller(): TelecomCallSnapshot? {
@@ -867,4 +899,27 @@ class ExternalCallEngine(
             ExternalCallPhase.CLEANUP_ABORTED,
         )
     }
+}
+
+/** Redacted Telecom graph for diagnostics; never includes phone numbers or session identities. */
+internal object ExternalCallTopologyLog {
+    fun describe(session: ExternalCallSessionSnapshot, calls: List<TelecomCallSnapshot>): String =
+        "phase=${session.phase} calls=[" + calls.joinToString(", ") { call ->
+            val role = when (call.id) {
+                session.callerId -> "caller"
+                session.operatorId -> "operator"
+                session.conferenceId -> "conference"
+                else -> "other"
+            }
+            val children = call.childIds.joinToString("+") { child ->
+                when (child) {
+                    session.callerId -> "caller"
+                    session.operatorId -> "operator"
+                    else -> "other"
+                }
+            }
+            "$role:${call.state}:${call.direction}:conference=${call.conference}:children=[$children]" +
+                ":parent=${call.parentNativeId != null}:owned=${call.ownerSessionId == session.config.sessionId}" +
+                ":emergency=${call.emergency}"
+        } + "]"
 }

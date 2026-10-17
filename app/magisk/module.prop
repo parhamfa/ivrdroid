@@ -1,6 +1,6 @@
 id=ivrdroid_app
 name=IVRdroid Privileged App Overlay
-version=0.10.2
-versionCode=21
+version=0.10.3
+versionCode=22
 author=IVRdroid contributors
 description=System-app overlay granting IVRdroid restricted-network access, Doze exemption, and non-UI managed-call control while preserving the stock dialer.

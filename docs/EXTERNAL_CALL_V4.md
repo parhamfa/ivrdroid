@@ -75,7 +75,11 @@ play notice
 Setup and merge each have a ten-second watchdog. On Not connected or System failure the controller
 disconnects only the exact outgoing leg, restores/unholds the original caller, reacquires the
 private IVR route, and resumes the selected branch. An unexpected extra, ambiguous, replaced, or
-emergency call retains the existing fail-closed preemption behavior.
+emergency call retains the existing fail-closed preemption behavior. One exception applies only
+while the requested merge is in flight: Android 12 Telecom announces the new conference parent
+before linking its children, so exactly one conference-property call whose children are all owned
+legs is awaited until it contains both or the merge watchdog expires. Rejected topologies log a
+redacted role/state summary under `IVRdroidCall`.
 
 The helper/app bridge is an owner-only, atomic, one-line protocol. Requests contain the session,
 revision, block, boot identity, sequence/timing data, and desired state. The app resolves and

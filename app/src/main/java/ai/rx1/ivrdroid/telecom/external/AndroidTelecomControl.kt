@@ -125,6 +125,8 @@ class AndroidTelecomControl(
             nativeId = NativeTelecomIdentity.from(call.toString()),
             parentNativeId = call.parent?.let { NativeTelecomIdentity.from(it.toString()) },
             childrenNativeIds = call.children.mapNotNull { NativeTelecomIdentity.from(it.toString()) },
+            conference = details.hasProperty(Call.Details.PROPERTY_CONFERENCE),
+            childIds = call.children.map(::idFor),
             direction = when (details.callDirection) {
                 Call.Details.DIRECTION_INCOMING -> TelecomCallDirection.INCOMING
                 Call.Details.DIRECTION_OUTGOING -> TelecomCallDirection.OUTGOING

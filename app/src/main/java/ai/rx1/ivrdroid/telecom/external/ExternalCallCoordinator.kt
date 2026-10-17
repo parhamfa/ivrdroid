@@ -81,6 +81,14 @@ class ExternalCallCoordinator(
         Log.w("IVRdroidCall", "Recording failure at $nowElapsedMs; preserving ${snapshot.phase}")
     }
 
+    override fun onTopologyRejected(
+        reason: String,
+        snapshot: ExternalCallSessionSnapshot,
+        calls: List<TelecomCallSnapshot>,
+    ) {
+        Log.w("IVRdroidCall", "$reason ${ExternalCallTopologyLog.describe(snapshot, calls)}")
+    }
+
     private fun recover(nowElapsedMs: Long) {
         val recovered = journal.load()
         val bootId = BootIdentity.current()

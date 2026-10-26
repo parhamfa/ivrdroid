@@ -506,7 +506,7 @@ function EmailSettingsCard({
             </select>
           </Field>
         </div>
-        <Field label="Username" hint="For iCloud, use your Apple Account @icloud.com address.">
+        <Field label="Username" hint="For iCloud, use your iCloud Mail address (…@icloud.com), even if your Apple Account signs in with another email.">
           <input autoComplete="off" value={email.smtp_username} disabled={disabled} onChange={(event) => onChange({ ...email, smtp_username: event.target.value })} />
         </Field>
         <Field label="Password" hint={email.password_configured ? "App-specific password. Leave blank to keep the saved one." : "App-specific password, not your Apple Account password."}>

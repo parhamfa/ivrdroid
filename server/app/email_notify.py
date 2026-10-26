@@ -165,6 +165,8 @@ def describe_smtp_error(error: BaseException, payload: EmailPayload) -> str:
     mismatch = "check that the port matches the security setting (465 uses SSL, 587 uses STARTTLS)"
     if isinstance(error, smtplib.SMTPAuthenticationError):
         text = f"SMTP login failed ({_server_reply(error.smtp_code, error.smtp_error)})"
+        if payload.host.endswith(".mail.me.com"):
+            text += "; iCloud needs your @icloud.com address as the username and an app-specific password"
     elif isinstance(error, smtplib.SMTPSenderRefused):
         text = f"SMTP server refused the sender address ({_server_reply(error.smtp_code, error.smtp_error)})"
     elif isinstance(error, smtplib.SMTPRecipientsRefused):

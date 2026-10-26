@@ -42,8 +42,10 @@ rollback (it ignores email and keeps sending ntfy alerts). Do not downgrade to r
 
 Production sends through iCloud+ SMTP from an rx1.ir custom-domain address:
 
-- Server `smtp.mail.me.com`, port 587, STARTTLS. Username is the Apple Account's @icloud.com
-  address; the password is an app-specific password. The From address must be an rx1.ir
+- Server `smtp.mail.me.com`, port 587, STARTTLS. Username is the iCloud Mail @icloud.com
+  address, even when the Apple Account signs in with another email: a Gmail login is rejected
+  with `550 5.1.1 Mailbox does not exist` and the custom-domain address with `535`. The password
+  is an app-specific password. The From address must be an rx1.ir
   address added under iCloud Settings → Custom Email Domain. The dashboard stores the password
   encrypted with the data key and never returns it.
 - old-mac normally egresses through the `melbi` WireGuard link, which drops outbound 587/465.

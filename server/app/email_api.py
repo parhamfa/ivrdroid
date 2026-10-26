@@ -124,7 +124,8 @@ def test_email_settings(
     try:
         email_notify.send_test_email(payload)
     except EmailDeliveryError as error:
-        raise HTTPException(status_code=502, detail=str(error)) from None
+        # Not 502: Cloudflare replaces 5xx bodies with its own page, which would hide the SMTP reason.
+        raise HTTPException(status_code=400, detail=str(error)) from None
     audit(session, actor, "email.test_sent", "email-settings")
     session.commit()
     return response

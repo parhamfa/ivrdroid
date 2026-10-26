@@ -303,7 +303,7 @@ def test_email_test_login_failure_is_sanitized(client, monkeypatch, caplog) -> N
     calls = fake_smtp(monkeypatch, login_error=smtplib.SMTPAuthenticationError(535, reply))
     enable_email(client)
     response = client.post(f"{EMAIL_URL}/test")
-    assert response.status_code == 502
+    assert response.status_code == 400
     detail = response.json()["detail"]
     assert detail.startswith("SMTP login failed (535 5.7.8 Authentication failed")
     assert PASSWORD not in detail
@@ -324,7 +324,7 @@ def test_email_test_never_logs_in_without_starttls(client, monkeypatch) -> None:
     )
     enable_email(client)
     response = client.post(f"{EMAIL_URL}/test")
-    assert response.status_code == 502
+    assert response.status_code == 400
     assert "STARTTLS" in response.json()["detail"]
     assert [call[0] for call in calls] == ["connect", "ehlo", "starttls", "quit"]
 
@@ -393,6 +393,10 @@ def test_dispatched_email_failure_is_logged_without_secrets(client, monkeypatch,
             "refused all 1 recipients (550 5.1.1 unknown user)",
         ),
         (smtplib.SMTPSenderRefused(553, b"5.7.1 not owned", "ivrdroid@icloud.com"), "refused the sender address (553"),
+        (
+            smtplib.SMTPAuthenticationError(550, b"5.1.1 Mailbox does not exist"),
+            "(550 5.1.1 Mailbox does not exist); iCloud needs your @icloud.com address as the username",
+        ),
     ],
 )
 def test_smtp_errors_are_described_for_the_owner(error, expected) -> None:

@@ -33,7 +33,7 @@ def test_additive_upgrade_preserves_preferences_history_and_rollback_state(monke
         command.upgrade(config, "head")
         command.upgrade(config, "head")
         with scoped_engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0010_call_recovery"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0011_email_settings"
             assert connection.execute(text("SELECT timezone, date_calendar FROM display_settings")).one() == ("Europe/Sofia", "gregorian")
             assert dict(connection.execute(text("SELECT id, terminal_notification_scheduled FROM call_records")).all()) == {"finished": True, "active": False}
             assert connection.execute(text("SELECT count(*) FROM call_event_receipts")).scalar_one() == 0
@@ -41,7 +41,7 @@ def test_additive_upgrade_preserves_preferences_history_and_rollback_state(monke
             command.downgrade(config, "0009_display_settings")
         with scoped_engine.connect() as connection:
             assert connection.execute(text("SELECT count(*) FROM call_records")).scalar_one() == 2
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0010_call_recovery"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0011_email_settings"
     finally:
         scoped_engine.dispose()
         with engine.begin() as connection:

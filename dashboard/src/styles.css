@@ -291,6 +291,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monos
 .ntfy-event .settings-form-grid { margin-top: 4px; }
 .ntfy-flag { display: flex; align-items: center; gap: 8px; min-height: 38px; color: var(--ink); font-size: 12px; font-weight: 600; }
 .ntfy-flag input { width: auto; }
+.ntfy-event__head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 20px; margin-bottom: 12px; }
+.ntfy-event__title { display: grid; gap: 3px; }
+.ntfy-event__title strong { font-size: 13px; }
+.ntfy-event__title small { color: var(--muted); font-size: 11px; }
+.ntfy-event__channels { display: flex; flex-wrap: wrap; gap: 18px; }
+.ntfy-event__channels .toggle-row--compact { margin: 0; }
+.settings-actions__hint { align-self: center; color: var(--muted); font-size: 11px; }
+.field textarea { min-width: 0; min-height: 78px; padding: 8px 10px; border: 1px solid var(--line-dark); border-radius: 5px; outline: 0; background: #fff; color: var(--ink); font: inherit; font-size: 13px; resize: vertical; }
+.field textarea:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(20,125,123,.1); }
 .settings-empty { padding: 25px; border: 1px dashed var(--line-dark); border-radius: 6px; color: var(--muted); font-size: 12px; text-align: center; }
 .schedule-editor { margin-top: 13px; padding: 15px; border: 1px solid var(--line); border-radius: 7px; background: #fafcfc; }
 .schedule-editor__head { display: grid; grid-template-columns: 1fr .8fr 1fr auto; align-items: end; gap: 12px; }

@@ -6,8 +6,8 @@ from sqlalchemy.orm import Session
 from .auth import require_admin, require_admin_write
 from .database import get_session
 from .models import utcnow
-from .ntfy import decrypt_token, initialize_ntfy_settings, parse_events, send_test_notification
-from .schemas import NtfySettingsRequest, NtfySettingsResponse
+from .ntfy import _storable_events, decrypt_token, initialize_ntfy_settings, parse_events, send_test_notification
+from .schemas import NtfyEvents, NtfySettingsRequest, NtfySettingsResponse
 from .services import audit
 
 
@@ -50,7 +50,14 @@ def put_ntfy_settings(
     row.topic = body.topic
     if body.token is not None:
         row.token_encrypted = request.app.state.cipher.encrypt(body.token)
-    row.events = body.events.model_dump(mode="json")
+    row.events = _storable_events(body.events)
+    email_events = dict(row.email_events) if isinstance(row.email_events, dict) else {}
+    for key in NtfyEvents.model_fields:
+        config = getattr(body.events, key)
+        # A dashboard that predates email routing omits the flag; keep what is stored instead of clearing it.
+        if "email" in config.model_fields_set:
+            email_events[key] = config.email
+    row.email_events = email_events
     row.updated_at = utcnow()
     row.updated_by = actor
     audit(

@@ -4,7 +4,7 @@ import { DisplaySettingsProvider } from "../displaySettings";
 import { DEFAULT_DISPLAY_SETTINGS } from "../display";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api";
-import type { DraftConfiguration, NtfySettings, RecordingSettings } from "../types";
+import type { DraftConfiguration, EmailSettings, NtfySettings, RecordingSettings } from "../types";
 import { SettingsPage } from "./SettingsPage";
 
 const render = (ui: ReactNode) => renderUI(<DisplaySettingsProvider>{ui}</DisplaySettingsProvider>);
@@ -22,6 +22,9 @@ vi.mock("../api", () => ({
     ntfySettings: vi.fn(),
     saveNtfySettings: vi.fn(),
     testNtfySettings: vi.fn(),
+    emailSettings: vi.fn(),
+    saveEmailSettings: vi.fn(),
+    testEmailSettings: vi.fn(),
     devices: vi.fn(),
     revisions: vi.fn(),
     audit: vi.fn(),
@@ -59,18 +62,41 @@ const ntfy: NtfySettings = {
   topic: "",
   token_configured: false,
   events: {
-    voicemail_ready: { enabled: true, priority: "default", include_masked_caller: true },
-    conversation_ready: { enabled: true, priority: "default", include_masked_caller: true },
-    ivr_session_failed: { enabled: true, priority: "high", include_masked_caller: true },
-    external_call_failed: { enabled: true, priority: "high", include_masked_caller: true, not_connected: true, system_failure: true },
-    revision_activation_failed: { enabled: true, priority: "high" },
-    storage_full: { enabled: true, priority: "max", warn_at_quota_percent: 90 },
-    tablet_offline: { enabled: true, priority: "high", idle_timeout_minutes: 15, in_call_timeout_minutes: 45, notify_when_recovered: true },
-    ivr_session_completed: { enabled: false, priority: "default", include_masked_caller: true },
-    stock_dialer_routing: { enabled: false, priority: "low", include_masked_caller: false },
+    voicemail_ready: { enabled: true, email: false, priority: "default", include_masked_caller: true },
+    conversation_ready: { enabled: true, email: false, priority: "default", include_masked_caller: true },
+    ivr_session_failed: { enabled: true, email: false, priority: "high", include_masked_caller: true },
+    external_call_failed: { enabled: true, email: false, priority: "high", include_masked_caller: true, not_connected: true, system_failure: true },
+    revision_activation_failed: { enabled: true, email: false, priority: "high" },
+    storage_full: { enabled: true, email: false, priority: "max", warn_at_quota_percent: 90 },
+    tablet_offline: { enabled: true, email: false, priority: "high", idle_timeout_minutes: 15, in_call_timeout_minutes: 45, notify_when_recovered: true },
+    ivr_session_completed: { enabled: false, email: false, priority: "default", include_masked_caller: true },
+    stock_dialer_routing: { enabled: false, email: false, priority: "low", include_masked_caller: false },
   },
   updated_at: "2026-08-17T00:00:00Z",
   updated_by: "owner@example.com",
+};
+
+const email: EmailSettings = {
+  enabled: false,
+  smtp_host: "smtp.mail.me.com",
+  smtp_port: 587,
+  smtp_security: "starttls",
+  smtp_username: "",
+  password_configured: false,
+  from_address: "",
+  from_name: "IVRdroid",
+  recipients: [],
+  updated_at: "2026-08-17T00:00:00Z",
+  updated_by: "owner@example.com",
+};
+
+const configuredEmail: EmailSettings = {
+  ...email,
+  enabled: true,
+  smtp_username: "owner@icloud.com",
+  password_configured: true,
+  from_address: "ivrdroid@rx1.ir",
+  recipients: ["owner@example.com"],
 };
 
 beforeEach(() => {
@@ -89,6 +115,15 @@ beforeEach(() => {
     updated_by: "owner@example.com",
   }));
   vi.mocked(api.testNtfySettings).mockResolvedValue({ ...ntfy, enabled: true, topic: "ivrdroid-test" });
+  vi.mocked(api.emailSettings).mockResolvedValue(structuredClone(email));
+  vi.mocked(api.saveEmailSettings).mockImplementation(async ({ smtp_password, ...body }) => ({
+    ...email,
+    ...body,
+    password_configured: Boolean(smtp_password) || email.password_configured,
+    updated_at: "2026-08-17T01:00:00Z",
+    updated_by: "owner@example.com",
+  }));
+  vi.mocked(api.testEmailSettings).mockResolvedValue(structuredClone(configuredEmail));
   vi.mocked(api.devices).mockResolvedValue([]);
   vi.mocked(api.revisions).mockResolvedValue([]);
   vi.mocked(api.audit).mockResolvedValue([]);
@@ -179,7 +214,7 @@ describe("recording settings", () => {
 describe("ntfy settings", () => {
   it("saves per-event knobs without sending a blank token", async () => {
     render(<SettingsPage />);
-    await screen.findByRole("heading", { name: /Push notifications/i });
+    await screen.findByRole("heading", { name: /^Notifications/i });
     fireEvent.click(screen.getByRole("checkbox", { name: /Enable ntfy/i }));
     fireEvent.change(screen.getByRole("textbox", { name: /Topic/i }), { target: { value: "ivrdroid-test" } });
     fireEvent.change(screen.getByRole("spinbutton", { name: /Idle timeout \(minutes\)/i }), { target: { value: "20" } });
@@ -196,10 +231,97 @@ describe("ntfy settings", () => {
 
   it("sends a single test notification", async () => {
     render(<SettingsPage />);
-    await screen.findByRole("heading", { name: /Push notifications/i });
+    await screen.findByRole("heading", { name: /^Notifications/i });
     fireEvent.click(screen.getByRole("checkbox", { name: /Enable ntfy/i }));
     fireEvent.change(screen.getByRole("textbox", { name: /Topic/i }), { target: { value: "ivrdroid-test" } });
     fireEvent.click(screen.getByRole("button", { name: "Send test" }));
     await waitFor(() => expect(api.testNtfySettings).toHaveBeenCalledTimes(1));
+  });
+
+  it("disables an event's Email channel until email is enabled", async () => {
+    render(<SettingsPage />);
+    await screen.findByRole("heading", { name: /^Notifications/i });
+    const channel = screen.getByRole("checkbox", { name: "Email: Voicemail ready" }) as HTMLInputElement;
+    expect(channel.disabled).toBe(true);
+    expect((screen.getByRole("checkbox", { name: "Push: Voicemail ready" }) as HTMLInputElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Enable email/i }));
+    expect(channel.disabled).toBe(false);
+  });
+
+  it("saves email routing through the notification save while ntfy stays off", async () => {
+    vi.mocked(api.emailSettings).mockResolvedValue(structuredClone(configuredEmail));
+    render(<SettingsPage />);
+    await screen.findByRole("heading", { name: /^Notifications/i });
+    const channel = screen.getByRole("checkbox", { name: "Email: Stock-dialer routing" }) as HTMLInputElement;
+    expect(channel.disabled).toBe(false);
+    fireEvent.click(channel);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(api.saveNtfySettings).toHaveBeenCalledWith(expect.objectContaining({
+      enabled: false,
+      events: expect.objectContaining({
+        stock_dialer_routing: expect.objectContaining({ enabled: false, email: true }),
+        voicemail_ready: expect.objectContaining({ email: false }),
+      }),
+    })));
+    expect(api.saveEmailSettings).not.toHaveBeenCalled();
+  });
+});
+
+describe("email settings", () => {
+  it("keeps the saved password when blank and parses recipients on save", async () => {
+    render(<SettingsPage />);
+    await screen.findByRole("heading", { name: /Email delivery/i });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Enable email/i }));
+    fireEvent.change(screen.getByRole("textbox", { name: /Username/i }), { target: { value: "owner@icloud.com" } });
+    fireEvent.change(screen.getByRole("textbox", { name: /From address/i }), { target: { value: "ivrdroid@rx1.ir" } });
+    fireEvent.change(screen.getByRole("textbox", { name: /Recipients/i }), { target: { value: "a@x.ir, b@y.com\nc@z.org" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save email settings" }));
+    await waitFor(() => expect(api.saveEmailSettings).toHaveBeenCalledWith({
+      enabled: true,
+      smtp_host: "smtp.mail.me.com",
+      smtp_port: 587,
+      smtp_security: "starttls",
+      smtp_username: "owner@icloud.com",
+      smtp_password: null,
+      from_address: "ivrdroid@rx1.ir",
+      from_name: "IVRdroid",
+      recipients: ["a@x.ir", "b@y.com", "c@z.org"],
+    }));
+    expect(await screen.findByText("Email settings are effective immediately.")).toBeTruthy();
+    expect(api.saveNtfySettings).not.toHaveBeenCalled();
+  });
+
+  it("swaps the default port with the security mode", async () => {
+    render(<SettingsPage />);
+    await screen.findByRole("heading", { name: /Email delivery/i });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Enable email/i }));
+    const port = screen.getByRole("spinbutton", { name: /^Port/i }) as HTMLInputElement;
+    fireEvent.change(screen.getByRole("combobox", { name: /^Security/i }), { target: { value: "ssl" } });
+    expect(port.value).toBe("465");
+    fireEvent.change(screen.getByRole("combobox", { name: /^Security/i }), { target: { value: "starttls" } });
+    expect(port.value).toBe("587");
+  });
+
+  it("requires saving before a test email", async () => {
+    vi.mocked(api.emailSettings).mockResolvedValue(structuredClone(configuredEmail));
+    render(<SettingsPage />);
+    const test = await screen.findByRole("button", { name: "Send test email" }) as HTMLButtonElement;
+    expect(test.disabled).toBe(false);
+    expect(screen.queryByText("Save before testing")).toBeNull();
+    fireEvent.change(screen.getByRole("textbox", { name: /From name/i }), { target: { value: "Front desk" } });
+    expect(test.disabled).toBe(true);
+    expect(screen.getByText("Save before testing")).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox", { name: /From name/i }), { target: { value: "IVRdroid" } });
+    expect(test.disabled).toBe(false);
+  });
+
+  it("shows the server's reason when the test email fails", async () => {
+    vi.mocked(api.emailSettings).mockResolvedValue(structuredClone(configuredEmail));
+    vi.mocked(api.testEmailSettings).mockRejectedValue(new Error("SMTP authentication failed: check the app-specific password."));
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "Send test email" }));
+    expect(await screen.findByText("SMTP authentication failed: check the app-specific password.")).toBeTruthy();
+    expect(api.testEmailSettings).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Test email sent.")).toBeNull();
   });
 });

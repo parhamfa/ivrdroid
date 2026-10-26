@@ -130,6 +130,7 @@ from .ntfy import (
     schedule_ntfy,
 )
 from .ntfy_api import router as ntfy_settings_router
+from .email_api import router as email_settings_router
 from .v3_api import router as admin_v3_router
 from .v4_api import router as admin_v4_router
 from .conversation_recording_api import router as conversation_recording_device_router
@@ -268,6 +269,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(recording_admin_router)
     app.include_router(recording_settings_router)
     app.include_router(ntfy_settings_router)
+    app.include_router(email_settings_router)
     app.include_router(display_settings_router)
     app.include_router(recording_device_router)
     app.include_router(conversation_recording_device_router)

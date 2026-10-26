@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from email.headerregistry import Address
 from enum import Enum
 from typing import Annotated, Literal
 from uuid import UUID
@@ -951,6 +952,7 @@ NTFY_TOPIC_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 class NtfyEventBase(StrictModel):
     enabled: bool
     priority: NtfyPriority = "default"
+    email: bool = False
 
 
 class NtfyCallerEvent(NtfyEventBase):
@@ -1067,5 +1069,121 @@ class NtfySettingsResponse(StrictModel):
     topic: str
     token_configured: bool
     events: NtfyEvents
+    updated_at: datetime
+    updated_by: str
+
+
+SmtpSecurity = Literal["starttls", "ssl"]
+EMAIL_DOMAIN_PATTERN = r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$"
+EMAIL_FORBIDDEN_CHARACTERS = frozenset('<>,;"()')
+
+
+def _has_control_characters(value: str) -> bool:
+    return any(ord(character) < 32 or 127 <= ord(character) < 160 or character in "\u2028\u2029" for character in value)
+
+
+def normalize_email_address(value: str) -> str:
+    address = value.strip()
+    if not address:
+        raise ValueError("email address is required")
+    if any(character.isspace() for character in address) or _has_control_characters(address):
+        raise ValueError("email address cannot contain spaces or line breaks")
+    if EMAIL_FORBIDDEN_CHARACTERS & set(address):
+        raise ValueError('email address cannot contain < > , ; " ( or )')
+    if not address.isascii():
+        raise ValueError("email address must use ASCII characters")
+    if address.count("@") != 1:
+        raise ValueError("email address must contain exactly one @")
+    local, domain = address.split("@")
+    if not local:
+        raise ValueError("email address needs a name before the @")
+    if len(local) > 64 or len(address) > 254:
+        raise ValueError("email address is too long")
+    if not re.fullmatch(EMAIL_DOMAIN_PATTERN, domain):
+        raise ValueError("email address must end in a domain such as example.com")
+    try:
+        # The same parser builds the message headers, so anything it rejects would fail at send time.
+        Address(addr_spec=address)
+    except Exception as error:
+        raise ValueError("email address is not valid") from error
+    return address.lower()
+
+
+class EmailSettingsRequest(StrictModel):
+    enabled: bool
+    smtp_host: str = Field(default="", max_length=253)
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_security: SmtpSecurity = "starttls"
+    smtp_username: str = Field(default="", max_length=254)
+    smtp_password: str | None = Field(default=None, max_length=256)
+    from_address: str = Field(default="", max_length=254)
+    from_name: str = Field(default="IVRdroid", max_length=80)
+    recipients: list[str] = Field(default_factory=list, max_length=5)
+
+    @field_validator("smtp_host")
+    @classmethod
+    def bare_hostname(cls, value: str) -> str:
+        host = value.strip().lower()
+        if host and not re.fullmatch(EMAIL_DOMAIN_PATTERN, host):
+            raise ValueError("SMTP host must be a hostname such as smtp.mail.me.com, without a scheme or port")
+        return host
+
+    @field_validator("smtp_username")
+    @classmethod
+    def username_without_spaces(cls, value: str) -> str:
+        username = value.strip()
+        if any(character.isspace() for character in username) or _has_control_characters(username):
+            raise ValueError("SMTP username cannot contain spaces or control characters")
+        return username
+
+    @field_validator("smtp_password")
+    @classmethod
+    def blank_password_is_absent(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if _has_control_characters(stripped):
+            raise ValueError("SMTP password cannot contain control characters")
+        return stripped or None
+
+    @field_validator("from_address")
+    @classmethod
+    def normalize_sender(cls, value: str) -> str:
+        return normalize_email_address(value) if value.strip() else ""
+
+    @field_validator("from_name")
+    @classmethod
+    def single_line_name(cls, value: str) -> str:
+        name = value.strip()
+        if _has_control_characters(name):
+            raise ValueError("sender name cannot contain line breaks or control characters")
+        return name
+
+    @field_validator("recipients")
+    @classmethod
+    def unique_recipients(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(normalize_email_address(address) for address in value))
+
+    @model_validator(mode="after")
+    def complete_when_enabled(self):
+        if self.enabled and not self.smtp_host:
+            raise ValueError("SMTP host is required when email notifications are enabled")
+        if self.enabled and not self.from_address:
+            raise ValueError("sender address is required when email notifications are enabled")
+        if self.enabled and not self.recipients:
+            raise ValueError("at least one recipient is required when email notifications are enabled")
+        return self
+
+
+class EmailSettingsResponse(StrictModel):
+    enabled: bool
+    smtp_host: str
+    smtp_port: int
+    smtp_security: SmtpSecurity
+    smtp_username: str
+    password_configured: bool
+    from_address: str
+    from_name: str
+    recipients: list[str]
     updated_at: datetime
     updated_by: str

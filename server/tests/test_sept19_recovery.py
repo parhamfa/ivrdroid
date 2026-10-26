@@ -32,6 +32,7 @@ def test_historical_repair_backs_up_source_and_original_values_and_deduplicates_
     monkeypatch.setattr(repair, "SOURCES", {call_id: (len(pcm), hashlib.sha256(pcm).hexdigest())})
     monkeypatch.setattr(repair, "evidence_bundle", lambda _: proof)
     monkeypatch.setattr("app.ntfy.deliver_notification", lambda _: pytest.fail("Historical repair must not alert"))
+    monkeypatch.setattr("app.email_notify.deliver_email", lambda _: pytest.fail("Historical repair must not email"))
     settings = client.app.state.settings
     dry = repair.run(settings, evidence)
     assert not dry["applied"] and dry["requeue_verified_sources"] == [ctx["recording_id"]]

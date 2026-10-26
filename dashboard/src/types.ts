@@ -305,7 +305,10 @@ export interface RecordingSettings {
 export type NtfyPriority = "min" | "low" | "default" | "high" | "max";
 
 export interface NtfyEventBase {
+  /** Push delivery through ntfy. */
   enabled: boolean;
+  /** Email delivery through SMTP. */
+  email: boolean;
   priority: NtfyPriority;
 }
 
@@ -348,6 +351,35 @@ export interface NtfySettings {
   events: NtfyEvents;
   updated_at: string;
   updated_by: string;
+}
+
+export type SmtpSecurity = "starttls" | "ssl";
+
+export interface EmailSettings {
+  enabled: boolean;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_security: SmtpSecurity;
+  smtp_username: string;
+  password_configured: boolean;
+  from_address: string;
+  from_name: string;
+  recipients: string[];
+  updated_at: string;
+  updated_by: string;
+}
+
+export interface EmailSettingsRequest {
+  enabled: boolean;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_security: SmtpSecurity;
+  smtp_username: string;
+  /** null keeps the stored password. */
+  smtp_password: string | null;
+  from_address: string;
+  from_name: string;
+  recipients: string[];
 }
 
 export interface SessionAuditEvent {

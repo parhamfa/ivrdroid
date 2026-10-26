@@ -33,6 +33,30 @@ Never downgrade the schema or restore an old database over new calls and recordi
 
 Physical acceptance and the two-hour soak are required before tagging this release accepted.
 
+## Email notifications
+
+Migration `0011_email_settings` is additive: it creates the `email_settings` singleton and adds
+the nullable `ntfy_settings.email_events` column. Per-event email flags live in that column, not
+in `ntfy_settings.events`, so an API from before 0011 can still read the ntfy row after a
+rollback (it ignores email and keeps sending ntfy alerts). Do not downgrade to remove them.
+
+Production sends through iCloud+ SMTP from an rx1.ir custom-domain address:
+
+- Server `smtp.mail.me.com`, port 587, STARTTLS. Username is the Apple Account's @icloud.com
+  address; the password is an app-specific password. The From address must be an rx1.ir
+  address added under iCloud Settings → Custom Email Domain. The dashboard stores the password
+  encrypted with the data key and never returns it.
+- old-mac normally egresses through the `melbi` WireGuard link, which drops outbound 587/465.
+  The rush mangle rule "Route: old-mac SMTP via Starlink" (src 192.168.88.49, tcp dst-port 587,
+  `mark-routing main`, before "Mark Conn: Google") sends submission traffic out Starlink. If the
+  dashboard's test email times out, check that rule and its counters first.
+- rx1.ir DNS must keep the iCloud MX, SPF (`include:icloud.com`) and the
+  `sig1._domainkey` CNAME. That CNAME must be **DNS only** in Cloudflare; proxying it hides
+  the DKIM key and outgoing mail fails DKIM.
+
+Verify with Settings → Email → "Send test email", then check that SPF, DKIM and DMARC all pass
+in the received message's headers.
+
 ## Previous release procedure (0.9.0)
 
 1. Recheck actual image IDs, schema head, device versions/version codes, active revision, idle

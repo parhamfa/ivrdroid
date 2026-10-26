@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta, timezone
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 from fastapi import BackgroundTasks, FastAPI
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 import httpx
 
+from . import email_notify
 from .crypto import DataCipher
-from .models import Device, NtfySettings, utcnow
+from .email_notify import EmailPayload, build_email_payload, decrypt_password, email_ready
+from .models import Device, EmailSettings, NtfySettings, utcnow
 from .recording_service import recording_used_bytes
 from .schemas import NtfyEvents, NtfyPriority, default_ntfy_events
 
 LOGGER = logging.getLogger("ivrdroid.ntfy")
+# SMTP can take seconds, and notify_storage_full runs while an upload holds the quota row lock.
+EMAIL_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ivrdroid-email")
 
 VOICEMAIL_SPOOL_LIMIT_BYTES = 512 * 1024 * 1024
 CONVERSATION_SPOOL_LIMIT_BYTES = 4 * 1024 * 1024 * 1024
@@ -80,7 +85,7 @@ def initialize_ntfy_settings(session: Session, actor: str, *, lock: bool = False
             enabled=False,
             server_url="https://ntfy.sh",
             topic="",
-            events=default_ntfy_events().model_dump(mode="json"),
+            events=_storable_events(default_ntfy_events()),
             updated_by=actor,
         )
         session.add(row)
@@ -88,10 +93,23 @@ def initialize_ntfy_settings(session: Session, actor: str, *, lock: bool = False
     return row
 
 
+def _storable_events(events: NtfyEvents) -> dict[str, Any]:
+    # 0.10.3 validates stored events with extra keys forbidden, so email routing lives in email_events.
+    return events.model_dump(mode="json", exclude={key: {"email"} for key in NtfyEvents.model_fields})
+
+
 def parse_events(row: NtfySettings) -> NtfyEvents:
     defaults = default_ntfy_events().model_dump(mode="json")
     stored = row.events if isinstance(row.events, dict) else {}
-    merged = {key: {**defaults[key], **stored.get(key, {})} for key in defaults}
+    email = row.email_events if isinstance(row.email_events, dict) else {}
+    merged = {
+        key: {
+            **defaults[key],
+            **{name: value for name, value in stored.get(key, {}).items() if name != "email"},
+            "email": email.get(key) is True,
+        }
+        for key in defaults
+    }
     return NtfyEvents.model_validate(merged)
 
 
@@ -145,10 +163,11 @@ def _event_config(events: NtfyEvents, event_key: str):
     return getattr(events, event_key)
 
 
-def _build_payload(
+def _build_deliverables(
     *,
     row: NtfySettings,
-    token: str | None,
+    email_row: EmailSettings | None,
+    cipher: DataCipher,
     public_base_url: str,
     event_key: str,
     title: str,
@@ -157,29 +176,63 @@ def _build_payload(
     tags: str,
     caller_masked: str | None,
     extra: dict[str, Any] | None,
-) -> NtfyPayload | None:
-    if not row.enabled or not row.topic:
-        return None
+) -> list[NtfyPayload | EmailPayload]:
     events = parse_events(row)
     config = _event_config(events, event_key)
-    if not config.enabled:
-        return None
+    push = bool(row.enabled and row.topic and config.enabled)
+    email = email_ready(email_row) and config.email
+    if not push and not email:
+        return []
     if extra and extra.get("external_status") == "NOT_CONNECTED" and not getattr(config, "not_connected", True):
-        return None
+        return []
     if extra and extra.get("external_status") == "SYSTEM_FAILURE" and not getattr(config, "system_failure", True):
-        return None
+        return []
     body = message
     if caller_masked and getattr(config, "include_masked_caller", False):
         body = f"{message}\nCaller {caller_masked}"
-    return NtfyPayload(
-        url=f"{row.server_url.rstrip('/')}/{quote(row.topic, safe='')}",
-        token=token,
-        title=title,
-        message=body[:1000],
-        priority=NTFY_PRIORITIES[config.priority],
-        tags=tags,
-        click=urljoin(f"{public_base_url.rstrip('/')}/", click_path.lstrip("/")),
-    )
+    click = urljoin(f"{public_base_url.rstrip('/')}/", click_path.lstrip("/"))
+    deliverables: list[NtfyPayload | EmailPayload] = []
+    if push:
+        deliverables.append(
+            NtfyPayload(
+                url=f"{row.server_url.rstrip('/')}/{quote(row.topic, safe='')}",
+                token=decrypt_token(cipher, row),
+                title=title,
+                message=body[:1000],
+                priority=NTFY_PRIORITIES[config.priority],
+                tags=tags,
+                click=click,
+            ),
+        )
+    if email:
+        try:
+            password = decrypt_password(cipher, email_row)
+        except Exception:
+            LOGGER.warning("Stored SMTP password could not be decrypted; skipping the email notification")
+        else:
+            deliverables.append(
+                build_email_payload(
+                    email_row,
+                    password,
+                    local_hostname=urlparse(public_base_url).hostname,
+                    subject_title=title,
+                    body=body[:1000],
+                    click_url=click,
+                ),
+            )
+    return deliverables
+
+
+def _submit_email(payload: EmailPayload) -> None:
+    EMAIL_EXECUTOR.submit(email_notify.deliver_email, payload)
+
+
+def _deliver(deliverables: list[NtfyPayload | EmailPayload]) -> None:
+    for item in deliverables:
+        if isinstance(item, NtfyPayload):
+            deliver_notification(item)
+        else:
+            _submit_email(item)
 
 
 def dispatch_ntfy(
@@ -196,10 +249,10 @@ def dispatch_ntfy(
     cipher: DataCipher = app.state.cipher
     with app.state.database.session() as session:
         row = initialize_ntfy_settings(session, app.state.settings.development_admin_email, lock=True)
-        token = decrypt_token(cipher, row)
-        payload = _build_payload(
+        deliverables = _build_deliverables(
             row=row,
-            token=token,
+            email_row=session.get(EmailSettings, 1),
+            cipher=cipher,
             public_base_url=app.state.settings.public_base_url,
             event_key=event_key,
             title=title,
@@ -210,8 +263,7 @@ def dispatch_ntfy(
             extra=extra,
         )
         session.commit()
-    if payload is not None:
-        deliver_notification(payload)
+    _deliver(deliverables)
 
 
 def schedule_ntfy(
@@ -228,13 +280,14 @@ def schedule_ntfy(
 
 def notify_storage_full(app: FastAPI, detail: str = "Recording storage is full.") -> None:
     cipher: DataCipher = app.state.cipher
-    payload: NtfyPayload | None = None
+    deliverables: list[NtfyPayload | EmailPayload] = []
     with app.state.database.session() as session:
         row = initialize_ntfy_settings(session, app.state.settings.development_admin_email, lock=True)
         if row.last_storage_notified_at is None:
-            payload = _build_payload(
+            deliverables = _build_deliverables(
                 row=row,
-                token=decrypt_token(cipher, row),
+                email_row=session.get(EmailSettings, 1),
+                cipher=cipher,
                 public_base_url=app.state.settings.public_base_url,
                 event_key="storage_full",
                 title="Recording storage is full",
@@ -244,11 +297,10 @@ def notify_storage_full(app: FastAPI, detail: str = "Recording storage is full."
                 caller_masked=None,
                 extra=None,
             )
-            if payload is not None:
+            if deliverables:
                 row.last_storage_notified_at = utcnow()
         session.commit()
-    if payload is not None:
-        deliver_notification(payload)
+    _deliver(deliverables)
 
 
 def _spool_full(status: dict[str, Any]) -> bool:
@@ -267,7 +319,7 @@ def _quota_warning(session: Session, app: FastAPI, events: NtfyEvents) -> bool:
 
 def evaluate_storage(app: FastAPI) -> None:
     cipher: DataCipher = app.state.cipher
-    payload: NtfyPayload | None = None
+    deliverables: list[NtfyPayload | EmailPayload] = []
     with app.state.database.session() as session:
         row = initialize_ntfy_settings(session, app.state.settings.development_admin_email, lock=True)
         events = parse_events(row)
@@ -276,9 +328,10 @@ def evaluate_storage(app: FastAPI) -> None:
         warning = _quota_warning(session, app, events)
         saturated = spool or warning
         if saturated and row.last_storage_notified_at is None:
-            payload = _build_payload(
+            deliverables = _build_deliverables(
                 row=row,
-                token=decrypt_token(cipher, row),
+                email_row=session.get(EmailSettings, 1),
+                cipher=cipher,
                 public_base_url=app.state.settings.public_base_url,
                 event_key="storage_full",
                 title="Recording storage is full",
@@ -288,13 +341,12 @@ def evaluate_storage(app: FastAPI) -> None:
                 caller_masked=None,
                 extra=None,
             )
-            if payload is not None:
+            if deliverables:
                 row.last_storage_notified_at = utcnow()
         elif not saturated:
             row.last_storage_notified_at = None
         session.commit()
-    if payload is not None:
-        deliver_notification(payload)
+    _deliver(deliverables)
 
 
 def _offline_timeout(events: NtfyEvents, call_state: str) -> timedelta:
@@ -308,9 +360,10 @@ def _offline_timeout(events: NtfyEvents, call_state: str) -> timedelta:
 
 def evaluate_presence(app: FastAPI) -> None:
     cipher: DataCipher = app.state.cipher
-    payloads: list[NtfyPayload] = []
+    deliverables: list[NtfyPayload | EmailPayload] = []
     with app.state.database.session() as session:
         row = initialize_ntfy_settings(session, app.state.settings.development_admin_email, lock=True)
+        email_row = session.get(EmailSettings, 1)
         events = parse_events(row)
         now = utcnow()
         devices = list(session.scalars(select(Device).where(Device.revoked_at.is_(None))))
@@ -325,12 +378,12 @@ def evaluate_presence(app: FastAPI) -> None:
             call_state = str((device.status or {}).get("call_state") or "unknown")
             if now - seen >= _offline_timeout(events, call_state):
                 offline = True
-        token = decrypt_token(cipher, row)
         if offline:
             if row.last_offline_notified_at is None:
-                payload = _build_payload(
+                deliverables = _build_deliverables(
                     row=row,
-                    token=token,
+                    email_row=email_row,
+                    cipher=cipher,
                     public_base_url=app.state.settings.public_base_url,
                     event_key="tablet_offline",
                     title="Tablet offline",
@@ -340,15 +393,15 @@ def evaluate_presence(app: FastAPI) -> None:
                     caller_masked=None,
                     extra=None,
                 )
-                if payload is not None:
+                if deliverables:
                     row.last_offline_notified_at = now
-                    payloads.append(payload)
         elif row.last_offline_notified_at is not None:
             row.last_offline_notified_at = None
             if events.tablet_offline.notify_when_recovered:
-                payload = _build_payload(
+                deliverables = _build_deliverables(
                     row=row,
-                    token=token,
+                    email_row=email_row,
+                    cipher=cipher,
                     public_base_url=app.state.settings.public_base_url,
                     event_key="tablet_offline",
                     title="Tablet recovered",
@@ -358,11 +411,8 @@ def evaluate_presence(app: FastAPI) -> None:
                     caller_masked=None,
                     extra=None,
                 )
-                if payload is not None:
-                    payloads.append(payload)
         session.commit()
-    for payload in payloads:
-        deliver_notification(payload)
+    _deliver(deliverables)
 
 
 def run_ntfy_watch(app: FastAPI) -> None:

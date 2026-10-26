@@ -6,6 +6,8 @@ import type {
   Device,
   DisplaySettings,
   DraftConfiguration,
+  EmailSettings,
+  EmailSettingsRequest,
   FlowDiff,
   Overview,
   Prompt,
@@ -164,5 +166,13 @@ export const api = {
     }),
   testNtfySettings: () =>
     request<NtfySettings>("/api/admin/v1/ntfy-settings/test", { method: "POST" }),
+  emailSettings: () => request<EmailSettings>("/api/admin/v1/email-settings"),
+  saveEmailSettings: (body: EmailSettingsRequest) =>
+    request<EmailSettings>("/api/admin/v1/email-settings", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  testEmailSettings: () =>
+    request<EmailSettings>("/api/admin/v1/email-settings/test", { method: "POST" }),
   audit: () => request<AuditRecord[]>("/api/admin/v1/audit"),
 };

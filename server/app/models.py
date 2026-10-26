@@ -330,8 +330,31 @@ class NtfySettings(Base):
     topic: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     events: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    # Kept outside events because 0.10.3 rejects unknown event keys; a rollback must still read them.
+    email_events: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     last_offline_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_storage_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_by: Mapped[str] = mapped_column(String(320), nullable=False)
+
+
+class EmailSettings(Base):
+    __tablename__ = "email_settings"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="email_settings_singleton"),
+        CheckConstraint("smtp_security IN ('starttls', 'ssl')", name="email_settings_security"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    smtp_host: Mapped[str] = mapped_column(String(253), nullable=False, default="smtp.mail.me.com")
+    smtp_port: Mapped[int] = mapped_column(Integer, nullable=False, default=587)
+    smtp_security: Mapped[str] = mapped_column(String(16), nullable=False, default="starttls")
+    smtp_username: Mapped[str] = mapped_column(String(254), nullable=False, default="")
+    smtp_password_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    from_address: Mapped[str] = mapped_column(String(254), nullable=False, default="")
+    from_name: Mapped[str] = mapped_column(String(80), nullable=False, default="IVRdroid")
+    recipients: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_by: Mapped[str] = mapped_column(String(320), nullable=False)
 

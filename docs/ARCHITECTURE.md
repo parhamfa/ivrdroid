@@ -6,7 +6,8 @@ IVRdroid handles one active cellular call and one menu session at a time. V3 add
 voicemail to the single-host control plane and one enrolled SM-T585 while preserving the
 appliance boundary: it is not a concurrent PBX, queue, extension, transfer, live-agent,
 whole-call recorder, transcription service, or arbitrary-webhook system. A bounded
-owner-configured ntfy publisher may post a closed catalog of operational alerts to one topic.
+owner-configured notifier may send a closed catalog of operational alerts to one ntfy topic and,
+per event, to up to five owner email recipients through one authenticated SMTP account.
 
 ## Trust boundary
 

@@ -1,4 +1,4 @@
-import { Archive, Bell, Clipboard, HardDrive, History, KeyRound, Laptop, Mic2, Plus, RotateCcw, ShieldOff, Trash2 } from "lucide-react";
+import { Archive, Bell, Clipboard, HardDrive, History, KeyRound, Laptop, Mail, Mic2, Plus, RotateCcw, ShieldOff, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { Button, ErrorState, Field, Loading, SuccessMessage, formatBytes } from "../components/ui";
@@ -8,7 +8,7 @@ import { useRemote } from "../hooks";
 import { RELEASE_VERSION, SOURCE_COMMIT } from "../release";
 import { SessionAuditSettingsCard } from "./SessionAuditSettingsCard";
 import { CallSafetySettingsCard } from "./CallSafetySettingsCard";
-import type { DraftConfiguration, NtfyEvents, NtfyPriority, NtfySettings, RecordingSettings, Schedule, ScheduleException, WeeklyWindow } from "../types";
+import type { DraftConfiguration, EmailSettings, NtfyEvents, NtfyPriority, NtfySettings, RecordingSettings, Schedule, ScheduleException, SmtpSecurity, WeeklyWindow } from "../types";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const NTFY_PRIORITIES: NtfyPriority[] = ["min", "low", "default", "high", "max"];
@@ -23,6 +23,25 @@ const NTFY_EVENTS: Array<{ key: keyof NtfyEvents; title: string; description: st
   { key: "ivr_session_completed", title: "IVR session completed", description: "Successful or remote-hangup IVR sessions." },
   { key: "stock_dialer_routing", title: "Stock-dialer routing", description: "Unmatched callers left with the Android dialer." },
 ];
+const SMTP_DEFAULT_PORTS: Record<SmtpSecurity, number> = { starttls: 587, ssl: 465 };
+
+function parseRecipients(value: string): string[] {
+  return value.split(/[\s,;]+/).filter((item) => item.length > 0);
+}
+
+function isEmailFormDirty(form: EmailSettings, saved: EmailSettings, password: string, recipients: string): boolean {
+  const parsed = parseRecipients(recipients);
+  return password.trim() !== ""
+    || form.enabled !== saved.enabled
+    || form.smtp_host !== saved.smtp_host
+    || form.smtp_port !== saved.smtp_port
+    || form.smtp_security !== saved.smtp_security
+    || form.smtp_username !== saved.smtp_username
+    || form.from_address !== saved.from_address
+    || form.from_name !== saved.from_name
+    || parsed.length !== saved.recipients.length
+    || parsed.some((item, index) => item !== saved.recipients[index]);
+}
 
 function isExternalCallReady(status: Record<string, unknown>): boolean {
   return Array.isArray(status.runtime_versions)
@@ -45,20 +64,25 @@ export function SettingsPage() {
 function OperationalSettings() {
   const formatDate = useDateFormatter();
   const remote = useRemote(async () => {
-    const [draft, recordingSettings, ntfySettings, devices, revisions, audit] = await Promise.all([
+    const [draft, recordingSettings, ntfySettings, emailSettings, devices, revisions, audit] = await Promise.all([
       api.draft(),
       api.recordingSettings(),
       api.ntfySettings(),
+      api.emailSettings(),
       api.devices(),
       api.revisions(),
       api.audit(),
     ]);
-    return { draft, recordingSettings, ntfySettings, devices, revisions, audit };
+    return { draft, recordingSettings, ntfySettings, emailSettings, devices, revisions, audit };
   }, []);
   const [draft, setDraft] = useState<DraftConfiguration | null>(null);
   const [retention, setRetention] = useState<RecordingSettings | null>(null);
   const [ntfy, setNtfy] = useState<NtfySettings | null>(null);
   const [ntfyToken, setNtfyToken] = useState("");
+  const [email, setEmail] = useState<EmailSettings | null>(null);
+  const [emailSaved, setEmailSaved] = useState<EmailSettings | null>(null);
+  const [emailPassword, setEmailPassword] = useState("");
+  const [emailRecipients, setEmailRecipients] = useState("");
   const [pairingName, setPairingName] = useState("SM-T585");
   const [pairing, setPairing] = useState<{ code: string; expires_at: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -69,10 +93,15 @@ function OperationalSettings() {
     setRetention(remote.data?.recordingSettings ?? null);
     setNtfy(remote.data?.ntfySettings ?? null);
     setNtfyToken("");
+    const emailSettings = remote.data?.emailSettings ?? null;
+    setEmail(emailSettings);
+    setEmailSaved(emailSettings);
+    setEmailPassword("");
+    setEmailRecipients(emailSettings?.recipients.join("\n") ?? "");
   }, [remote.data]);
 
   if (remote.error) return <ErrorState message={remote.error} retry={remote.refresh} />;
-  if (remote.loading || !draft || !retention || !ntfy) return <Loading label="Loading settings" />;
+  if (remote.loading || !draft || !retention || !ntfy || !email || !emailSaved) return <Loading label="Loading settings" />;
   if (!remote.data) return <ErrorState message={remote.error ?? "Settings unavailable"} retry={remote.refresh} />;
   const tabletSpoolBytes = remote.data.devices.reduce((total, device) => total + Number(device.status.voicemail_spool_bytes ?? device.status.recording_spool_bytes ?? 0), 0);
   const tabletSpoolCount = remote.data.devices.reduce((total, device) => total + Number(device.status.voicemail_spool_count ?? device.status.recording_spool_count ?? 0), 0);
@@ -127,7 +156,7 @@ function OperationalSettings() {
       });
       setNtfy(saved);
       setNtfyToken("");
-      setMessage("Push notification settings are effective immediately.");
+      setMessage("Notification settings are effective immediately.");
     }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Could not save notification settings"); }
     finally { setBusy(false); }
@@ -139,6 +168,38 @@ function OperationalSettings() {
       setMessage("Test notification sent.");
     }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Could not send a test notification"); }
+    finally { setBusy(false); }
+  };
+  const saveEmail = async () => {
+    setBusy(true); setError(null);
+    try {
+      const saved = await api.saveEmailSettings({
+        enabled: email.enabled,
+        smtp_host: email.smtp_host.trim(),
+        smtp_port: email.smtp_port,
+        smtp_security: email.smtp_security,
+        smtp_username: email.smtp_username.trim(),
+        smtp_password: emailPassword.trim() || null,
+        from_address: email.from_address.trim(),
+        from_name: email.from_name.trim(),
+        recipients: parseRecipients(emailRecipients),
+      });
+      setEmail(saved);
+      setEmailSaved(saved);
+      setEmailPassword("");
+      setEmailRecipients(saved.recipients.join("\n"));
+      setMessage("Email settings are effective immediately.");
+    }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not save email settings"); }
+    finally { setBusy(false); }
+  };
+  const testEmail = async () => {
+    setBusy(true); setError(null);
+    try {
+      await api.testEmailSettings();
+      setMessage("Test email sent.");
+    }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not send a test email"); }
     finally { setBusy(false); }
   };
   const createPairing = async () => {
@@ -193,11 +254,25 @@ function OperationalSettings() {
     <NtfySettingsCard
       ntfy={ntfy}
       token={ntfyToken}
+      emailEnabled={email.enabled}
       busy={busy}
       onToken={setNtfyToken}
       onChange={setNtfy}
       onSave={() => void saveNtfy()}
       onTest={() => void testNtfy()}
+    />
+
+    <EmailSettingsCard
+      email={email}
+      password={emailPassword}
+      recipients={emailRecipients}
+      dirty={isEmailFormDirty(email, emailSaved, emailPassword, emailRecipients)}
+      busy={busy}
+      onChange={setEmail}
+      onPassword={setEmailPassword}
+      onRecipients={setEmailRecipients}
+      onSave={() => void saveEmail()}
+      onTest={() => void testEmail()}
     />
 
     <section className="surface settings-section"><header><div><h2>Schedules</h2><p>Exceptions override weekly hours. Every unmatched time is closed.</p></div><Button variant="secondary" onClick={addSchedule}><Plus size={17} /> Add schedule</Button></header>
@@ -238,6 +313,7 @@ function OperationalSettings() {
 function NtfySettingsCard({
   ntfy,
   token,
+  emailEnabled,
   busy,
   onToken,
   onChange,
@@ -246,6 +322,7 @@ function NtfySettingsCard({
 }: {
   ntfy: NtfySettings;
   token: string;
+  emailEnabled: boolean;
   busy: boolean;
   onToken: (value: string) => void;
   onChange: (value: NtfySettings) => void;
@@ -253,6 +330,7 @@ function NtfySettingsCard({
   onTest: () => void;
 }) {
   const disabled = busy || !ntfy.enabled;
+  const emailDisabled = busy || !emailEnabled;
   const updateEvent = <K extends keyof NtfyEvents>(key: K, patch: Partial<NtfyEvents[K]>) => {
     onChange({ ...ntfy, events: { ...ntfy.events, [key]: { ...ntfy.events[key], ...patch } } });
   };
@@ -260,8 +338,8 @@ function NtfySettingsCard({
     <section className="surface settings-section" id="push-notifications">
       <header>
         <div>
-          <h2>Push notifications <span className="status-pill status-pill--muted">Effective immediately</span></h2>
-          <p>Server-side ntfy alerts. Public topics are world-readable; use a random topic and an access token. Full phone numbers are never sent.</p>
+          <h2>Notifications <span className="status-pill status-pill--muted">Effective immediately</span></h2>
+          <p>Server-side alerts by ntfy push, email, or both. Public ntfy topics are world-readable; use a random topic and an access token. Full phone numbers are never sent.</p>
         </div>
         <Bell size={23} />
       </header>
@@ -270,7 +348,7 @@ function NtfySettingsCard({
         <span className="toggle" aria-hidden="true" />
         <span>
           <strong>Enable ntfy</strong>
-          <small>{ntfy.enabled ? "On · posts after recordings, failures, and device health land on the server" : "Off · no notifications are sent"}</small>
+          <small>{ntfy.enabled ? "On · posts after recordings, failures, and device health land on the server" : "Off · no push notifications are sent"}</small>
         </span>
       </label>
       <div className="settings-form-grid">
@@ -288,17 +366,30 @@ function NtfySettingsCard({
       <div className="ntfy-events">
         {NTFY_EVENTS.map((item) => {
           const event = ntfy.events[item.key];
-          const eventDisabled = disabled || !event.enabled;
+          const pushActive = ntfy.enabled && event.enabled;
+          const emailActive = emailEnabled && event.email;
+          const priorityDisabled = busy || !pushActive;
+          const eventDisabled = busy || !(pushActive || emailActive);
           return (
-            <article className={`ntfy-event ${event.enabled ? "" : "ntfy-event--off"}`} key={item.key}>
-              <label className={`toggle-row toggle-row--compact ${disabled ? "toggle-row--disabled" : ""}`}>
-                <input type="checkbox" checked={event.enabled} disabled={disabled} onChange={(change) => updateEvent(item.key, { enabled: change.target.checked } as Partial<NtfyEvents[typeof item.key]>)} />
-                <span className="toggle" aria-hidden="true" />
-                <span><strong>{item.title}</strong><small>{item.description}</small></span>
-              </label>
+            <article className={`ntfy-event ${pushActive || emailActive ? "" : "ntfy-event--off"}`} key={item.key}>
+              <div className="ntfy-event__head">
+                <span className="ntfy-event__title"><strong>{item.title}</strong><small>{item.description}</small></span>
+                <div className="ntfy-event__channels">
+                  <label className={`toggle-row toggle-row--compact ${disabled ? "toggle-row--disabled" : ""}`}>
+                    <input type="checkbox" aria-label={`Push: ${item.title}`} checked={event.enabled} disabled={disabled} onChange={(change) => updateEvent(item.key, { enabled: change.target.checked } as Partial<NtfyEvents[typeof item.key]>)} />
+                    <span className="toggle" aria-hidden="true" />
+                    <span><strong>Push</strong></span>
+                  </label>
+                  <label className={`toggle-row toggle-row--compact ${emailDisabled ? "toggle-row--disabled" : ""}`}>
+                    <input type="checkbox" aria-label={`Email: ${item.title}`} checked={event.email} disabled={emailDisabled} onChange={(change) => updateEvent(item.key, { email: change.target.checked } as Partial<NtfyEvents[typeof item.key]>)} />
+                    <span className="toggle" aria-hidden="true" />
+                    <span><strong>Email</strong></span>
+                  </label>
+                </div>
+              </div>
               <div className="settings-form-grid">
-                <Field label="Priority">
-                  <select value={event.priority} disabled={eventDisabled} onChange={(change) => updateEvent(item.key, { priority: change.target.value as NtfyPriority } as Partial<NtfyEvents[typeof item.key]>)}>
+                <Field label="Push priority">
+                  <select value={event.priority} disabled={priorityDisabled} onChange={(change) => updateEvent(item.key, { priority: change.target.value as NtfyPriority } as Partial<NtfyEvents[typeof item.key]>)}>
                     {NTFY_PRIORITIES.map((priority) => <option key={priority} value={priority}>{priority}</option>)}
                   </select>
                 </Field>
@@ -348,6 +439,93 @@ function NtfySettingsCard({
       <div className="settings-actions">
         <Button variant="secondary" onClick={onTest} disabled={busy || !ntfy.enabled || !ntfy.topic}>Send test</Button>
         <Button onClick={onSave} disabled={busy}>Save</Button>
+      </div>
+    </section>
+  );
+}
+
+function EmailSettingsCard({
+  email,
+  password,
+  recipients,
+  dirty,
+  busy,
+  onChange,
+  onPassword,
+  onRecipients,
+  onSave,
+  onTest,
+}: {
+  email: EmailSettings;
+  password: string;
+  recipients: string;
+  dirty: boolean;
+  busy: boolean;
+  onChange: (value: EmailSettings) => void;
+  onPassword: (value: string) => void;
+  onRecipients: (value: string) => void;
+  onSave: () => void;
+  onTest: () => void;
+}) {
+  const disabled = busy || !email.enabled;
+  const portValid = Number.isInteger(email.smtp_port) && email.smtp_port >= 1 && email.smtp_port <= 65535;
+  const changeSecurity = (security: SmtpSecurity) => {
+    const previousDefault = SMTP_DEFAULT_PORTS[email.smtp_security];
+    const port = email.smtp_port === previousDefault ? SMTP_DEFAULT_PORTS[security] : email.smtp_port;
+    onChange({ ...email, smtp_security: security, smtp_port: port });
+  };
+  return (
+    <section className="surface settings-section" id="email-notifications">
+      <header>
+        <div>
+          <h2>Email delivery <span className="status-pill status-pill--muted">Effective immediately</span></h2>
+          <p>Server-side SMTP for the events routed to Email above. Works with iCloud Mail and an iCloud+ custom domain.</p>
+        </div>
+        <Mail size={23} />
+      </header>
+      <label className="toggle-row">
+        <input type="checkbox" checked={email.enabled} disabled={busy} onChange={(event) => onChange({ ...email, enabled: event.target.checked })} />
+        <span className="toggle" aria-hidden="true" />
+        <span>
+          <strong>Enable email</strong>
+          <small>{email.enabled ? "On · each event routed to Email is sent to every recipient" : "Off · no emails are sent"}</small>
+        </span>
+      </label>
+      <div className="settings-form-grid">
+        <Field label="SMTP server" hint="iCloud Mail uses smtp.mail.me.com.">
+          <input value={email.smtp_host} disabled={disabled} onChange={(event) => onChange({ ...email, smtp_host: event.target.value })} />
+        </Field>
+        <div className="settings-form-grid">
+          <Field label="Port">
+            <input type="number" min={1} max={65535} value={email.smtp_port} disabled={disabled} onChange={(event) => onChange({ ...email, smtp_port: Number(event.target.value) })} />
+          </Field>
+          <Field label="Security">
+            <select value={email.smtp_security} disabled={disabled} onChange={(event) => changeSecurity(event.target.value as SmtpSecurity)}>
+              <option value="starttls">STARTTLS</option>
+              <option value="ssl">SSL/TLS</option>
+            </select>
+          </Field>
+        </div>
+        <Field label="Username" hint="For iCloud, use your Apple Account @icloud.com address.">
+          <input autoComplete="off" value={email.smtp_username} disabled={disabled} onChange={(event) => onChange({ ...email, smtp_username: event.target.value })} />
+        </Field>
+        <Field label="Password" hint={email.password_configured ? "App-specific password. Leave blank to keep the saved one." : "App-specific password, not your Apple Account password."}>
+          <input type="password" autoComplete="new-password" value={password} disabled={disabled} placeholder={email.password_configured ? "Password configured" : ""} onChange={(event) => onPassword(event.target.value)} />
+        </Field>
+        <Field label="From address" hint="For example ivrdroid@rx1.ir. Must be an address of your iCloud custom domain.">
+          <input type="email" value={email.from_address} disabled={disabled} onChange={(event) => onChange({ ...email, from_address: event.target.value })} />
+        </Field>
+        <Field label="From name">
+          <input value={email.from_name} disabled={disabled} onChange={(event) => onChange({ ...email, from_name: event.target.value })} />
+        </Field>
+      </div>
+      <Field label="Recipients" hint="One address per line, or comma-separated.">
+        <textarea rows={3} value={recipients} disabled={disabled} onChange={(event) => onRecipients(event.target.value)} />
+      </Field>
+      <div className="settings-actions">
+        {email.enabled && dirty ? <span className="settings-actions__hint">Save before testing</span> : null}
+        <Button variant="secondary" onClick={onTest} disabled={busy || !email.enabled || dirty}>Send test email</Button>
+        <Button onClick={onSave} disabled={busy || (email.enabled && !portValid)}>Save email settings</Button>
       </div>
     </section>
   );

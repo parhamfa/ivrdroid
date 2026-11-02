@@ -82,7 +82,6 @@ def build_email_payload(
     local_hostname: str | None,
     subject_title: str,
     body: str,
-    click_url: str | None,
 ) -> EmailPayload:
     title = " ".join(subject_title.split())[:120]
     return EmailPayload(
@@ -95,7 +94,7 @@ def build_email_payload(
         from_name=row.from_name,
         recipients=tuple(row.recipients),
         subject=f"{SUBJECT_PREFIX} {title}",
-        body=f"{body}\n\n{click_url}\n" if click_url else body,
+        body=body,
         local_hostname=local_hostname,
     )
 

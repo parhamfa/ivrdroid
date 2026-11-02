@@ -155,6 +155,8 @@ def test_continuous_operator_audio_requires_connection_and_notifies_once(client)
         process_next(client.app)
         notify.assert_called_once()
         assert notify.call_args.args[1] == 'conversation_ready'
+        facts = notify.call_args.kwargs['recording']
+        assert (facts.kind, facts.duration_ms, facts.stop_reason) == ('conversation', 100, 'operator_hangup')
     assert client.get(url, headers=ctx['headers']).json()['acknowledged']
     audio = client.get(f"/api/admin/v1/recordings/{ctx['recording_id']}/audio")
     assert audio.status_code == 200 and len(audio.content) > 0

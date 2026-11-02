@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from . import email_notify
 from .auth import require_admin, require_admin_write
 from .database import get_session
+from .email_content import with_footer
 from .email_notify import (
     EmailDeliveryError,
     build_email_payload,
@@ -115,8 +116,10 @@ def test_email_settings(
         decrypt_password(request.app.state.cipher, row),
         local_hostname=urlparse(public_base_url).hostname,
         subject_title="IVRdroid test",
-        body="This is a test email from the IVRdroid dashboard.",
-        click_url=urljoin(f"{public_base_url.rstrip('/')}/", "settings"),
+        body=with_footer(
+            "This is a test email from the IVRdroid dashboard.",
+            "Sent as a test from IVRdroid settings, Email delivery.",
+        ),
     )
     response = _response(row)
     # End the transaction first so no database lock is held while the SMTP exchange runs.

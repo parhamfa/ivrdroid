@@ -40,6 +40,7 @@ from .schemas import (
     ExternalCallSubEvent,
 )
 from .services import load_manifest
+from .email_content import RecordingFacts
 from .ntfy import notify_storage_full, schedule_ntfy
 
 
@@ -529,5 +530,6 @@ def complete_conversation_recording(
         click_path=f"/voicemail?recording={recording.id}",
         tags="telephone_receiver,ivrdroid",
         caller_masked=mask_phone(caller) if caller else None,
+        recording=RecordingFacts.of(recording),
     )
     return _recording_response(recording)

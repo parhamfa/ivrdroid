@@ -5,11 +5,13 @@ import logging
 import smtplib
 import socket
 import ssl
+from datetime import date, datetime, timezone
 
 import pytest
 from sqlalchemy import select
 
-from app.email_notify import EmailPayload, describe_smtp_error
+from app.email_content import RecordingFacts, jalali_date
+from app.email_notify import EmailPayload, compose_message, describe_smtp_error
 from app.models import Device, EmailSettings, NtfySettings, utcnow
 from app.ntfy import call_notification_kwargs, dispatch_ntfy, evaluate_presence, evaluate_storage, notify_storage_full
 from test_ntfy import add_device, enable_ntfy
@@ -179,7 +181,10 @@ def test_each_event_routes_to_push_email_or_both(client, monkeypatch) -> None:
         "[IVRdroid] ivr_session_failed",
         "[IVRdroid] revision_activation_failed",
     ]
-    assert emailed[0].body == "ivr_session_failed happened\n\nhttps://ivrdroid.test/calls\n"
+    assert emailed[0].body == (
+        "ivr_session_failed happened\n\nOpen the IVRdroid dashboard for details.\n\n"
+        'Sent because "IVR session failed" email is on in IVRdroid settings.\n'
+    )
     assert emailed[0].recipients == ("alerts@example.com",)
     assert emailed[0].password == PASSWORD
     assert emailed[0].local_hostname == "ivrdroid.test"
@@ -211,14 +216,117 @@ def test_external_call_subtoggles_and_masked_caller_apply_to_email(client, monke
     assert emailed == []
     report("call-external-2", "SYSTEM_FAILURE")
     assert [item.subject for item in emailed] == ["[IVRdroid] External call failed"]
-    assert emailed[0].body.startswith("The operator step ended with SYSTEM_FAILURE.\nCaller +15-***-4567\n\n")
-    assert "/calls?call=call-external-2" in emailed[0].body
+    assert emailed[0].body.startswith("The operator step ended with SYSTEM_FAILURE.\nCaller: number ending 4567\n\n")
+    assert "http" not in emailed[0].body and "call-external-2" not in emailed[0].body
 
     events["external_call_failed"]["include_masked_caller"] = False
     save_events(client, events, ntfy=False)
     report("call-external-3", "SYSTEM_FAILURE")
     assert "4567" not in emailed[1].body
     assert pushed == []
+
+
+# 18:04 in Tehran on Aban 10, 1405.
+CALL_TIME = datetime(2026, 11, 1, 14, 34, tzinfo=timezone.utc)
+
+
+def conversation_facts(**changes) -> RecordingFacts:
+    return RecordingFacts(**{
+        "kind": "conversation",
+        "captured_at": CALL_TIME,
+        "duration_ms": 252_400,
+        "operator_last4": "0912",
+        "stop_reason": "caller_hangup",
+        "partial": False,
+        "size_bytes": 2_140_000,
+        **changes,
+    })
+
+
+def test_conversation_ready_email_is_a_link_free_call_card(client, monkeypatch) -> None:
+    pushed, emailed = capture(monkeypatch)
+    enable_email(client)
+    events = current_events(client)
+    events["conversation_ready"].update(enabled=True, email=True)
+    save_events(client, events, ntfy=True)
+    dispatch_ntfy(
+        client.app,
+        "conversation_ready",
+        title="Conversation ready",
+        message="An external-call recording is ready to play.",
+        click_path="/voicemail?recording=rec-1",
+        caller_masked="+98-***-5356",
+        recording=conversation_facts(),
+    )
+    assert emailed[0].subject == "[IVRdroid] Call from number ending 5356, 4 min 12 s"
+    assert emailed[0].body == (
+        "A forwarded call was recorded and saved in IVRdroid.\n\n"
+        "When: Aban 10, 1405, 18:04 (Asia/Tehran)\n"
+        "Caller: number ending 5356\n"
+        "Duration: 4 min 12 s\n"
+        "Answered by: operator line ending 0912\n"
+        "Ended: Caller hung up\n"
+        "Recording: Ready, 2.1 MB\n\n"
+        "To listen, open the IVRdroid dashboard and choose Recordings.\n\n"
+        'Sent because "Conversation ready" email is on in IVRdroid settings.\n'
+    )
+    message = compose_message(emailed[0])
+    assert message["Content-Transfer-Encoding"] == "7bit"
+    assert "=?" not in message.as_string()
+    # Push keeps its tap target and existing wording.
+    assert pushed[0].click == "https://ivrdroid.test/voicemail?recording=rec-1"
+    assert pushed[0].message == "An external-call recording is ready to play.\nCaller +98-***-5356"
+
+
+def test_recording_email_follows_display_settings_and_caller_toggle(client, monkeypatch) -> None:
+    _, emailed = capture(monkeypatch)
+    enable_email(client)
+    events = current_events(client)
+    events["voicemail_ready"].update(email=True, include_masked_caller=False)
+    events["conversation_ready"].update(email=True, include_masked_caller=False)
+    save_events(client, events, ntfy=False)
+    saved = client.put("/api/admin/v1/display-settings", json={"timezone": "UTC", "date_calendar": "gregorian"})
+    assert saved.status_code == 200, saved.text
+    voicemail = conversation_facts(
+        kind="voicemail", duration_ms=41_600, operator_last4="", stop_reason="finish_key", partial=True,
+        size_bytes=640_400,
+    )
+    for key, facts in (("voicemail_ready", voicemail), ("conversation_ready", conversation_facts(operator_last4=""))):
+        dispatch_ntfy(client.app, key, title=key, message="ready", caller_masked="+98-***-5356", recording=facts)
+    assert [item.subject for item in emailed] == ["[IVRdroid] Voicemail, 42 s", "[IVRdroid] Recorded call, 4 min 12 s"]
+    assert emailed[0].body.startswith(
+        "A caller left a voicemail in IVRdroid.\n\n"
+        "When: Nov 1, 2026, 14:34 (UTC)\n"
+        "Duration: 42 s\n"
+        "Ended: Finish key\n"
+        "Recording: Partial audio, 640 KB\n\n"
+    )
+    assert "5356" not in emailed[0].body + emailed[1].body
+    assert "Answered by" not in emailed[1].body
+
+
+def test_voicemail_completion_emails_the_call_card(client, monkeypatch) -> None:
+    from test_recordings_api import caller_wav, create_and_upload, provision_recording_context
+
+    _, emailed = capture(monkeypatch)
+    enable_email(client)
+    events = current_events(client)
+    events["voicemail_ready"].update(email=True)
+    save_events(client, events, ntfy=False)
+    context = provision_recording_context(client)
+    create_and_upload(client, context, caller_wav())
+    complete = client.post(f"/api/device/v1/recordings/{context['recording_id']}/complete", headers=context["headers"])
+    assert complete.status_code == 200, complete.text
+    assert emailed[0].subject.startswith("[IVRdroid] Voicemail from number ending 4567, ")
+    assert "Caller: number ending 4567" in emailed[0].body
+    assert "http" not in emailed[0].body and context["recording_id"] not in emailed[0].body
+
+
+def test_jalali_dates_match_the_dashboard_calendar() -> None:
+    assert jalali_date(date(2026, 3, 20)) == (1404, 12, 29)
+    assert jalali_date(date(2026, 3, 21)) == (1405, 1, 1)
+    assert jalali_date(date(2026, 11, 1)) == (1405, 8, 10)
+    assert jalali_date(date(2025, 3, 20)) == (1403, 12, 30)
 
 
 def test_email_only_tablet_offline_and_recovery(client, monkeypatch) -> None:
@@ -350,7 +458,10 @@ def test_email_test_sends_over_verified_starttls(client, monkeypatch) -> None:
     assert message["Date"]
     assert message["Message-ID"].endswith("@icloud.com>")
     assert message["Auto-Submitted"] == "auto-generated"
-    assert "https://ivrdroid.test/settings" in message.get_content()
+    assert message.get_content() == (
+        "This is a test email from the IVRdroid dashboard.\n\n"
+        "Sent as a test from IVRdroid settings, Email delivery.\n"
+    )
     audit = client.get("/api/admin/v1/audit").json()
     assert any(item["action"] == "email.test_sent" for item in audit)
 

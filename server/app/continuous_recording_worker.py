@@ -15,6 +15,7 @@ from uuid import uuid4
 from sqlalchemy import or_, select, text
 
 from .models import CallRecord, ContinuousRecording, Recording, RecordingUpload, utcnow
+from .email_content import RecordingFacts
 from .ntfy import dispatch_ntfy
 from .crypto import mask_phone
 from .recording_service import (MEDIA_MAGIC, RecordingError, _fsync_directory, _require_safe_file,
@@ -171,7 +172,8 @@ def process_next(application) -> bool:
                         dispatch_ntfy(application, "conversation_ready", title="Conversation ready",
                             message="An external-call recording is ready to play.",
                             click_path=f"/voicemail?recording={recording.id}", tags="telephone_receiver,ivrdroid",
-                            caller_masked=mask_phone(caller) if caller else None)
+                            caller_masked=mask_phone(caller) if caller else None,
+                            recording=RecordingFacts.of(recording))
                     except Exception:
                         LOGGER.exception("Recording ready notification failed for %s", recording.id)
             except Exception as error:

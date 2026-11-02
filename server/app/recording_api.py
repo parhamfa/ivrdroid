@@ -51,6 +51,7 @@ from .schemas import (
     RetentionPolicyRequest,
     RetentionPolicyResponse,
 )
+from .email_content import RecordingFacts
 from .ntfy import notify_storage_full, schedule_ntfy
 from .services import audit, load_manifest
 
@@ -368,6 +369,7 @@ def complete_recording(
         click_path=f"/voicemail?recording={recording.id}",
         tags="mailbox_with_mail,ivrdroid",
         caller_masked=mask_phone(caller) if caller else None,
+        recording=RecordingFacts.of(recording),
     )
     return _as_upload_response(recording, None)
 

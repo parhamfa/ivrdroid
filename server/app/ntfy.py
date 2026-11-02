@@ -14,8 +14,10 @@ import httpx
 
 from . import email_notify
 from .crypto import DataCipher
+from .display_settings import DEFAULTS as DISPLAY_DEFAULTS
+from .email_content import RecordingFacts, event_email, event_note, recording_email, with_footer
 from .email_notify import EmailPayload, build_email_payload, decrypt_password, email_ready
-from .models import Device, EmailSettings, NtfySettings, utcnow
+from .models import Device, DisplaySettings, EmailSettings, NtfySettings, utcnow
 from .recording_service import recording_used_bytes
 from .schemas import NtfyEvents, NtfyPriority, default_ntfy_events
 
@@ -176,6 +178,8 @@ def _build_deliverables(
     tags: str,
     caller_masked: str | None,
     extra: dict[str, Any] | None,
+    recording: RecordingFacts | None = None,
+    display: DisplaySettings | None = None,
 ) -> list[NtfyPayload | EmailPayload]:
     events = parse_events(row)
     config = _event_config(events, event_key)
@@ -187,9 +191,8 @@ def _build_deliverables(
         return []
     if extra and extra.get("external_status") == "SYSTEM_FAILURE" and not getattr(config, "system_failure", True):
         return []
-    body = message
-    if caller_masked and getattr(config, "include_masked_caller", False):
-        body = f"{message}\nCaller {caller_masked}"
+    caller = caller_masked if getattr(config, "include_masked_caller", False) else None
+    body = f"{message}\nCaller {caller}" if caller else message
     click = urljoin(f"{public_base_url.rstrip('/')}/", click_path.lstrip("/"))
     deliverables: list[NtfyPayload | EmailPayload] = []
     if push:
@@ -210,14 +213,22 @@ def _build_deliverables(
         except Exception:
             LOGGER.warning("Stored SMTP password could not be decrypted; skipping the email notification")
         else:
+            if recording is not None:
+                subject, email_body = recording_email(
+                    recording,
+                    caller_masked=caller,
+                    timezone_name=display.timezone if display else DISPLAY_DEFAULTS["timezone"],
+                    calendar=display.date_calendar if display else DISPLAY_DEFAULTS["date_calendar"],
+                )
+            else:
+                subject, email_body = title, event_email(message[:1000], caller_masked=caller)
             deliverables.append(
                 build_email_payload(
                     email_row,
                     password,
                     local_hostname=urlparse(public_base_url).hostname,
-                    subject_title=title,
-                    body=body[:1000],
-                    click_url=click,
+                    subject_title=subject,
+                    body=with_footer(email_body, event_note(event_key)),
                 ),
             )
     return deliverables
@@ -245,6 +256,7 @@ def dispatch_ntfy(
     tags: str = "ivrdroid",
     caller_masked: str | None = None,
     extra: dict[str, Any] | None = None,
+    recording: RecordingFacts | None = None,
 ) -> None:
     cipher: DataCipher = app.state.cipher
     with app.state.database.session() as session:
@@ -261,6 +273,8 @@ def dispatch_ntfy(
             tags=tags,
             caller_masked=caller_masked,
             extra=extra,
+            recording=recording,
+            display=session.get(DisplaySettings, 1) if recording is not None else None,
         )
         session.commit()
     _deliver(deliverables)

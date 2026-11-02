@@ -1,22 +1,76 @@
 # Production deployment and rollback
 
-The production targets are **old-mac** and the enrolled **SM-T585**. Runtime configuration is
-`/Users/parhamfatemi/Services/ivrdroid/deploy`; the Compose project is `ivrdroid`. old-mac runs
-Docker through the `parhamfatemi` Colima instance. The existing `com.cloudflare.cloudflared`
-launch service routes `ivrdroid.rx1.ai` to the loopback-only web port, `127.0.0.1:3200`.
-Hetzner/OpenLiteSpeed instructions in older verification records describe a retired deployment.
-Do not modify unrelated hosts, tunnels, applications or volumes during this release.
+The production targets are **old-mac** and the enrolled **SM-T585**. old-mac is the 2017
+MacBook Pro, now running Ubuntu Linux (hostname `parham`). `ssh old-mac` enters as root and Docker
+runs natively, so plain `docker` and `docker compose` work. The Compose project is `ivrdroid`,
+defined by `/srv/oldmac-docker/projects/ivrdroid/compose.json`. The `cloudflared` systemd service
+routes `ivrdroid.rx1.ai` to the loopback-only web port, `127.0.0.1:3200`; the API and database
+stay on internal networks. The macOS/Colima layout under `/Users/parhamfatemi/Services/ivrdroid`
+and the Hetzner/OpenLiteSpeed instructions in older verification records describe retired
+deployments. old-mac also runs TextBee, rx1-dashboard and other projects: do not modify unrelated
+hosts, tunnels, applications or volumes during a release.
 
-For this host, invoke Docker as its Colima owner (SSH currently enters as root):
+Layout under `/srv/oldmac-docker` (root-owned, directories 0700, files 0600):
 
-```sh
-sudo -n -H -u parhamfatemi /opt/local/bin/docker \
-  --host unix:///Users/parhamfatemi/.colima/default/docker.sock ps
-```
+- `projects/ivrdroid/compose.json` is the whole runtime definition. There is no `.env`: the image
+  tags (`ivrdroid-api:<version>-<first12commit>`, likewise `ivrdroid-web`) and the api's
+  `IVRDROID_SOURCE_COMMIT` environment entry are written in this file, with `pull_policy: never`.
+- `source/Users/parhamfatemi/Services/ivrdroid/deploy/secrets/` holds the runtime secrets, a
+  restored copy of the macOS tree. They are bind-mounted read-only into the api under
+  `/run/secrets/`, and `docker-entrypoint.sh` loads them into the environment.
+- `volumes/ivrdroid_postgres_data`, `volumes/ivrdroid_prompt_media` and
+  `volumes/ivrdroid_recording_media` are the bind-mounted data.
+- `build/<name>-<version>/` holds source extracted for an image build.
+- `backups/<name>-<version>-<UTC timestamp>/` holds each deploy's rollback material.
 
-Release staging directories must be readable by that owner for Colima bind mounts. Runtime
-`.env`, `deploy/secrets/`, signing keys and rollback archives stay private. Preserve every key
-version required by existing media. Do not print credentials or copy them into build contexts.
+Runtime secrets, signing keys and rollback archives stay private. Preserve every key version
+required by existing media. Do not print credentials or copy them into build contexts.
+
+## Server or dashboard release (current procedure)
+
+Releases 0.10.4 to 0.10.6 used these steps. A release that also changes the tablet adds the
+Android steps from the 0.9.0 procedure below.
+
+1. Run server pytest, and the dashboard tests and build when it changed. Commit on a branch,
+   merge into `main` with `--no-ff` and push both without force. Build only from that merge
+   commit.
+2. Copy the exact source to old-mac and build there; it caches the pinned `python`, `node` and
+   `nginx-unprivileged` base images:
+
+   ```sh
+   C=$(git rev-parse HEAD); V=0.10.6; T=$V-${C:0:12}; B=/srv/oldmac-docker/build/<name>-$V
+   git archive "$C" server | ssh old-mac "mkdir -p $B && tar -x -C $B"
+   ssh old-mac "cd $B/server && DOCKER_BUILDKIT=0 docker build -t ivrdroid-api:$T --build-arg SOURCE_COMMIT=$C ."
+   ```
+
+   For the dashboard, archive `dashboard` as well and build `ivrdroid-web:$T` from
+   `$B/dashboard` the same way.
+3. Create `backups/<name>-<version>-<UTC timestamp>/` with `compose.previous.json` (a copy of the
+   live file), `alembic.before` (`select version_num from alembic_version`),
+   `database.before.dump` (`docker exec ivrdroid-db-1 pg_dump -U ivrdroid -d ivrdroid -Fc`) and
+   `compose.candidate.json`. The candidate changes only the new image tags and
+   `IVRDROID_SOURCE_COMMIT`; diff it against the previous file. Record `SHA256SUMS`.
+4. Confirm no call is in progress (latest `call_records`, recent API log). Copy the candidate over
+   `compose.json` and run `docker compose -p ivrdroid -f compose.json up -d api` (and/or `web`)
+   in `projects/ivrdroid`. The api runs `alembic upgrade head` when it starts.
+5. Verify that the containers are healthy and that `/health` reports the new version and full
+   commit:
+
+   ```sh
+   docker exec ivrdroid-api-1 python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health').read().decode())"
+   ```
+
+   Also check the schema head, the tablet's `POST /api/device/v1/sync` 200 responses and
+   `docker logs ivrdroid-api-1` for errors. Without a login the public host answers with the
+   Cloudflare Access redirect.
+6. Write the deployment record under `ivrdroid-release-artifacts/deployments/`, outside the repo.
+
+To roll back a release without a schema change, copy `compose.previous.json` back over
+`compose.json` and run `up -d` for the same services. Keep the previous images. Never run
+`alembic downgrade`.
+
+One-off scripts inside the api container must go through the entrypoint so the secrets are
+loaded: `docker exec -i ivrdroid-api-1 ivrdroid-entrypoint python -`.
 
 ## Release 0.10.1 continuity update
 
@@ -56,10 +110,18 @@ Production sends through iCloud+ SMTP from an rx1.ir custom-domain address:
   `sig1._domainkey` CNAME. That CNAME must be **DNS only** in Cloudflare; proxying it hides
   the DKIM key and outgoing mail fails DKIM.
 
-Verify with Settings → Email → "Send test email", then check that SPF, DKIM and DMARC all pass
-in the received message's headers.
+Verify with Settings → Email delivery → "Send test email", then check that SPF, DKIM and DMARC
+all pass in the received message's headers.
+
+Since 0.10.6 the emails carry no links (`server/app/email_content.py`). A short body around one
+link with an opaque recording ID is the shape of voicemail phishing, and Gmail filed those emails
+as spam. Recording emails state the call's facts instead and point at the Recordings page. Do not
+add a link back; push notifications keep theirs.
 
 ## Previous release procedure (0.9.0)
+
+These steps ran on the macOS host. Its `.env` with `IVRDROID_RELEASE_TAG` no longer exists: on the
+current host the tags live in `compose.json` (see the current procedure above).
 
 1. Recheck actual image IDs, schema head, device versions/version codes, active revision, idle
    Telecom/audio state, storage, enrollment and signing identity. Preserve original local changes
@@ -143,7 +205,8 @@ The initial 2026-09-12 baseline was API/web 0.8.6, schema `0005_ntfy_settings`, 
 0.8.6-dev/code17, persistent app overlay 0.8.4-dev/code15, helper 0.8.2-dev/code24 and IVR revision
 21. Recheck before installing; do not rely on these dated values after another release.
 
-- old-mac: `/Users/parhamfatemi/Services/ivrdroid/backups/20260912T162721Z-session-audit`
+- old-mac: `/Users/parhamfatemi/Services/ivrdroid/backups/20260912T162721Z-session-audit` on the
+  retired macOS install; it is not in the restored `/srv/oldmac-docker/source` tree.
 - Local: `/Users/parhamfatemi/Backups/ivrdroid/20260912T162721Z-session-audit`
 - Tablet: `/data/local/tmp/ivrdroid-rollback-20260912T162721Z.tar.gz`
 

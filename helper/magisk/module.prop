@@ -1,6 +1,6 @@
 id=ivrdroid_helper
 name=IVRdroid Privileged Audio Helper
-version=0.10.3
-versionCode=30
+version=0.10.4
+versionCode=31
 author=IVRdroid contributors
 description=Device-pinned transactional TinyALSA IVR with independent full-session auditing, voicemail and operator recording.

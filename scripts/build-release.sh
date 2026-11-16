@@ -12,6 +12,7 @@ export IVRDROID_SOURCE_COMMIT
 SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
 export SOURCE_DATE_EPOCH
 RELEASE_DIR=${1:-"$REPO_DIR/../ivrdroid-release-artifacts/0.10.3/$IVRDROID_SOURCE_COMMIT"}
+HELPER_VERSION=$(sed -n 's/^version=//p' helper/magisk/module.prop | head -n 1)
 mkdir -p "$RELEASE_DIR"
 chmod 0700 "$RELEASE_DIR"
 RELEASE_DIR=$(cd "$RELEASE_DIR" && pwd)
@@ -24,7 +25,7 @@ cmake --build helper/build-android-arm64 --parallel
 cp app/build/outputs/apk/debug/app-debug.apk "$RELEASE_DIR/IVRdroid-0.10.3.apk"
 cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk "$RELEASE_DIR/IVRdroid-0.10.3-acceptance.apk"
 cp app/dist/IVRdroid-system-app-0.10.3.zip "$RELEASE_DIR/"
-cp helper/dist/IVRdroid-helper-0.10.3-disabled.zip "$RELEASE_DIR/"
+cp "helper/dist/IVRdroid-helper-$HELPER_VERSION-disabled.zip" "$RELEASE_DIR/"
 cp helper/dist/ivrdroid-helper "$RELEASE_DIR/"
 cp helper/build-android-arm64/ivrdroid-audio-harness "$RELEASE_DIR/"
 git archive --format=tar HEAD > "$RELEASE_DIR/source.tar"

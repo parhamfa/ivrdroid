@@ -10,6 +10,13 @@ Discarding a queued request during cleanup cannot overwrite the finished call's
 `REMOTE_HANGUP` or other terminal result. The `END1` wire format and the 0.10.2 app
 and server contract are unchanged; this patch can be deployed to the helper alone.
 
+Helper 0.10.4 reads Telecom and audio state through a long-lived dump worker per helper
+process. The worker holds one binder connection and writes each fresh dump into a pipe;
+`dumpsys` is launched only as a fallback. Some old vendor kernels leak kernel memory on every
+binder open, so launching a binder client per poll eventually exhausts RAM. Run
+`ivrdroid-helper --dump-selftest <worker|dumpsys> <iterations> <interval_ms>` to compare both
+paths; it touches no lock, bridge or helper state and is safe while the helper is serving.
+
 For a UUID-correlated `START_MENU` request it:
 
 1. claims the request while Telecom still exposes one ringing non-emergency call;

@@ -303,6 +303,13 @@ mixer states, and an independent process samples Telecom every 500 ms. The worke
 private `SOCK_SEQPACKET` socket: the worker sends fixed phase bytes, and the guardian sends only
 fixed acknowledgements.
 
+Telecom and audio state come from service dumps. Each helper process that needs them keeps one
+long-lived dump worker that holds a single binder connection and writes a fresh dump into a pipe
+on request; `/system/bin/dumpsys` is launched only as a fallback when the worker is unavailable
+or fails. Some old vendor kernels leak kernel memory on every binder open, so launching a binder
+client per poll would eventually exhaust RAM. `ivrdroid-helper --dump-selftest
+<worker|dumpsys> <iterations> <interval_ms>` checks either path without touching helper state.
+
 If the worker dies, times out, or reports an audio/capture/termination failure:
 
 1. retain or re-establish the private route;

@@ -103,6 +103,11 @@ compile_test \
     "$HELPER_DIR/src/revision_config.cpp" \
     "$TEST_DIR/revision_config_test.cpp"
 compile_test \
+    service_dump_worker_test \
+    "$HELPER_DIR/src/binder_service_dump.cpp" \
+    "$HELPER_DIR/src/service_dump_worker.cpp" \
+    "$TEST_DIR/service_dump_worker_test.cpp"
+compile_test \
     session_snapshot_test \
     "$HELPER_DIR/src/session_snapshot.cpp" \
     "$TEST_DIR/session_snapshot_test.cpp"
@@ -142,6 +147,7 @@ compile_test \
     "$HELPER_DIR/../contracts/fixtures/configuration_revision_v3.compiled.txt" \
     "$HELPER_DIR/../contracts/fixtures/configuration_revision_v4.compiled.txt" \
     "$HELPER_DIR/../contracts/fixtures/configuration_revision_v41.compiled.txt"
+"$BUILD_DIR/service_dump_worker_test"
 "$BUILD_DIR/session_snapshot_test"
 "$BUILD_DIR/telecom_guard_test"
 "$BUILD_DIR/device_profile_test"

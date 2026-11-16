@@ -310,6 +310,22 @@ or fails. Some old vendor kernels leak kernel memory on every binder open, so la
 client per poll would eventually exhaust RAM. `ivrdroid-helper --dump-selftest
 <worker|dumpsys> <iterations> <interval_ms>` checks either path without touching helper state.
 
+The serving helper also holds the tablet reachable while the screen is off. Its connectivity
+guard writes the named kernel wake lock `ivrdroid-keepawake` to `/sys/power/wake_lock` right after
+taking the helper lock, because the vendor kernel suspends the CPU every few seconds with the
+screen off and the Wi-Fi driver cannot re-join a lost network while suspended. While no call is
+active it also runs `cmd wifi force-hi-perf-mode disabled` then `enabled` to switch off Wi-Fi
+power saving, which delays and drops inbound packets. The setting lives in system_server and is
+lost when the framework restarts, and WifiLockManager ignores a repeated `enabled` while it
+believes the mode is set, so the toggle is repeated every 15 minutes, with a 5-second kill
+deadline. Consecutive failures back off from 30 seconds, doubling up to 15 minutes; a success
+resets that. Each `cmd` opens binder, so this is two binder opens per refresh, 192 a day, and the
+exit status shows only that the command ran, not that the framework accepted it. The
+wake lock stays held when the helper exits, so the appliance remains reachable for repair. The
+file `/data/adb/ivrdroid/keep-awake.disabled` stops further asserts but undoes nothing; the
+manual undo is `echo ivrdroid-keepawake > /sys/power/wake_unlock` and
+`cmd wifi force-hi-perf-mode disabled`.
+
 If the worker dies, times out, or reports an audio/capture/termination failure:
 
 1. retain or re-establish the private route;

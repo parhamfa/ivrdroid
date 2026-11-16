@@ -4,6 +4,7 @@
 #include "call_safety_policy.h"
 #include "call_lifetime_policy.h"
 #include "child_process.h"
+#include "connectivity_guard.h"
 #include "device_profile.h"
 #include "dtmf_detector.h"
 #include "session_audio.h"
@@ -65,7 +66,7 @@ using ivrdroid::protocol::CurrentState;
 using ivrdroid::protocol::LastResult;
 
 constexpr char kLogTag[] = "IVRdroidHelper";
-constexpr char kHelperVersion[] = "0.10.4";
+constexpr char kHelperVersion[] = "0.10.5";
 #ifndef IVRDROID_SOURCE_COMMIT
 #define IVRDROID_SOURCE_COMMIT "unknown"
 #endif
@@ -886,6 +887,68 @@ pid_t SpawnServiceDumpWorker(int workerSocket, int clientSocket, void*) {
         descriptor,
         static_cast<char*>(nullptr));
     _exit(127);
+}
+
+// Toggles `cmd wifi force-hi-perf-mode` off and on for the connectivity guard.
+// Android's WifiLockManager ignores a repeated "enabled" while it believes the
+// mode is already set, so a plain re-assert would not re-apply power-save-off
+// after the driver was reset; switching off then on forces it. The exit status
+// only shows that the command ran, not that the framework accepted it: the
+// shell command prints "Command execution failed" and still exits 0. Each run
+// opens binder twice, which leaks kernel memory on old vendor kernels, so the
+// guard launches it only every 15 minutes (with backoff after failures) and
+// never in a loop.
+pid_t SpawnWifiHighPerfToggle(void*) {
+    const pid_t child = fork();
+    if (child != 0) return child;
+    if (gHelperLockFd >= 0) close(gHelperLockFd);
+    ivrdroid::CloseDescriptorsExcept(-1);
+    // Forked from the serve process, which installs handlers for these; reset
+    // them so the command starts with default dispositions.
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    signal(SIGPIPE, SIG_DFL);
+    const int devNull = open("/dev/null", O_RDWR);
+    if (devNull < 0 ||
+        dup2(devNull, STDIN_FILENO) < 0 ||
+        dup2(devNull, STDOUT_FILENO) < 0 ||
+        dup2(devNull, STDERR_FILENO) < 0) {
+        _exit(126);
+    }
+    if (devNull > STDERR_FILENO) close(devNull);
+    execl(
+        "/system/bin/sh",
+        "sh",
+        "-c",
+        "/system/bin/cmd wifi force-hi-perf-mode disabled; "
+        "exec /system/bin/cmd wifi force-hi-perf-mode enabled",
+        static_cast<char*>(nullptr));
+    _exit(127);
+}
+
+void LogConnectivityGuard(int priority, const char* message, void*) {
+    Log(priority, "%s", message);
+}
+
+constexpr int64_t kConnectivitySummaryIntervalMs = 60 * 60'000;
+
+void MaybeLogConnectivitySummary(ivrdroid::ConnectivityGuard& guard, int64_t* summaryAt) {
+    const int64_t now = MonotonicMilliseconds();
+    if (now - *summaryAt < kConnectivitySummaryIntervalMs) return;
+    // A whole window without a successful Wi-Fi assert deserves attention.
+    const bool unhealthy =
+        guard.wifiAssertsSucceeded() == 0 &&
+        guard.wakeLockState() != ivrdroid::WakeLockState::Disabled;
+    Log(
+        unhealthy ? ANDROID_LOG_WARN : ANDROID_LOG_INFO,
+        "Connectivity guard in the last %d min: wake_lock=%s wifi_high_perf_asserts=%d failed=%d.",
+        static_cast<int>((now - *summaryAt) / 60'000),
+        ivrdroid::WakeLockStateName(guard.wakeLockState()),
+        guard.wifiAssertsSucceeded(),
+        guard.wifiAssertsFailed());
+    guard.ResetStats();
+    *summaryAt = now;
 }
 
 constexpr int64_t kServiceDumpWarningIntervalMs = 60'000;
@@ -6608,6 +6671,14 @@ int Serve() {
         return 14;
     }
     gHelperLockFd = lockFd;
+    // Holds the tablet awake and Wi-Fi out of power saving so it stays
+    // reachable with the screen off. The lock is deliberately left held when
+    // the helper exits: the tablet is an appliance and must stay reachable for
+    // repair even while the helper is down.
+    ivrdroid::ConnectivityGuard connectivityGuard(
+        SpawnWifiHighPerfToggle, LogConnectivityGuard, nullptr);
+    // Before WaitForSystemReady, which can take long at boot.
+    connectivityGuard.AssertWakeLock();
     if (!WritePidFile()) {
         close(lockFd);
         return 15;
@@ -6652,6 +6723,7 @@ int Serve() {
     alignas(inotify_event) char events[4096] = {};
     int64_t lastAuditRecovery = MonotonicMilliseconds();
     int64_t lastIdleObservation = -1000;
+    int64_t connectivitySummaryAt = MonotonicMilliseconds();
     while (!gStopRequested) {
         gDrainingGuardians.erase(std::remove_if(gDrainingGuardians.begin(), gDrainingGuardians.end(),
             [](pid_t child) { return waitpid(child, nullptr, WNOHANG) != 0; }), gDrainingGuardians.end());
@@ -6673,7 +6745,10 @@ int Serve() {
                     ScheduleAuditRecovery();
                     lastAuditRecovery = MonotonicMilliseconds();
                 }
+                // Idle only, so cmd is never launched while a call is in progress.
+                connectivityGuard.Tick(MonotonicMilliseconds());
             }
+            MaybeLogConnectivitySummary(connectivityGuard, &connectivitySummaryAt);
         }
         const bool processed = ProcessOneCommand();
         if (gStopRequested) break;
@@ -6701,6 +6776,8 @@ int Serve() {
     }
 
     gServiceDumpClient.Shutdown();
+    // Reaps a running cmd; the wake lock stays held on purpose (see above).
+    connectivityGuard.Shutdown();
     WriteCurrentState(CurrentState::Stopped);
     inotify_rm_watch(inotifyFd, watch);
     close(inotifyFd);

@@ -53,6 +53,10 @@ compile_test \
     "$HELPER_DIR/src/child_process.cpp" \
     "$TEST_DIR/child_process_test.cpp"
 compile_test \
+    connectivity_guard_test \
+    "$HELPER_DIR/src/connectivity_guard.cpp" \
+    "$TEST_DIR/connectivity_guard_test.cpp"
+compile_test \
     conversation_handoff_protocol_test \
     "$HELPER_DIR/src/call_control_protocol.cpp" \
     "$HELPER_DIR/src/conversation_handoff_protocol.cpp" \
@@ -130,6 +134,7 @@ compile_test \
     "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_not_connected_v2.txt"
 "$BUILD_DIR/call_safety_policy_test"
 "$BUILD_DIR/child_process_test"
+"$BUILD_DIR/connectivity_guard_test"
 "$BUILD_DIR/conversation_handoff_protocol_test" \
     "$HELPER_DIR/../app/src/test/resources/call_control/conversation_handoff_v1.txt"
 "$BUILD_DIR/dtmf_detector_test"

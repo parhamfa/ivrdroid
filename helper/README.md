@@ -17,6 +17,22 @@ binder open, so launching a binder client per poll eventually exhausts RAM. Run
 `ivrdroid-helper --dump-selftest <worker|dumpsys> <iterations> <interval_ms>` to compare both
 paths; it touches no lock, bridge or helper state and is safe while the helper is serving.
 
+Helper 0.10.5 adds a connectivity guard so the tablet stays reachable with the screen off.
+On this kernel the CPU suspends every few seconds once the screen is off, and the Wi-Fi driver
+cannot re-join a lost network while suspended; Wi-Fi power saving also delays and drops inbound
+packets. The serving helper therefore writes `ivrdroid-keepawake` to `/sys/power/wake_lock`
+as soon as it has its lock, and, while no call is active, runs
+`cmd wifi force-hi-perf-mode disabled` then `enabled` once and then again every 15 minutes,
+because that setting is lost whenever the Android framework restarts and Android ignores a
+repeated `enabled` it believes is already set. After a failure it retries after 30 seconds, then
+doubles the wait each time up to 15 minutes. Each `cmd` opens binder, which leaks kernel memory
+here, so that is two opens per refresh, 192 a day. A zero exit only shows the command ran. An
+hourly log line reports `wake_lock=held|failed|disabled|unknown` and the number of Wi-Fi asserts,
+as a warning when none succeeded in that hour. The lock is left held
+when the helper exits. To stop the guard, create `/data/adb/ivrdroid/keep-awake.disabled`; that
+only stops further asserts, so undo the current state by hand with
+`echo ivrdroid-keepawake > /sys/power/wake_unlock` and `cmd wifi force-hi-perf-mode disabled`.
+
 For a UUID-correlated `START_MENU` request it:
 
 1. claims the request while Telecom still exposes one ringing non-emergency call;

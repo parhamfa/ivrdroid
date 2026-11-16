@@ -65,6 +65,7 @@ add_library(ivrdroid_core STATIC
     src/continuous_recording.cpp
     src/async_recording_writer.cpp
     src/child_process.cpp
+    src/connectivity_guard.cpp
     src/conversation_handoff_protocol.cpp
     src/device_profile.cpp
     src/external_call_policy.cpp

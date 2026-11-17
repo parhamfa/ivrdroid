@@ -53,6 +53,10 @@ compile_test \
     "$HELPER_DIR/src/child_process.cpp" \
     "$TEST_DIR/child_process_test.cpp"
 compile_test \
+    connectivity_guard_test \
+    "$HELPER_DIR/src/connectivity_guard.cpp" \
+    "$TEST_DIR/connectivity_guard_test.cpp"
+compile_test \
     conversation_handoff_protocol_test \
     "$HELPER_DIR/src/call_control_protocol.cpp" \
     "$HELPER_DIR/src/conversation_handoff_protocol.cpp" \
@@ -103,6 +107,11 @@ compile_test \
     "$HELPER_DIR/src/revision_config.cpp" \
     "$TEST_DIR/revision_config_test.cpp"
 compile_test \
+    service_dump_worker_test \
+    "$HELPER_DIR/src/binder_service_dump.cpp" \
+    "$HELPER_DIR/src/service_dump_worker.cpp" \
+    "$TEST_DIR/service_dump_worker_test.cpp"
+compile_test \
     session_snapshot_test \
     "$HELPER_DIR/src/session_snapshot.cpp" \
     "$TEST_DIR/session_snapshot_test.cpp"
@@ -125,6 +134,7 @@ compile_test \
     "$HELPER_DIR/../app/src/test/resources/call_control/answer_timeout_not_connected_v2.txt"
 "$BUILD_DIR/call_safety_policy_test"
 "$BUILD_DIR/child_process_test"
+"$BUILD_DIR/connectivity_guard_test"
 "$BUILD_DIR/conversation_handoff_protocol_test" \
     "$HELPER_DIR/../app/src/test/resources/call_control/conversation_handoff_v1.txt"
 "$BUILD_DIR/dtmf_detector_test"
@@ -142,6 +152,7 @@ compile_test \
     "$HELPER_DIR/../contracts/fixtures/configuration_revision_v3.compiled.txt" \
     "$HELPER_DIR/../contracts/fixtures/configuration_revision_v4.compiled.txt" \
     "$HELPER_DIR/../contracts/fixtures/configuration_revision_v41.compiled.txt"
+"$BUILD_DIR/service_dump_worker_test"
 "$BUILD_DIR/session_snapshot_test"
 "$BUILD_DIR/telecom_guard_test"
 "$BUILD_DIR/device_profile_test"

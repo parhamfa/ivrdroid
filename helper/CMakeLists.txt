@@ -58,12 +58,14 @@ target_compile_options(ivrdroid_dtmf PRIVATE
 
 add_library(ivrdroid_core STATIC
     src/audit_policy.cpp
+    src/binder_service_dump.cpp
     src/call_control_protocol.cpp
     src/call_safety_policy.cpp
     src/call_lifetime_policy.cpp
     src/continuous_recording.cpp
     src/async_recording_writer.cpp
     src/child_process.cpp
+    src/connectivity_guard.cpp
     src/conversation_handoff_protocol.cpp
     src/device_profile.cpp
     src/external_call_policy.cpp
@@ -74,6 +76,7 @@ add_library(ivrdroid_core STATIC
     src/prompt_barge_in_policy.cpp
     src/recording_policy.cpp
     src/revision_config.cpp
+    src/service_dump_worker.cpp
     src/session_snapshot.cpp
     src/sha256.cpp
     src/telecom_guard.cpp
@@ -86,6 +89,9 @@ target_compile_options(ivrdroid_core PRIVATE
     -Wextra
     -Wpedantic
     -Werror
+)
+target_link_libraries(ivrdroid_core PUBLIC
+    dl
 )
 
 add_executable(ivrdroid-helper

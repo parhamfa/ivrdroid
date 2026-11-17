@@ -1,8 +1,10 @@
 #include "call_control_protocol.h"
 #include "async_recording_writer.h"
+#include "binder_service_dump.h"
 #include "call_safety_policy.h"
 #include "call_lifetime_policy.h"
 #include "child_process.h"
+#include "connectivity_guard.h"
 #include "device_profile.h"
 #include "dtmf_detector.h"
 #include "session_audio.h"
@@ -14,6 +16,7 @@
 #include "prompt_barge_in_policy.h"
 #include "recording_policy.h"
 #include "revision_config.h"
+#include "service_dump_worker.h"
 #include "session_snapshot.h"
 #include "sha256.h"
 #include "telecom_guard.h"
@@ -63,7 +66,7 @@ using ivrdroid::protocol::CurrentState;
 using ivrdroid::protocol::LastResult;
 
 constexpr char kLogTag[] = "IVRdroidHelper";
-constexpr char kHelperVersion[] = "0.10.3";
+constexpr char kHelperVersion[] = "0.10.6";
 #ifndef IVRDROID_SOURCE_COMMIT
 #define IVRDROID_SOURCE_COMMIT "unknown"
 #endif
@@ -722,7 +725,7 @@ void WriteBridgeRevision(
     }
 }
 
-bool CaptureDumpsys(
+bool CaptureDumpsysProcess(
     const char* service,
     size_t maximumBytes,
     std::string* output) {
@@ -846,6 +849,229 @@ bool CaptureDumpsys(
         complete &&
         WIFEXITED(status) &&
         WEXITSTATUS(status) == 0;
+}
+
+// Launching dumpsys opens the binder driver in a new process every poll. On
+// kernels that leak memory per binder open, that exhausts RAM, so each helper
+// process keeps one long-lived dump worker and uses dumpsys only as fallback.
+pid_t SpawnServiceDumpWorker(int workerSocket, int clientSocket, void*) {
+    const pid_t parentPid = getpid();
+    const pid_t child = fork();
+    if (child != 0) {
+        if (child > 0) {
+            Log(ANDROID_LOG_INFO, "Started service dump worker pid %d.", child);
+        }
+        return child;
+    }
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+        getppid() != parentPid) {
+        _exit(126);
+    }
+    // The guardian ignores these; an ignored disposition survives exec.
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    signal(SIGPIPE, SIG_DFL);
+    close(clientSocket);
+    const int flags = fcntl(workerSocket, F_GETFD);
+    if (flags < 0 ||
+        fcntl(workerSocket, F_SETFD, flags & ~FD_CLOEXEC) != 0) {
+        _exit(126);
+    }
+    char descriptor[16] = {};
+    std::snprintf(descriptor, sizeof(descriptor), "%d", workerSocket);
+    execl(
+        "/proc/self/exe",
+        "ivrdroid-helper",
+        "--dump-worker",
+        descriptor,
+        static_cast<char*>(nullptr));
+    _exit(127);
+}
+
+// Runs a connectivity guard command. WifiHighPerf toggles
+// `cmd wifi force-hi-perf-mode` off and on: Android's WifiLockManager ignores
+// a repeated "enabled" while it believes the mode is already set, so a plain
+// re-assert would not re-apply power-save-off after the driver was reset;
+// switching off then on forces it. The exit status
+// only shows that the command ran, not that the framework accepted it: the
+// shell command prints "Command execution failed" and still exits 0. Each run
+// opens binder twice, which leaks kernel memory on old vendor kernels, so the
+// guard launches it only every 15 minutes (with backoff after failures) and
+// never in a loop. WifiScan runs `cmd wifi start-scan` after the link has been
+// down for a while, because this chip does not scan by itself with the screen
+// off; the guard spaces those requests out the same way.
+pid_t SpawnConnectivityCommand(ivrdroid::ConnectivityCommand command, void*) {
+    const pid_t child = fork();
+    if (child != 0) return child;
+    if (gHelperLockFd >= 0) close(gHelperLockFd);
+    ivrdroid::CloseDescriptorsExcept(-1);
+    // Forked from the serve process, which installs handlers for these; reset
+    // them so the command starts with default dispositions.
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    signal(SIGPIPE, SIG_DFL);
+    const int devNull = open("/dev/null", O_RDWR);
+    if (devNull < 0 ||
+        dup2(devNull, STDIN_FILENO) < 0 ||
+        dup2(devNull, STDOUT_FILENO) < 0 ||
+        dup2(devNull, STDERR_FILENO) < 0) {
+        _exit(126);
+    }
+    if (devNull > STDERR_FILENO) close(devNull);
+    if (command == ivrdroid::ConnectivityCommand::WifiScan) {
+        execl(
+            "/system/bin/cmd",
+            "cmd",
+            "wifi",
+            "start-scan",
+            static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    execl(
+        "/system/bin/sh",
+        "sh",
+        "-c",
+        "/system/bin/cmd wifi force-hi-perf-mode disabled; "
+        "exec /system/bin/cmd wifi force-hi-perf-mode enabled",
+        static_cast<char*>(nullptr));
+    _exit(127);
+}
+
+void LogConnectivityGuard(int priority, const char* message, void*) {
+    Log(priority, "%s", message);
+}
+
+constexpr int64_t kConnectivitySummaryIntervalMs = 60 * 60'000;
+
+void MaybeLogConnectivitySummary(ivrdroid::ConnectivityGuard& guard, int64_t* summaryAt) {
+    const int64_t now = MonotonicMilliseconds();
+    if (now - *summaryAt < kConnectivitySummaryIntervalMs) return;
+    // A whole window without a successful Wi-Fi assert deserves attention.
+    const bool unhealthy =
+        guard.wifiAssertsSucceeded() == 0 &&
+        guard.wakeLockState() != ivrdroid::WakeLockState::Disabled;
+    Log(
+        unhealthy ? ANDROID_LOG_WARN : ANDROID_LOG_INFO,
+        "Connectivity guard in the last %d min: wake_lock=%s wifi_high_perf_asserts=%d failed=%d "
+        "wifi_link_drops=%d scan_requests=%d scan_failed=%d.",
+        static_cast<int>((now - *summaryAt) / 60'000),
+        ivrdroid::WakeLockStateName(guard.wakeLockState()),
+        guard.wifiAssertsSucceeded(),
+        guard.wifiAssertsFailed(),
+        guard.wifiLinkDrops(),
+        guard.wifiScanRequests(),
+        guard.wifiScanRequestsFailed());
+    guard.ResetStats();
+    *summaryAt = now;
+}
+
+constexpr int64_t kServiceDumpWarningIntervalMs = 60'000;
+constexpr int64_t kServiceDumpSummaryIntervalMs = 60 * 60'000;
+
+ivrdroid::ServiceDumpClient gServiceDumpClient(SpawnServiceDumpWorker, nullptr);
+// Per-process bookkeeping; a forked child resets it so it never reports or
+// recovers from its parent's history.
+pid_t gServiceDumpStatsPid = -1;
+bool gServiceDumpWarned = false;
+int64_t gServiceDumpWarningAt = -1;
+int64_t gServiceDumpSummaryAt = -1;
+unsigned long gServiceDumpsByWorker = 0;
+unsigned long gServiceDumpsByDumpsys = 0;
+
+const char* ServiceDumpResultName(ivrdroid::ServiceDumpResult result) {
+    switch (result) {
+        case ivrdroid::ServiceDumpResult::Ok: return "ok";
+        case ivrdroid::ServiceDumpResult::TimedOut: return "timed out";
+        case ivrdroid::ServiceDumpResult::Failed: return "failed";
+        case ivrdroid::ServiceDumpResult::Unavailable: return "unavailable";
+        case ivrdroid::ServiceDumpResult::TooLarge: return "too large";
+    }
+    return "unknown";
+}
+
+void PrepareServiceDumpStats() {
+    if (gServiceDumpStatsPid == getpid()) return;
+    gServiceDumpStatsPid = getpid();
+    gServiceDumpWarned = false;
+    gServiceDumpWarningAt = -1;
+    gServiceDumpSummaryAt = MonotonicMilliseconds();
+    gServiceDumpsByWorker = 0;
+    gServiceDumpsByDumpsys = 0;
+}
+
+// One place for a human to see whether the leak-free path is in use.
+void MaybeLogServiceDumpSummary() {
+    const int64_t now = MonotonicMilliseconds();
+    if (now - gServiceDumpSummaryAt < kServiceDumpSummaryIntervalMs) return;
+    if (gServiceDumpsByWorker != 0 || gServiceDumpsByDumpsys != 0) {
+        Log(
+            ANDROID_LOG_INFO,
+            "Service dumps in the last %d min: worker=%lu dumpsys=%lu worker_spawns=%d.",
+            static_cast<int>((now - gServiceDumpSummaryAt) / 60'000),
+            gServiceDumpsByWorker,
+            gServiceDumpsByDumpsys,
+            gServiceDumpClient.spawnCount());
+    }
+    gServiceDumpsByWorker = 0;
+    gServiceDumpsByDumpsys = 0;
+    gServiceDumpSummaryAt = now;
+}
+
+bool ShouldWarnServiceDump() {
+    const int64_t now = MonotonicMilliseconds();
+    if (gServiceDumpWarningAt >= 0 &&
+        now - gServiceDumpWarningAt < kServiceDumpWarningIntervalMs) {
+        return false;
+    }
+    gServiceDumpWarningAt = now;
+    gServiceDumpWarned = true;
+    return true;
+}
+
+bool CaptureDumpsys(
+    const char* service,
+    size_t maximumBytes,
+    std::string* output) {
+    PrepareServiceDumpStats();
+    const ivrdroid::ServiceDumpResult result = gServiceDumpClient.Capture(
+        service,
+        maximumBytes,
+        static_cast<int>(kDumpsysTimeoutMs),
+        output);
+    bool captured = false;
+    if (result == ivrdroid::ServiceDumpResult::Ok) {
+        ++gServiceDumpsByWorker;
+        // Bounded by the warning throttle: only a warned degradation recovers.
+        if (gServiceDumpWarned) {
+            gServiceDumpWarned = false;
+            Log(ANDROID_LOG_INFO, "Service dump worker recovered.");
+        }
+        captured = true;
+    } else if (result == ivrdroid::ServiceDumpResult::TimedOut ||
+               result == ivrdroid::ServiceDumpResult::TooLarge) {
+        // dumpsys would time out or overflow as well; do not double the wait.
+        if (ShouldWarnServiceDump()) {
+            Log(
+                ANDROID_LOG_WARN,
+                "Service dump worker %s for %s.",
+                ServiceDumpResultName(result),
+                service);
+        }
+    } else {
+        if (ShouldWarnServiceDump()) {
+            Log(
+                ANDROID_LOG_WARN,
+                "Service dump worker %s for %s; falling back to dumpsys.",
+                ServiceDumpResultName(result),
+                service);
+        }
+        ++gServiceDumpsByDumpsys;
+        captured = CaptureDumpsysProcess(service, maximumBytes, output);
+    }
+    MaybeLogServiceDumpSummary();
+    return captured;
 }
 
 enum class AudioModeState {
@@ -6461,6 +6687,14 @@ int Serve() {
         return 14;
     }
     gHelperLockFd = lockFd;
+    // Holds the tablet awake and Wi-Fi out of power saving so it stays
+    // reachable with the screen off. The lock is deliberately left held when
+    // the helper exits: the tablet is an appliance and must stay reachable for
+    // repair even while the helper is down.
+    ivrdroid::ConnectivityGuard connectivityGuard(
+        SpawnConnectivityCommand, LogConnectivityGuard, nullptr);
+    // Before WaitForSystemReady, which can take long at boot.
+    connectivityGuard.AssertWakeLock();
     if (!WritePidFile()) {
         close(lockFd);
         return 15;
@@ -6505,6 +6739,7 @@ int Serve() {
     alignas(inotify_event) char events[4096] = {};
     int64_t lastAuditRecovery = MonotonicMilliseconds();
     int64_t lastIdleObservation = -1000;
+    int64_t connectivitySummaryAt = MonotonicMilliseconds();
     while (!gStopRequested) {
         gDrainingGuardians.erase(std::remove_if(gDrainingGuardians.begin(), gDrainingGuardians.end(),
             [](pid_t child) { return waitpid(child, nullptr, WNOHANG) != 0; }), gDrainingGuardians.end());
@@ -6526,7 +6761,10 @@ int Serve() {
                     ScheduleAuditRecovery();
                     lastAuditRecovery = MonotonicMilliseconds();
                 }
+                // Idle only, so cmd is never launched while a call is in progress.
+                connectivityGuard.Tick(MonotonicMilliseconds());
             }
+            MaybeLogConnectivitySummary(connectivityGuard, &connectivitySummaryAt);
         }
         const bool processed = ProcessOneCommand();
         if (gStopRequested) break;
@@ -6553,6 +6791,9 @@ int Serve() {
         }
     }
 
+    gServiceDumpClient.Shutdown();
+    // Reaps a running cmd; the wake lock stays held on purpose (see above).
+    connectivityGuard.Shutdown();
     WriteCurrentState(CurrentState::Stopped);
     inotify_rm_watch(inotifyFd, watch);
     close(inotifyFd);
@@ -6603,9 +6844,197 @@ int SelfTest() {
     return 0;
 }
 
+bool ParseBoundedInteger(
+    const char* text,
+    long long minimum,
+    long long maximum,
+    long long* value) {
+    if (text == nullptr || *text == '\0') return false;
+    const char* end = text + std::strlen(text);
+    long long parsed = 0;
+    const auto result = std::from_chars(text, end, parsed);
+    if (result.ec != std::errc() || result.ptr != end ||
+        parsed < minimum || parsed > maximum) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+// Internal mode: the long-lived dump worker spawned by SpawnServiceDumpWorker.
+int RunDumpWorker(const char* argument) {
+    long long parsed = 0;
+    if (!ParseBoundedInteger(
+            argument,
+            3,
+            std::numeric_limits<int>::max(),
+            &parsed)) {
+        return 2;
+    }
+    const int fd = static_cast<int>(parsed);
+    struct stat status {};
+    if (fstat(fd, &status) != 0 || !S_ISSOCK(status.st_mode)) return 2;
+    // First: an inherited PCM or mixer descriptor held by a long-lived
+    // worker would keep the audio device busy.
+    ivrdroid::CloseDescriptorsExcept(fd);
+    prctl(PR_SET_NAME, "ivrdroid-dump");
+    const int nullFd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (nullFd >= 0) {
+        dup2(nullFd, STDIN_FILENO);
+        dup2(nullFd, STDOUT_FILENO);
+        if (nullFd > STDERR_FILENO) close(nullFd);
+    }
+    signal(SIGPIPE, SIG_IGN);
+    return ivrdroid::RunServiceDumpWorker(
+        fd,
+        ivrdroid::InitializeBinderServiceDump(),
+        ivrdroid::BinderServiceDump,
+        nullptr);
+}
+
+int64_t MonotonicMicroseconds() {
+    timespec value {};
+    clock_gettime(CLOCK_MONOTONIC, &value);
+    return static_cast<int64_t>(value.tv_sec) * 1'000'000 + value.tv_nsec / 1'000;
+}
+
+struct DumpSelfTestStats {
+    unsigned long ok = 0;
+    unsigned long failed = 0;
+    unsigned long timedOut = 0;
+    int64_t minimumUs = std::numeric_limits<int64_t>::max();
+    int64_t maximumUs = 0;
+    int64_t totalUs = 0;
+    size_t minimumBytes = std::numeric_limits<size_t>::max();
+    size_t maximumBytes = 0;
+    bool markers = true;
+};
+
+void PrintDumpSelfTestStats(const char* service, const DumpSelfTestStats& stats) {
+    const unsigned long attempts = stats.ok + stats.failed + stats.timedOut;
+    std::printf(
+        "%s ok=%lu failed=%lu timed_out=%lu latency_ms min=%.1f avg=%.1f max=%.1f "
+        "bytes min=%zu max=%zu markers=%s\n",
+        service,
+        stats.ok,
+        stats.failed,
+        stats.timedOut,
+        attempts == 0 ? 0.0 : static_cast<double>(stats.minimumUs) / 1'000.0,
+        attempts == 0 ? 0.0 : static_cast<double>(stats.totalUs) / 1'000.0 / attempts,
+        static_cast<double>(stats.maximumUs) / 1'000.0,
+        stats.ok == 0 ? 0 : stats.minimumBytes,
+        stats.maximumBytes,
+        stats.markers ? "yes" : "no");
+}
+
+// Compares the worker and dumpsys paths without touching the helper lock,
+// bridge or state, so it is safe while the production helper is serving.
+int DumpSelfTest(int argc, char** argv) {
+    long long iterations = 0;
+    long long intervalMs = 0;
+    const bool useWorker = argc == 5 && std::strcmp(argv[2], "worker") == 0;
+    const bool useDumpsys = argc == 5 && std::strcmp(argv[2], "dumpsys") == 0;
+    if ((!useWorker && !useDumpsys) ||
+        !ParseBoundedInteger(argv[3], 1, 1'000'000, &iterations) ||
+        !ParseBoundedInteger(argv[4], 0, 60'000, &intervalMs)) {
+        std::fprintf(
+            stderr,
+            "usage: %s --dump-selftest <worker|dumpsys> <iterations 1..1000000> "
+            "<interval_ms 0..60000>\n",
+            argv[0]);
+        return 2;
+    }
+
+    ivrdroid::ServiceDumpClient client(SpawnServiceDumpWorker, nullptr);
+    struct Target {
+        const char* service;
+        size_t maximumBytes;
+        DumpSelfTestStats stats;
+    };
+    Target targets[] = {
+        {"telecom", kMaximumTelecomDumpBytes, {}},
+        {"audio", kMaximumAudioDumpBytes, {}},
+    };
+    std::string dump;
+    for (long long round = 0; round < iterations; ++round) {
+        if (round > 0 && intervalMs > 0) {
+            timespec delay {
+                static_cast<time_t>(intervalMs / 1'000),
+                static_cast<long>(intervalMs % 1'000) * 1'000'000,
+            };
+            while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+        }
+        for (Target& target : targets) {
+            const int64_t started = MonotonicMicroseconds();
+            bool ok = false;
+            bool timedOut = false;
+            if (useWorker) {
+                const ivrdroid::ServiceDumpResult result = client.Capture(
+                    target.service,
+                    target.maximumBytes,
+                    static_cast<int>(kDumpsysTimeoutMs),
+                    &dump);
+                ok = result == ivrdroid::ServiceDumpResult::Ok;
+                timedOut = result == ivrdroid::ServiceDumpResult::TimedOut;
+            } else {
+                ok = CaptureDumpsysProcess(target.service, target.maximumBytes, &dump);
+            }
+            const int64_t elapsed = MonotonicMicroseconds() - started;
+            DumpSelfTestStats& stats = target.stats;
+            stats.minimumUs = std::min(stats.minimumUs, elapsed);
+            stats.maximumUs = std::max(stats.maximumUs, elapsed);
+            stats.totalUs += elapsed;
+            if (!ok) {
+                if (timedOut) {
+                    ++stats.timedOut;
+                } else {
+                    ++stats.failed;
+                }
+                continue;
+            }
+            ++stats.ok;
+            stats.minimumBytes = std::min(stats.minimumBytes, dump.size());
+            stats.maximumBytes = std::max(stats.maximumBytes, dump.size());
+            const bool markers = std::strcmp(target.service, "telecom") == 0
+                ? dump.find("mCalls:") != std::string::npos &&
+                    dump.find("mCallAudioManager:") != std::string::npos
+                : dump.find("Actual mode = MODE_") != std::string::npos;
+            stats.markers = stats.markers && markers;
+        }
+    }
+
+    const int spawns = client.spawnCount();
+    client.Shutdown();
+    bool passed = true;
+    std::printf(
+        "dump-selftest path=%s iterations=%lld interval_ms=%lld\n",
+        useWorker ? "worker" : "dumpsys",
+        iterations,
+        intervalMs);
+    for (const Target& target : targets) {
+        PrintDumpSelfTestStats(target.service, target.stats);
+        passed = passed &&
+            target.stats.ok == static_cast<unsigned long>(iterations) &&
+            target.stats.markers;
+    }
+    std::printf("worker_spawns=%d\n", spawns);
+    if (useWorker && spawns != 1) passed = false;
+    std::printf("result=%s\n", passed ? "PASS" : "FAIL");
+    std::fflush(stdout);
+    return passed ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Both modes run before any signal handler, lock, bridge or state setup.
+    if (argc >= 2 && std::strcmp(argv[1], "--dump-worker") == 0) {
+        return argc == 3 ? RunDumpWorker(argv[2]) : 2;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--dump-selftest") == 0) {
+        return DumpSelfTest(argc, argv);
+    }
+
     signal(SIGINT, HandleSignal);
     signal(SIGTERM, HandleSignal);
     signal(SIGHUP, HandleSignal);
@@ -6621,6 +7050,10 @@ int main(int argc, char** argv) {
         return SelfTest();
     }
 
-    std::fprintf(stderr, "usage: %s --serve | --self-test | --version\n", argv[0]);
+    std::fprintf(
+        stderr,
+        "usage: %s --serve | --self-test | --version | "
+        "--dump-selftest <worker|dumpsys> <iterations> <interval_ms>\n",
+        argv[0]);
     return 2;
 }

@@ -13,9 +13,14 @@ commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=Tr
 if os.environ.get('IVRDROID_SOURCE_COMMIT') != commit:
     raise SystemExit('Build source commit must match HEAD.')
 version = '0.10.3'
-for path in ('app/magisk/module.prop', 'helper/magisk/module.prop'):
-    if f'version={version}\n' not in (root / path).read_text():
-        raise SystemExit(f'Inconsistent release metadata: {path}')
+if f'version={version}\n' not in (root / 'app/magisk/module.prop').read_text():
+    raise SystemExit('Inconsistent release metadata: app/magisk/module.prop')
+# The helper ships on its own version line; its ZIP name follows its module.prop.
+helper_version = re.search(r'^version=(\S+)$', (root / 'helper/magisk/module.prop').read_text(), re.M)
+if helper_version is None:
+    raise SystemExit('Inconsistent release metadata: helper/magisk/module.prop')
+if f'kHelperVersion[] = "{helper_version[1]}"' not in (root / 'helper/src/main.cpp').read_text():
+    raise SystemExit('Inconsistent release metadata: helper version')
 app = (root / 'app/build.gradle.kts').read_text()
 if f'versionName = "{version}"' not in app:
     raise SystemExit('Inconsistent APK version.')
@@ -26,7 +31,7 @@ if code != overlay or code < 22 or helper < 30:
     raise SystemExit('Version codes must preserve Android upgrade order.')
 folder = Path(sys.argv[1]).resolve()
 files = ['IVRdroid-0.10.3.apk', 'IVRdroid-0.10.3-acceptance.apk', 'IVRdroid-system-app-0.10.3.zip',
-         'IVRdroid-helper-0.10.3-disabled.zip', 'ivrdroid-helper', 'ivrdroid-audio-harness', 'source.tar']
+         f'IVRdroid-helper-{helper_version[1]}-disabled.zip', 'ivrdroid-helper', 'ivrdroid-audio-harness', 'source.tar']
 artifacts = {}
 for name in files:
     path = folder / name

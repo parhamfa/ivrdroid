@@ -28,7 +28,15 @@ repeated `enabled` it believes is already set. After a failure it retries after 
 doubles the wait each time up to 15 minutes. Each `cmd` opens binder, which leaks kernel memory
 here, so that is two opens per refresh, 192 a day. A zero exit only shows the command ran. An
 hourly log line reports `wake_lock=held|failed|disabled|unknown` and the number of Wi-Fi asserts,
-as a warning when none succeeded in that hour. The lock is left held
+as a warning when none succeeded in that hour. Helper 0.10.6 adds a link watch: every 5 seconds the
+guard reads `/sys/class/net/wlan0/operstate`, because this Wi-Fi chip does not scan by itself
+with the screen off and a dropped link otherwise stays down. Once the link has been down for 45
+seconds it runs `cmd wifi start-scan`, every 20 seconds for the first four requests and then
+doubling up to 15 minutes; that pacing carries over to the next outage until the link has stayed
+up for 10 minutes, and a missing interface means Wi-Fi is switched off and never triggers a
+scan. When the link comes back the high-performance toggle runs again at once, but at most once
+every 5 minutes, and the hourly line adds `wifi_link_drops`, `scan_requests` and `scan_failed`.
+The lock is left held
 when the helper exits. To stop the guard, create `/data/adb/ivrdroid/keep-awake.disabled`; that
 only stops further asserts, so undo the current state by hand with
 `echo ivrdroid-keepawake > /sys/power/wake_unlock` and `cmd wifi force-hi-perf-mode disabled`.

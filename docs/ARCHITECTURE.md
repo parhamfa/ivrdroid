@@ -320,7 +320,15 @@ lost when the framework restarts, and WifiLockManager ignores a repeated `enable
 believes the mode is set, so the toggle is repeated every 15 minutes, with a 5-second kill
 deadline. Consecutive failures back off from 30 seconds, doubling up to 15 minutes; a success
 resets that. Each `cmd` opens binder, so this is two binder opens per refresh, 192 a day, and the
-exit status shows only that the command ran, not that the framework accepted it. The
+exit status shows only that the command ran, not that the framework accepted it. The guard
+also watches `/sys/class/net/wlan0/operstate` every 5 seconds, because the Wi-Fi chip has no
+offloaded background scan and Android does not scan again by itself after a link drop with the
+screen off. After 45 seconds down it runs `cmd wifi start-scan` in the same single child slot,
+every 20 seconds for four requests and then doubling up to 15 minutes, and that pacing carries
+over to the next outage until the link has stayed up for 10 minutes, so a long or flapping outage
+costs a bounded number of binder opens; a missing interface (Wi-Fi switched off) never triggers a
+scan, and a link that comes back gets the high-performance toggle again at once, at most once
+every 5 minutes. The
 wake lock stays held when the helper exits, so the appliance remains reachable for repair. The
 file `/data/adb/ivrdroid/keep-awake.disabled` stops further asserts but undoes nothing; the
 manual undo is `echo ivrdroid-keepawake > /sys/power/wake_unlock` and

@@ -66,7 +66,7 @@ using ivrdroid::protocol::CurrentState;
 using ivrdroid::protocol::LastResult;
 
 constexpr char kLogTag[] = "IVRdroidHelper";
-constexpr char kHelperVersion[] = "0.10.5";
+constexpr char kHelperVersion[] = "0.10.6";
 #ifndef IVRDROID_SOURCE_COMMIT
 #define IVRDROID_SOURCE_COMMIT "unknown"
 #endif
@@ -889,16 +889,19 @@ pid_t SpawnServiceDumpWorker(int workerSocket, int clientSocket, void*) {
     _exit(127);
 }
 
-// Toggles `cmd wifi force-hi-perf-mode` off and on for the connectivity guard.
-// Android's WifiLockManager ignores a repeated "enabled" while it believes the
-// mode is already set, so a plain re-assert would not re-apply power-save-off
-// after the driver was reset; switching off then on forces it. The exit status
+// Runs a connectivity guard command. WifiHighPerf toggles
+// `cmd wifi force-hi-perf-mode` off and on: Android's WifiLockManager ignores
+// a repeated "enabled" while it believes the mode is already set, so a plain
+// re-assert would not re-apply power-save-off after the driver was reset;
+// switching off then on forces it. The exit status
 // only shows that the command ran, not that the framework accepted it: the
 // shell command prints "Command execution failed" and still exits 0. Each run
 // opens binder twice, which leaks kernel memory on old vendor kernels, so the
 // guard launches it only every 15 minutes (with backoff after failures) and
-// never in a loop.
-pid_t SpawnWifiHighPerfToggle(void*) {
+// never in a loop. WifiScan runs `cmd wifi start-scan` after the link has been
+// down for a while, because this chip does not scan by itself with the screen
+// off; the guard spaces those requests out the same way.
+pid_t SpawnConnectivityCommand(ivrdroid::ConnectivityCommand command, void*) {
     const pid_t child = fork();
     if (child != 0) return child;
     if (gHelperLockFd >= 0) close(gHelperLockFd);
@@ -917,6 +920,15 @@ pid_t SpawnWifiHighPerfToggle(void*) {
         _exit(126);
     }
     if (devNull > STDERR_FILENO) close(devNull);
+    if (command == ivrdroid::ConnectivityCommand::WifiScan) {
+        execl(
+            "/system/bin/cmd",
+            "cmd",
+            "wifi",
+            "start-scan",
+            static_cast<char*>(nullptr));
+        _exit(127);
+    }
     execl(
         "/system/bin/sh",
         "sh",
@@ -942,11 +954,15 @@ void MaybeLogConnectivitySummary(ivrdroid::ConnectivityGuard& guard, int64_t* su
         guard.wakeLockState() != ivrdroid::WakeLockState::Disabled;
     Log(
         unhealthy ? ANDROID_LOG_WARN : ANDROID_LOG_INFO,
-        "Connectivity guard in the last %d min: wake_lock=%s wifi_high_perf_asserts=%d failed=%d.",
+        "Connectivity guard in the last %d min: wake_lock=%s wifi_high_perf_asserts=%d failed=%d "
+        "wifi_link_drops=%d scan_requests=%d scan_failed=%d.",
         static_cast<int>((now - *summaryAt) / 60'000),
         ivrdroid::WakeLockStateName(guard.wakeLockState()),
         guard.wifiAssertsSucceeded(),
-        guard.wifiAssertsFailed());
+        guard.wifiAssertsFailed(),
+        guard.wifiLinkDrops(),
+        guard.wifiScanRequests(),
+        guard.wifiScanRequestsFailed());
     guard.ResetStats();
     *summaryAt = now;
 }
@@ -6676,7 +6692,7 @@ int Serve() {
     // the helper exits: the tablet is an appliance and must stay reachable for
     // repair even while the helper is down.
     ivrdroid::ConnectivityGuard connectivityGuard(
-        SpawnWifiHighPerfToggle, LogConnectivityGuard, nullptr);
+        SpawnConnectivityCommand, LogConnectivityGuard, nullptr);
     // Before WaitForSystemReady, which can take long at boot.
     connectivityGuard.AssertWakeLock();
     if (!WritePidFile()) {
